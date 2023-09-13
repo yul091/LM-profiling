@@ -40,19 +40,25 @@ def extract_seq_cls_model_layers(
 
 
 def profile_and_infer_seq_cls(
-    model: AutoModelForSequenceClassification, 
+    model: Union[
+        BertForSequenceClassification, 
+        GPT2ForSequenceClassification,  
+        BartForSequenceClassification,
+    ], 
     inputs: Dict[torch.Tensor, Any],
 ) -> Dict[str, float]:
     layer_times = {}
     
     # Extract the transformer layers using the provided function
+    input_ids = inputs['input_ids']
+    input_shape = input_ids.size()
     transformer_layers = extract_seq_cls_model_layers(model)
-    batch_size, sequence_length = inputs['input_ids'].shape[:2]
+    batch_size, sequence_length = input_ids.shape[:2]
     if model.config.pad_token_id is None:
         sequence_lengths = -1
     else:
-        if inputs['input_ids'] is not None:
-            sequence_lengths = torch.ne(inputs['input_ids'], model.config.pad_token_id).sum(-1) - 1
+        if input_ids is not None:
+            sequence_lengths = torch.ne(input_ids, model.config.pad_token_id).sum(-1) - 1
         else:
             sequence_lengths = -1
             logger.warning(
@@ -65,12 +71,17 @@ def profile_and_infer_seq_cls(
     if isinstance(model, (BertForSequenceClassification, BartForSequenceClassification)):
         embedding_layer = model.bert.embeddings if isinstance(model, BertForSequenceClassification) else model.model.encoder.embed_tokens
         start_time = time.time()
-        hidden_states = embedding_layer(inputs['input_ids'])
+        hidden_states = embedding_layer(input_ids)
         elapsed_time = time.time() - start_time
         layer_times['embed_layer'] = elapsed_time
         inputs["attention_mask"] = inputs["attention_mask"].unsqueeze(1).unsqueeze(2)
     else:
-        hidden_states = inputs['input_ids']
+        past_length = 0
+        position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+        inputs_embeds = model.transformer.wte(input_ids)
+        position_embeds = model.transformer.wpe(position_ids)
+        hidden_states = inputs_embeds + position_embeds
     
     # Profile each transformer layer
     for i, layer in enumerate(transformer_layers):
@@ -161,13 +172,14 @@ def text_classification_profiling(args: argparse.Namespace):
 
 
     profiling_df = pd.DataFrame(profiling_res)
-    profiling_df.to_csv(f'{output_dir}/profiling_res.csv', index=False)
+    model_n = model_name_or_path.split('/')[-1]
+    profiling_df.to_csv(f'{output_dir}/profiling_{model_n}_res.csv', index=False)
 
 
 if __name__ == "__main__":
     argparse = argparse.ArgumentParser()
     argparse.add_argument('--model_name_or_path', type=str, default='bert-base-uncased')
-    argparse.add_argument('--per_device_eval_batch_size', type=int, default=8)
+    argparse.add_argument('--per_device_eval_batch_size', type=int, default=5)
     argparse.add_argument('--output_dir', type=str, default='profile_res')
     args = argparse.parse_args()
     
