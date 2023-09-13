@@ -87,17 +87,24 @@ def profile_and_infer_seq_cls(
     for i, layer in enumerate(transformer_layers):
         start_time = time.time()
         if isinstance(model, GPT2ForSequenceClassification):
-            outputs = layer(hidden_states)
-            hidden_states = outputs[0]
+            outputs = layer(hidden_states)   
+        elif isinstance(model, BartForSequenceClassification):
+            # Expand the mask to have shape (batch_size, 1, sequence_length, sequence_length)
+            attention_mask = inputs["attention_mask"].squeeze(1).squeeze(1)  # Ensure it has shape (batch_size, sequence_length)
+            expanded_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2).expand(-1, 1, sequence_length, sequence_length)
+            # For BART, we pass in both the hidden states and attention mask, and layer_head_mask as None
+            outputs = layer(hidden_states, expanded_attention_mask, None)
         else:
             outputs = layer(hidden_states, inputs["attention_mask"])
-            hidden_states = outputs[0]
+        hidden_states = outputs[0]
         elapsed_time = time.time() - start_time
         layer_times[f'transformer_layer_{i}'] = elapsed_time
     
     # Get the classification output from the model
     if isinstance(model, GPT2ForSequenceClassification):
         logits = model.score(hidden_states)
+    elif isinstance(model, BartForSequenceClassification):
+        logits = model.classification_head(hidden_states)
     else:
         logits = model.classifier(hidden_states)
     
