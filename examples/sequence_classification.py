@@ -48,6 +48,7 @@ def profile_and_infer_seq_cls(
     inputs: Dict[torch.Tensor, Any],
 ) -> Dict[str, float]:
     layer_times = {}
+    layer_memory = {}
     
     # Extract the transformer layers using the provided function
     input_ids = inputs['input_ids']
@@ -68,12 +69,11 @@ def profile_and_infer_seq_cls(
     
     # For BERT and BART, there's an embedding layer before the transformer layers
     # For GPT-2, there's no such distinction
+    start_time = time.time()
+    start_mem = torch.cuda.memory_allocated(device=model.device) 
     if isinstance(model, (BertForSequenceClassification, BartForSequenceClassification)):
         embedding_layer = model.bert.embeddings if isinstance(model, BertForSequenceClassification) else model.model.encoder.embed_tokens
-        start_time = time.time()
         hidden_states = embedding_layer(input_ids)
-        elapsed_time = time.time() - start_time
-        layer_times['embed_layer'] = elapsed_time
         inputs["attention_mask"] = inputs["attention_mask"].unsqueeze(1).unsqueeze(2)
     else:
         past_length = 0
@@ -83,9 +83,15 @@ def profile_and_infer_seq_cls(
         position_embeds = model.transformer.wpe(position_ids)
         hidden_states = inputs_embeds + position_embeds
     
+    elapsed_time = time.time() - start_time
+    end_mem = torch.cuda.memory_allocated(device=model.device)
+    layer_times['embedding_layer'] = elapsed_time
+    layer_memory['embedding_layer'] = end_mem - start_mem
+    
     # Profile each transformer layer
     for i, layer in enumerate(transformer_layers):
         start_time = time.time()
+        start_mem = torch.cuda.memory_allocated(device=model.device)
         if isinstance(model, GPT2ForSequenceClassification):
             outputs = layer(hidden_states)   
         elif isinstance(model, BartForSequenceClassification):
@@ -98,22 +104,31 @@ def profile_and_infer_seq_cls(
             outputs = layer(hidden_states, inputs["attention_mask"])
         hidden_states = outputs[0]
         elapsed_time = time.time() - start_time
+        end_mem = torch.cuda.memory_allocated(device=model.device)
         layer_times[f'transformer_layer_{i}'] = elapsed_time
+        layer_memory[f'transformer_layer_{i}'] = end_mem - start_mem
     
     # Get the classification output from the model
+    start_time = time.time()
+    start_mem = torch.cuda.memory_allocated(device=model.device)
     if isinstance(model, GPT2ForSequenceClassification):
         logits = model.score(hidden_states)
     elif isinstance(model, BartForSequenceClassification):
         logits = model.classification_head(hidden_states)
     else:
         logits = model.classifier(hidden_states)
+        
+    elapsed_time = time.time() - start_time
+    end_mem = torch.cuda.memory_allocated(device=model.device)
+    layer_times['FC_layer'] = elapsed_time
+    layer_memory['FC_layer'] = end_mem - start_mem
     
     # Decode the output to get the predicted class
     pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
     predictions = torch.argmax(pooled_logits, dim=-1)
     decoded_predictions = [model.config.id2label[prediction.item()] for prediction in predictions]
 
-    return layer_times, decoded_predictions
+    return layer_times, layer_memory, decoded_predictions
 
 
 def text_classification_profiling(args: argparse.Namespace):
@@ -168,19 +183,22 @@ def text_classification_profiling(args: argparse.Namespace):
     )
     model.eval()
     model.to('cuda')
-    profiling_res = []
+    latency_res = []
+    memory_res = []
 
     for i, batch in tqdm(enumerate(test_loader)):
         inputs = {k: v.to(model.device) for k, v in batch.items()}
-        layer_times, predictions = profile_and_infer_seq_cls(model, inputs)
-        profiling_res.append(layer_times)
+        layer_times, layer_memory, predictions = profile_and_infer_seq_cls(model, inputs)
+        latency_res.append(layer_times)
+        memory_res.append(layer_memory)
         # print("predictions:", predictions)
         # print("layer_times:", layer_times)
 
-
-    profiling_df = pd.DataFrame(profiling_res)
+    latency_df = pd.DataFrame(latency_res)
+    memory_df = pd.DataFrame(memory_res)
     model_n = model_name_or_path.split('/')[-1]
-    profiling_df.to_csv(f'{output_dir}/profiling_{model_n}_res.csv', index=False)
+    latency_df.to_csv(f'{output_dir}/latency_{model_n}_res.csv', index=False)
+    memory_df.to_csv(f'{output_dir}/memory_{model_n}_res.csv', index=False)
 
 
 if __name__ == "__main__":
