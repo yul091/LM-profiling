@@ -1,0 +1,223 @@
+import sys
+sys.dont_write_bytecode = True
+import pandas as pd
+import argparse
+from tqdm import tqdm
+import torch
+from torch.utils.data import DataLoader
+from datasets import load_dataset
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    logging,
+)
+logger = logging.get_logger(__name__)
+
+from profile_gpt2 import GPT2ForSequenceClassificationProfile
+
+
+    
+
+# def profile_and_infer_seq_cls(
+#     model: Union[
+#         BertForSequenceClassification, 
+#         GPT2ForSequenceClassification,  
+#         BartForSequenceClassification,
+#     ], 
+#     inputs: Dict[torch.Tensor, Any],
+# ):
+#     layer_times = {}
+#     layer_memory = {}
+    
+#     # Extract the transformer layers using the provided function
+#     input_ids = inputs['input_ids']
+#     input_shape = input_ids.size()
+#     transformer_blocks = extract_seq_cls_model_layers(model)
+#     batch_size, sequence_length = input_ids.shape[:2]
+#     if model.config.pad_token_id is None:
+#         sequence_lengths = -1
+#     else:
+#         if input_ids is not None:
+#             sequence_lengths = torch.ne(input_ids, model.config.pad_token_id).sum(-1) - 1
+#         else:
+#             sequence_lengths = -1
+#             logger.warning(
+#                 f"{model.__class__.__name__} will not detect padding tokens in `inputs_embeds`. Results may be "
+#                 "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
+#             )
+    
+#     # For BERT and BART, there's an embedding layer before the transformer layers
+#     # For GPT-2, there's no such distinction
+#     start_time = time.time()
+#     start_mem = get_memory() 
+#     if isinstance(model, (BertForSequenceClassification, BartForSequenceClassification)):
+#         embedding_layer = model.bert.embeddings if isinstance(model, BertForSequenceClassification) else model.model.encoder.embed_tokens
+#         hidden_states = embedding_layer(input_ids)
+#         inputs["attention_mask"] = inputs["attention_mask"].unsqueeze(1).unsqueeze(2)
+#     else:
+#         if past_key_values is None:
+#             past_length = 0
+#             past_key_values = tuple([None] * len(transformer_blocks))
+#         else:
+#             past_length = past_key_values[0][0].size(-2)
+#         past_length = 0
+#         position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=input_ids.device)
+#         position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+#         inputs_embeds = model.transformer.wte(input_ids)
+#         position_embeds = model.transformer.wpe(position_ids)
+#         hidden_states = inputs_embeds + position_embeds
+    
+#     elapsed_time = time.time() - start_time
+#     end_mem = get_memory()
+#     layer_times['embedding_layer'] = elapsed_time
+#     layer_memory['embedding_layer'] = end_mem - start_mem
+    
+#     # Profile each transformer layer
+#     # First consider gpt2
+#     if model.__class__.__name__.lower() == 'gpt2forsequenceclassification':
+#         for i, (block, layer_past) in enumerate(zip(transformer_blocks, past_key_values)):
+    
+#     for i, block in enumerate(transformer_blocks):
+#         # start_time = time.time()
+#         # start_mem = torch.cuda.memory_allocated(device=model.device)
+#         # if isinstance(model, GPT2ForSequenceClassification):
+#         #     outputs = layer(hidden_states)   
+#         # elif isinstance(model, BartForSequenceClassification):
+#         #     # Expand the mask to have shape (batch_size, 1, sequence_length, sequence_length)
+#         #     attention_mask = inputs["attention_mask"].squeeze(1).squeeze(1)  # Ensure it has shape (batch_size, sequence_length)
+#         #     expanded_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2).expand(-1, 1, sequence_length, sequence_length)
+#         #     # For BART, we pass in both the hidden states and attention mask, and layer_head_mask as None
+#         #     outputs = layer(hidden_states, expanded_attention_mask, None)
+#         # else:
+#         #     outputs = layer(hidden_states, inputs["attention_mask"])
+#         # hidden_states = outputs[0]
+#         # elapsed_time = time.time() - start_time
+#         # end_mem = torch.cuda.memory_allocated(device=model.device)
+#         # layer_times[f'transformer_layer_{i}'] = elapsed_time
+#         # layer_memory[f'transformer_layer_{i}'] = end_mem - start_mem
+#         # GPT2Block
+#         outputs = gpt2block_forward_with_profile(
+#             block=block,
+#             idx=i,
+#             layer_times=layer_times,
+#             layer_memory=layer_memory,
+#             hidden_states=hidden_states,
+#             attention_mask=inputs["attention_mask"],
+#         )
+#         hidden_states = outputs[0]
+    
+#     # Get the classification output from the model
+#     start_time = time.time()
+#     start_mem = get_memory()
+#     if isinstance(model, GPT2ForSequenceClassification):
+#         logits = model.score(hidden_states)
+#     elif isinstance(model, BartForSequenceClassification):
+#         logits = model.classification_head(hidden_states)
+#     else:
+#         logits = model.classifier(hidden_states)
+        
+#     elapsed_time = time.time() - start_time
+#     end_mem = get_memory()
+#     layer_times['FC_layer'] = elapsed_time
+#     layer_memory['FC_layer'] = end_mem - start_mem
+    
+#     # Decode the output to get the predicted class
+#     pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+#     predictions = torch.argmax(pooled_logits, dim=-1)
+#     decoded_predictions = [model.config.id2label[prediction.item()] for prediction in predictions]
+
+#     return layer_times, layer_memory, decoded_predictions
+
+
+def text_classification_profiling(args: argparse.Namespace):
+    model_name_or_path = args.model_name_or_path
+    per_device_eval_batch_size = args.per_device_eval_batch_size
+    output_dir = args.output_dir
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    if 'gpt' in model_name_or_path.lower():
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+
+    # Load imdb and stanford sentiment treebank (sst-2) / movie review (mr) datasets from Huggingface
+    imdb = load_dataset('imdb') # train (25000)/test (25000)/unsupervised (50000): ['text', 'label']
+    train_dataset = imdb['train']
+    test_dataset = imdb['test']
+
+    num_labels = train_dataset.features['label'].num_classes
+    config = AutoConfig.from_pretrained(model_name_or_path, num_labels=num_labels)
+
+    if 'gpt' in model_name_or_path.lower():
+        model = GPT2ForSequenceClassificationProfile.from_pretrained(
+            model_name_or_path, 
+            config=config, 
+            ignore_mismatched_sizes=True,
+        )
+        # Resize only if it hasn't been resized already
+        if model.get_input_embeddings().weight.shape[0] != len(tokenizer):
+            model.resize_token_embeddings(len(tokenizer))
+        # Set the padding token in the model's configuration
+        config.pad_token_id = tokenizer.pad_token_id
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+    def preprocess_function(examples):
+        return tokenizer(examples['text'], truncation=True)
+
+    # Tokenize the datasets
+    tokenized_train = train_dataset.map(preprocess_function, batched=True)
+    tokenized_test = test_dataset.map(preprocess_function, batched=True)
+    # Remove unused columns (keep ['label', 'input_ids', 'token_type_ids', 'attention_mask'])
+    tokenized_train = tokenized_train.remove_columns(['text'])
+    tokenized_test = tokenized_test.remove_columns(['text'])
+    # Set the format of the datasets to PyTorch tensors
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+    # Batch inference with the model
+    test_loader = DataLoader(
+        tokenized_test, 
+        batch_size=per_device_eval_batch_size, 
+        shuffle=False,
+        collate_fn=data_collator,
+    )
+    model.eval()
+    model.to(device)
+    latency_res = []
+    memory_res = []
+
+    for i, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
+        # Get input length
+        batch_size, sequence_length = batch['input_ids'].shape[:2]
+        layer_times = {'batch_size': batch_size, 'input_length': sequence_length}
+        layer_memory = {'batch_size': batch_size, 'input_length': sequence_length}
+        
+        # Prepare inputs
+        inputs = {k: v.to(model.device) for k, v in batch.items()}
+        
+        outputs = model(**inputs, layer_times=layer_times, layer_memory=layer_memory)
+        pooled_logits = outputs[1]
+        
+        # Decode the output to get the predicted class
+        predictions = torch.argmax(pooled_logits, dim=-1)
+        decoded_predictions = [model.config.id2label[prediction.item()] for prediction in predictions]
+    
+        latency_res.append(layer_times)
+        memory_res.append(layer_memory)
+        # print("predictions:", predictions)
+        # print("layer_times:", layer_times)
+
+    latency_df = pd.DataFrame(latency_res)
+    memory_df = pd.DataFrame(memory_res)
+    model_n = model_name_or_path.split('/')[-1]
+    latency_df.to_csv(f'{output_dir}/latency_{model_n}_res.csv', index=False)
+    memory_df.to_csv(f'{output_dir}/memory_{model_n}_res.csv', index=False)
+
+
+if __name__ == "__main__":
+    argparse = argparse.ArgumentParser()
+    argparse.add_argument('--model_name_or_path', type=str, default='bert-base-uncased')
+    argparse.add_argument('--per_device_eval_batch_size', type=int, default=5)
+    argparse.add_argument('--output_dir', type=str, default='profile_res')
+    args = argparse.parse_args()
+    
+    text_classification_profiling(args)
