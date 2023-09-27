@@ -112,20 +112,23 @@ class LayerProfiler:
 
 
 if __name__ == '__main__':
-    
+    import os
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name_or_path', type=str, default='bert-base-uncased')
     parser.add_argument('--profiling_iterations', type=int, default=1000)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--sort', action='store_true')
+    parser.add_argument('--output_dir', type=str, default='logging')
     args = parser.parse_args()
     
     model_base_name = args.model_name_or_path.split('/')[-1]
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
     logging.basicConfig(
         format="%(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
-        filename=f"layer_profiler_{model_base_name}.log",
+        filename=f"{args.output_dir}/layer_profiler_{model_base_name}.log",
         filemode="w",
     )
     logger = logging.getLogger(__name__)
