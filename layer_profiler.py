@@ -1,6 +1,7 @@
 import time
 import argparse
 import logging
+from collections import defaultdict
 from typing import List, Tuple, Dict, Union, Optional
 from functools import partial
 import torch
@@ -10,6 +11,9 @@ from transformers import (
     AutoConfig,
     AutoTokenizer,
     AutoModel,
+    BertModel,
+    GPT2Model,
+    T5Model,
 )
 from transformers.models.bert.modeling_bert import (
     BertEmbeddings,
@@ -38,14 +42,25 @@ class LayerProfiler:
         model: torch.nn.Module,
         config: argparse.Namespace,
         layer_name: Optional[str] = None,
+        logger: Optional[logging.Logger] = None,
     ):
         self.model = model
-        self.layer_name =  layer_name
         self.config = config
-        self.layer_time_reach = {}
-        self.layer_time_cost = {}
-        self.layer_memory = {}
-        self.register_hook(self.model, depth=0)
+        self.layer_time_reach = defaultdict(float)
+        self.layer_time_cost = defaultdict(list)
+        self.layer_input_length = defaultdict(list)  # Recording input length heterogeneity
+        self.layer_memory = defaultdict(list)
+        
+        if logger is None:
+            self.logger = logging.getLogger(__name__)
+        else:
+            self.logger = logger
+        
+        if layer_name is None:
+            self.register_hook(self.model, depth=0)
+        else:
+            submodel = getattr(self.model, layer_name)
+            self.register_hook(submodel, depth=0)
         
         
     def take_time_pre(
@@ -53,7 +68,7 @@ class LayerProfiler:
         name: str,
         layer: nn.Module,
         module: nn.Module,
-        inputs: Dict[str, torch.Tensor],
+        inputs: Tuple[torch.Tensor],
     ):
         self.layer_time_reach[name] = time.time()
         
@@ -63,17 +78,14 @@ class LayerProfiler:
         name: str,
         layer: nn.Module,
         module: nn.Module,
-        inputs: Dict[str, torch.Tensor],
-        outputs: Dict[str, torch.Tensor],
+        inputs: Tuple[torch.Tensor],
+        outputs: Tuple[torch.Tensor],
     ):
-        if self.config.debug:
-            logger.info("[DEBUG]torch.cuda.memory_allocated():", torch.cuda.memory_allocated())
-        if name in self.layer_time_cost:
-            self.layer_time_cost[name] += time.time() - self.layer_time_reach[name]
-            self.layer_memory[name] += torch.cuda.memory_allocated()
-        else:
-            self.layer_time_cost[name] = time.time() - self.layer_time_reach[name]
-            self.layer_memory[name] = torch.cuda.memory_allocated()
+        if isinstance(layer, nn.Embedding) and layer.num_embeddings == self.config.vocab_size:
+            self.layer_input_length[name].append(inputs[0].shape[1])
+            
+        self.layer_time_cost[name].append(time.time() - self.layer_time_reach[name])
+        self.layer_memory[name].append(torch.cuda.memory_allocated())
         
         
     def register_hook(
@@ -91,13 +103,13 @@ class LayerProfiler:
             elif isinstance(layer, nn.Sequential):
                 # DFS recursion for all modules in the Sequential
                 self.register_hook(layer, depth + 1)
-            elif isinstance(layer, (BertEmbeddings, BertEncoder, BertPooler, BertLayer, BertIntermediate, BertOutput)):
+            elif isinstance(layer, (BertEmbeddings, BertModel, BertEncoder, BertPooler, BertLayer, BertIntermediate, BertOutput)):
                 # DFS recursion for all modules in the Bert Modules
                 self.register_hook(layer, depth + 1) 
-            elif isinstance(layer, GPT2Block):
+            elif isinstance(layer, (GPT2Model, GPT2Block)):
                 # DFS recursion for all modules in the GPT2Block
                 self.register_hook(layer, depth + 1)
-            elif isinstance(layer, (T5Stack, T5Block, T5LayerSelfAttention, T5LayerCrossAttention)):
+            elif isinstance(layer, (T5Model, T5Stack, T5Block, T5LayerSelfAttention, T5LayerCrossAttention)):
                 # DFS recursion for all modules in the T5 Modules
                 self.register_hook(layer, depth + 1)
             else:
@@ -107,7 +119,7 @@ class LayerProfiler:
                 layer.register_forward_hook(
                     partial(self.take_time, str(type(layer)) + ':' + str(depth) + ':' + name, layer)
                 )
-                logger.info(f"Register hook for {name} ({type(layer)}) at depth {depth}")
+                self.logger.info(f"Register hook for {name} ({type(layer)}) at depth {depth}")
 
 
 
@@ -124,6 +136,7 @@ if __name__ == '__main__':
     model_base_name = args.model_name_or_path.split('/')[-1]
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+        
     logging.basicConfig(
         format="%(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -136,14 +149,13 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     config = AutoConfig.from_pretrained(args.model_name_or_path)
-    config.debug = args.debug
     model = AutoModel.from_pretrained(args.model_name_or_path, config=config).to(device)
     if 'gpt' in args.model_name_or_path:
         tokenizer.pad_token = tokenizer.eos_token
 
     model.eval()
     
-    profiler = LayerProfiler(model, config)
+    profiler = LayerProfiler(model, config, logger=logger)
     
     input_texts =[
         "Hello, my dog is cute",
@@ -182,8 +194,8 @@ if __name__ == '__main__':
 
     logger.info(f"pre_memory: {pre_memory / ((1024 ** 2) * args.profiling_iterations)} MB")
     for key in sorted_keys:
-        time_val = profiler.layer_time_cost[key] / args.profiling_iterations
-        memory_val = profiler.layer_memory.get(key, 0) / ((1024 ** 2) * args.profiling_iterations)  # Convert from bytes to MB
+        time_val = sum(profiler.layer_time_cost[key]) / args.profiling_iterations
+        memory_val = sum(profiler.layer_memory.get(key, 0)) / ((1024 ** 2) * args.profiling_iterations)  # Convert from bytes to MB
         logger.info(f"{key:<{max_key_length}} \t Time: {time_val*1000:.6f} ms \t Memory: {memory_val:.2f} MB")
 
     # TODO: postprocessing for the results: delta memory, memory ratio, latency ratio, etc.
