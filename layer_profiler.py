@@ -59,7 +59,10 @@ class LayerProfiler:
         else:
             submodel = getattr(self.model, layer_name)
             self.register_hook(submodel)
-        
+            
+    def get_module_name(self, module: nn.Module):
+        return next(name for name, mod in self.model.named_modules() if mod is module)
+
         
     def take_time_pre_forward(
         self,
@@ -86,25 +89,42 @@ class LayerProfiler:
         self.layer_time_forward[name].append(time.time() - self.layer_time_reach[name])
         self.layer_memory_forward[name].append(torch.cuda.memory_allocated())
         
-        
-    def take_time_pre_backward(
-        self, 
-        name: str, 
-        module: nn.Module, 
-        grad_input: Tuple[torch.Tensor], 
-        grad_output: Tuple[torch.Tensor],
-    ):
-        self.layer_time_return[name] = time.time()
+    # def take_time_pre_backward(
+    #     self, 
+    #     module: nn.Module, 
+    #     grad_input: Tuple[torch.Tensor], 
+    #     grad_output: Tuple[torch.Tensor],
+    # ):
+    #     name = self.get_module_name(module)
+    #     self.layer_time_return[name] = time.time()
 
+    # def take_time_backward(
+    #     self, 
+    #     module: nn.Module, 
+    #     grad_input: Tuple[torch.Tensor], 
+    #     grad_output: Tuple[torch.Tensor],
+    # ):
+    #     name = self.get_module_name(module)
+    #     self.layer_time_backward[name].append(time.time() - self.layer_time_return[name])
+    #     self.layer_memory_backward[name].append(torch.cuda.memory_allocated())
+        
     def take_time_backward(
         self, 
-        name: str, 
         module: nn.Module, 
         grad_input: Tuple[torch.Tensor], 
         grad_output: Tuple[torch.Tensor],
+        *args,  # Accept additional arguments
     ):
-        self.layer_time_backward[name].append(time.time() - self.layer_time_return[name])
-        self.layer_memory_backward[name].append(torch.cuda.memory_allocated())
+        name = self.get_module_name(module)
+        # If the time_return for this module is not set, then it's the start of the backward pass for this module.
+        if name not in self.layer_time_return:
+            self.layer_time_return[name] = time.time()
+        else:
+            # If the time_return for this module is set, then it's the end of the backward pass for this module.
+            self.layer_time_backward[name].append(time.time() - self.layer_time_return[name])
+            self.layer_memory_backward[name].append(torch.cuda.memory_allocated())
+            # Reset the time_return for this module.
+            del self.layer_time_return[name]
         
         
     def register_hook(
@@ -144,12 +164,20 @@ class LayerProfiler:
                 layer.register_forward_hook(
                     partial(self.take_time_forward, layer_name, layer)
                 )
-                layer.register_backward_hook(
-                    partial(self.take_time_pre_backward, layer_name, layer)
-                )
-                layer.register_backward_hook(
-                    partial(self.take_time_backward, layer_name, layer)
-                )
+                # layer.register_backward_hook(
+                #     partial(self.take_time_pre_backward, layer)
+                # )
+                # layer.register_backward_hook(
+                #     partial(self.take_time_backward, layer)
+                # )
+                if hasattr(layer, 'register_full_backward_hook'):
+                    layer.register_full_backward_hook(
+                        partial(self.take_time_backward, layer)
+                    )
+                else:
+                    layer.register_backward_hook(
+                        partial(self.take_time_backward, layer)
+                    )
                 self.logger.info(f"Register hook for {layer_name}")
 
 
