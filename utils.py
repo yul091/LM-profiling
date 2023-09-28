@@ -1,38 +1,81 @@
 import time
+import json
+from typing import Dict, Union, Any
 import torch
+import torch.nn as nn
+from packaging import version
+from transformers import (
+    Trainer,
+    TrainingArguments,
+    TrainerState,
+    TrainerControl,
+)
+
+from transformers.utils import (
+    is_sagemaker_mp_enabled,
+    is_apex_available,
+)
+
+if is_apex_available():
+    from apex import amp
+
+if is_sagemaker_mp_enabled():
+    import smdistributed.modelparallel.torch as smp
+    from smdistributed.modelparallel import __version__ as SMP_VERSION
+
+    IS_SAGEMAKER_MP_POST_1_10 = version.parse(SMP_VERSION) >= version.parse("1.10")
+
+    from transformers.trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
+else:
+    IS_SAGEMAKER_MP_POST_1_10 = False
 
 
 
-class Timer:
-    def __enter__(self):
-        self.start = time.time()
-        return self
-
-    def __exit__(self, *args):
-        self.end = time.time()
-        self.interval = self.end - self.start
+class BackwardProfileTrainer(Trainer):
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Initialize the list to store backwad time
+        self.backward_time = []
         
-   
-# Function to get current GPU memory usage
-def get_memory():
-    return torch.cuda.memory_allocated()
+        
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        model.train()
+        inputs = self._prepare_inputs(inputs)
 
+        if is_sagemaker_mp_enabled():
+            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+            return loss_mb.reduce_mean().detach().to(self.args.device)
 
-# def extract_seq_cls_model_layers(
-#     model: Union[
-#         BertForSequenceClassification, 
-#         GPT2ForSequenceClassification,  
-#         BartForSequenceClassification,
-#     ]
-# ):
-#     model_name = model.__class__.__name__.lower()
-#     layers = []
-#     if "bert" in model_name:
-#         layers = model.bert.encoder.layer
-#     elif "gpt2" in model_name:
-#         layers = model.transformer.h
-#     elif "bart" in model_name:
-#         encoder_layers = model.model.encoder.layers
-#         decoder_layers = model.model.decoder.layers
-#         layers = encoder_layers + decoder_layers
-#     return layers
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+            # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+            loss = loss / self.args.gradient_accumulation_steps
+
+        # Backward
+        backward_start_time = time.time()
+        if self.do_grad_scaling:
+            self.scaler.scale(loss).backward()
+        elif self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        elif self.deepspeed:
+            # loss gets scaled under gradient_accumulation_steps in deepspeed
+            loss = self.deepspeed.backward(loss)
+        else:
+            loss.backward()
+        self.backward_time.append(time.time() - backward_start_time)
+
+        return loss.detach()
+    
+    
+    def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl):
+        # Save the list of backward latencies to a file when training ends
+        
+        with open(f'{args.output_dir}/train_latency_backward.json', 'w') as f:
+            json.dump(self.backward_time, f)

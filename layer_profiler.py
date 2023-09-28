@@ -41,13 +41,10 @@ class LayerProfiler:
     ):
         self.model = model
         self.config = config
-        self.layer_time_reach = defaultdict(float)
+        self.layer_input_length = defaultdict(list)
+        self.layer_forward_reach = defaultdict(float)
         self.layer_time_forward = defaultdict(list)
-        self.layer_time_return = defaultdict(float)
-        self.layer_time_backward = defaultdict(list)
-        self.layer_input_length = defaultdict(list)  # Recording input length heterogeneity
         self.layer_memory_forward = defaultdict(list)
-        self.layer_memory_backward = defaultdict(list)
         
         if logger is None:
             self.logger = logging.getLogger(__name__)
@@ -60,6 +57,7 @@ class LayerProfiler:
             submodel = getattr(self.model, layer_name)
             self.register_hook(submodel)
             
+            
     def get_module_name(self, module: nn.Module):
         return next(name for name, mod in self.model.named_modules() if mod is module)
 
@@ -71,7 +69,7 @@ class LayerProfiler:
         module: nn.Module,
         inputs: Tuple[torch.Tensor],
     ):
-        self.layer_time_reach[name] = time.time()
+        self.layer_forward_reach[name] = time.time()
         
         
     def take_time_forward(
@@ -86,46 +84,21 @@ class LayerProfiler:
         if isinstance(layer, nn.Embedding) and layer.num_embeddings == self.config.vocab_size:
             self.layer_input_length[name].append(inputs[0].shape[1])
             
-        self.layer_time_forward[name].append(time.time() - self.layer_time_reach[name])
+        self.layer_time_forward[name].append(time.time() - self.layer_forward_reach[name])
         self.layer_memory_forward[name].append(torch.cuda.memory_allocated())
         
-    # def take_time_pre_backward(
-    #     self, 
-    #     module: nn.Module, 
-    #     grad_input: Tuple[torch.Tensor], 
-    #     grad_output: Tuple[torch.Tensor],
-    # ):
-    #     name = self.get_module_name(module)
-    #     self.layer_time_return[name] = time.time()
-
+        
     # def take_time_backward(
     #     self, 
     #     module: nn.Module, 
     #     grad_input: Tuple[torch.Tensor], 
     #     grad_output: Tuple[torch.Tensor],
+    #     *args,  # Accept additional arguments
     # ):
     #     name = self.get_module_name(module)
-    #     self.layer_time_backward[name].append(time.time() - self.layer_time_return[name])
+    #     self.layer_backward_reach[name].append(time.time())
     #     self.layer_memory_backward[name].append(torch.cuda.memory_allocated())
-        
-    def take_time_backward(
-        self, 
-        module: nn.Module, 
-        grad_input: Tuple[torch.Tensor], 
-        grad_output: Tuple[torch.Tensor],
-        *args,  # Accept additional arguments
-    ):
-        name = self.get_module_name(module)
-        # If the time_return for this module is not set, then it's the start of the backward pass for this module.
-        if name not in self.layer_time_return:
-            self.layer_time_return[name] = time.time()
-        else:
-            # If the time_return for this module is set, then it's the end of the backward pass for this module.
-            self.layer_time_backward[name].append(time.time() - self.layer_time_return[name])
-            self.layer_memory_backward[name].append(torch.cuda.memory_allocated())
-            # Reset the time_return for this module.
-            del self.layer_time_return[name]
-        
+            
         
     def register_hook(
         self, 
@@ -164,20 +137,14 @@ class LayerProfiler:
                 layer.register_forward_hook(
                     partial(self.take_time_forward, layer_name, layer)
                 )
-                # layer.register_backward_hook(
-                #     partial(self.take_time_pre_backward, layer)
-                # )
-                # layer.register_backward_hook(
-                #     partial(self.take_time_backward, layer)
-                # )
-                if hasattr(layer, 'register_full_backward_hook'):
-                    layer.register_full_backward_hook(
-                        partial(self.take_time_backward, layer)
-                    )
-                else:
-                    layer.register_backward_hook(
-                        partial(self.take_time_backward, layer)
-                    )
+                # if hasattr(layer, 'register_full_backward_hook'):
+                #     layer.register_full_backward_hook(
+                #         partial(self.take_time_backward, layer)
+                #     )
+                # else:
+                #     layer.register_backward_hook(
+                #         partial(self.take_time_backward, layer)
+                #     )
                 self.logger.info(f"Register hook for {layer_name}")
 
 
@@ -256,12 +223,6 @@ if __name__ == '__main__':
         time_val = sum(profiler.layer_time_forward[key]) / args.profiling_iterations
         memory_val = sum(profiler.layer_memory_forward.get(key, 0)) / ((1024 ** 2) * args.profiling_iterations)  # Convert from bytes to MB
         logger.info(f"{key:<{max_key_length}} \t Time: {time_val*1000:.6f} ms \t Memory: {memory_val:.2f} MB")
-        
-        if profiler.layer_time_backward == {}:
-            continue
-        backward_val = sum(profiler.layer_time_backward[key]) / args.profiling_iterations
-        backward_memory_val = sum(profiler.layer_memory_backward.get(key, 0)) / ((1024 ** 2) * args.profiling_iterations)  # Convert from bytes to MB
-        logger.info(f"{key:<{max_key_length}} \t Backward Time: {backward_val*1000:.6f} ms \t Backward Memory: {backward_memory_val:.2f} MB")
 
     # TODO: postprocessing for the results: delta memory, memory ratio, latency ratio, etc.
     logger.info(f"Total time: {(end - begin):.6f} s")

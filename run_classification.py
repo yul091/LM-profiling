@@ -37,7 +37,6 @@ from transformers import (
     DataCollatorWithPadding,
     EvalPrediction,
     HfArgumentParser,
-    Trainer,
     TrainingArguments,
     default_data_collator,
     set_seed,
@@ -49,6 +48,7 @@ from transformers.utils.versions import require_version
 import json
 sys.dont_write_bytecode = True
 from layer_profiler import LayerProfiler
+from utils import BackwardProfileTrainer
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.34.0.dev0")
@@ -678,7 +678,7 @@ def main():
         data_collator = None
 
     # Initialize our Trainer
-    trainer = Trainer(
+    trainer = BackwardProfileTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -711,21 +711,14 @@ def main():
         
         layer_input_length = profiler.layer_input_length
         layer_time_forward = profiler.layer_time_forward
-        layer_time_backward = profiler.layer_time_backward
         layer_memory_forward = profiler.layer_memory_forward
-        layer_memory_backward = profiler.layer_memory_backward
 
         # Save profiling results
-        model_n = model_args.model_name_or_path.split('/')[-1]
-        with open(f'{training_args.output_dir}/train_latency_forward_{model_n}.json', 'w') as f:
+        with open(f'{training_args.output_dir}/train_latency_forward.json', 'w') as f:
             json.dump(layer_time_forward, f)
-        with open(f'{training_args.output_dir}/train_memory_forward_{model_n}.json', 'w') as f:
+        with open(f'{training_args.output_dir}/train_memory_forward.json', 'w') as f:
             json.dump(layer_memory_forward, f)
-        with open(f'{training_args.output_dir}/train_latency_backward_{model_n}.json', 'w') as f:
-            json.dump(layer_time_backward, f)
-        with open(f'{training_args.output_dir}/train_memory_backward_{model_n}.json', 'w') as f:
-            json.dump(layer_memory_backward, f)
-        with open(f'{training_args.output_dir}/train_input_length_{model_n}.json', 'w') as f:
+        with open(f'{training_args.output_dir}/train_input_length.json', 'w') as f:
             json.dump(layer_input_length, f)
 
     # Evaluation
@@ -741,12 +734,11 @@ def main():
         trainer.save_metrics("eval", metrics)
         
         # Save profiling results
-        model_n = model_args.model_name_or_path.split('/')[-1]
-        with open(f'{training_args.output_dir}/eval_latency_forward_{model_n}.json', 'w') as f:
+        with open(f'{training_args.output_dir}/eval_latency_forward.json', 'w') as f:
             json.dump(layer_time_forward, f)
-        with open(f'{training_args.output_dir}/eval_memory_forward_{model_n}.json', 'w') as f:
+        with open(f'{training_args.output_dir}/eval_memory_forward.json', 'w') as f:
             json.dump(layer_memory_forward, f)
-        with open(f'{training_args.output_dir}/eval_input_length_{model_n}.json', 'w') as f:
+        with open(f'{training_args.output_dir}/eval_input_length.json', 'w') as f:
             json.dump(layer_input_length, f)
 
     if training_args.do_predict:
@@ -783,6 +775,12 @@ def main():
         trainer.push_to_hub(**kwargs)
     else:
         trainer.create_model_card(**kwargs)
+        
+        
+
+
+
+
 
 
 def _mp_fn(index):
