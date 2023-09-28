@@ -15,7 +15,6 @@ from transformers import (
     DataCollatorWithPadding,
 )
 
-# from profile_gpt2 import GPT2ForSequenceClassificationProfile
 from layer_profiler import LayerProfiler
 
 
@@ -94,17 +93,17 @@ def inference(args: argparse.Namespace, logger: logging.Logger = None):
         # logger.info(f"Predictions: {decoded_predictions}")
         
         
-    layer_time_cost = profiler.layer_time_cost
+    layer_time_forward = profiler.layer_time_forward
     layer_input_length = profiler.layer_input_length
-    layer_memory = profiler.layer_memory
+    layer_memory = profiler.layer_memory_forward
 
     # Save the results
     model_n = model_name_or_path.split('/')[-1]
-    with open(f'{output_dir}/latency_{model_n}_res.json', 'w') as f:
-        json.dump(layer_time_cost, f)
-    with open(f'{output_dir}/memory_{model_n}_res.json', 'w') as f:
+    with open(f'{output_dir}/latency_forward_{model_n}.json', 'w') as f:
+        json.dump(layer_time_forward, f)
+    with open(f'{output_dir}/memory_forward_{model_n}.json', 'w') as f:
         json.dump(layer_memory, f)
-    with open(f'{output_dir}/input_length_{model_n}_res.json', 'w') as f:
+    with open(f'{output_dir}/input_length_{model_n}.json', 'w') as f:
         json.dump(layer_input_length, f)
 
 
