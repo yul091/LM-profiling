@@ -1,4 +1,6 @@
 import time
+import psutil
+import GPUtil
 import argparse
 import logging
 from collections import defaultdict
@@ -45,6 +47,11 @@ class LayerProfiler:
         self.layer_forward_reach = defaultdict(float)
         self.layer_time_forward = defaultdict(list)
         self.layer_memory_forward = defaultdict(list)
+        self.layer_memory_backward = defaultdict(list)
+        # self.layer_forward_cpu_utils = defaultdict(list)
+        # self.layer_forward_gpu_utils = defaultdict(list)
+        # self.layer_backward_cpu_utils = defaultdict(list)
+        # self.layer_backward_gpu_utils = defaultdict(list)
         
         if logger is None:
             self.logger = logging.getLogger(__name__)
@@ -81,23 +88,31 @@ class LayerProfiler:
         outputs: Tuple[torch.Tensor],
         **kwargs,
     ):
+        # gpus = GPUtil.getGPUs()
+        # gpu_utilization = gpus[0].load if gpus else None
+        # self.layer_forward_cpu_utils[name].append(psutil.cpu_percent())
+        # self.layer_forward_gpu_utils[name].append(gpu_utilization)
+        
         if isinstance(layer, nn.Embedding) and layer.num_embeddings == self.config.vocab_size:
             self.layer_input_length[name].append(inputs[0].shape[1])
             
         self.layer_time_forward[name].append(time.time() - self.layer_forward_reach[name])
         self.layer_memory_forward[name].append(torch.cuda.memory_allocated())
+
         
-        
-    # def take_time_backward(
-    #     self, 
-    #     module: nn.Module, 
-    #     grad_input: Tuple[torch.Tensor], 
-    #     grad_output: Tuple[torch.Tensor],
-    #     *args,  # Accept additional arguments
-    # ):
-    #     name = self.get_module_name(module)
-    #     self.layer_backward_reach[name].append(time.time())
-    #     self.layer_memory_backward[name].append(torch.cuda.memory_allocated())
+    def take_time_backward(
+        self, 
+        module: nn.Module, 
+        grad_input: Tuple[torch.Tensor], 
+        grad_output: Tuple[torch.Tensor],
+        *args,  # Accept additional arguments
+    ):
+        name = self.get_module_name(module)
+        # gpus = GPUtil.getGPUs()
+        # gpu_utilization = gpus[0].load if gpus else None
+        # self.layer_backward_cpu_utils[name].append(psutil.cpu_percent())
+        # self.layer_backward_gpu_utils[name].append(gpu_utilization)
+        self.layer_memory_backward[name].append(torch.cuda.memory_allocated())
             
         
     def register_hook(
@@ -137,14 +152,14 @@ class LayerProfiler:
                 layer.register_forward_hook(
                     partial(self.take_time_forward, layer_name, layer)
                 )
-                # if hasattr(layer, 'register_full_backward_hook'):
-                #     layer.register_full_backward_hook(
-                #         partial(self.take_time_backward, layer)
-                #     )
-                # else:
-                #     layer.register_backward_hook(
-                #         partial(self.take_time_backward, layer)
-                #     )
+                if hasattr(layer, 'register_full_backward_hook'):
+                    layer.register_full_backward_hook(
+                        partial(self.take_time_backward, layer)
+                    )
+                else:
+                    layer.register_backward_hook(
+                        partial(self.take_time_backward, layer)
+                    )
                 self.logger.info(f"Register hook for {layer_name}")
 
 
@@ -155,7 +170,6 @@ if __name__ == '__main__':
     parser.add_argument('--model_name_or_path', type=str, default='bert-base-uncased')
     parser.add_argument('--profiling_iterations', type=int, default=1000)
     parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--sort', action='store_true')
     parser.add_argument('--output_dir', type=str, default='logging')
     args = parser.parse_args()
     
@@ -211,7 +225,7 @@ if __name__ == '__main__':
 
     # Sort: print the results grouped by layer type
     # No sort: print the results grouped by the order of execution
-    sort = args.sort
+    sort = True
     if sort:
         # Sort the dictionary based on keys
         sorted_keys = sorted(profiler.layer_time_forward.keys())
@@ -222,6 +236,8 @@ if __name__ == '__main__':
     for key in sorted_keys:
         time_val = sum(profiler.layer_time_forward[key]) / args.profiling_iterations
         memory_val = sum(profiler.layer_memory_forward.get(key, 0)) / ((1024 ** 2) * args.profiling_iterations)  # Convert from bytes to MB
+        # cpu_val = sum(profiler.layer_forward_cpu_utils[key]) / args.profiling_iterations
+        # gpu_val = sum(profiler.layer_forward_gpu_utils[key]) / args.profiling_iterations
         logger.info(f"{key:<{max_key_length}} \t Time: {time_val*1000:.6f} ms \t Memory: {memory_val:.2f} MB")
 
     # TODO: postprocessing for the results: delta memory, memory ratio, latency ratio, etc.

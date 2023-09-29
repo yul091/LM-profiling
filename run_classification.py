@@ -708,18 +708,24 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
-        
-        layer_input_length = profiler.layer_input_length
-        layer_time_forward = profiler.layer_time_forward
-        layer_memory_forward = profiler.layer_memory_forward
 
         # Save profiling results
-        with open(f'{training_args.output_dir}/train_latency_forward.json', 'w') as f:
-            json.dump(layer_time_forward, f)
-        with open(f'{training_args.output_dir}/train_memory_forward.json', 'w') as f:
-            json.dump(layer_memory_forward, f)
+        with open(f'{training_args.output_dir}/train_forward_latency.json', 'w') as f:
+            json.dump(profiler.layer_time_forward, f)
+        with open(f'{training_args.output_dir}/train_forward_memory.json', 'w') as f:
+            json.dump(profiler.layer_memory_forward, f)
         with open(f'{training_args.output_dir}/train_input_length.json', 'w') as f:
-            json.dump(layer_input_length, f)
+            json.dump(profiler.layer_input_length, f)
+        with open(f'{training_args.output_dir}/train_backward_latency.json', 'w') as f:
+            json.dump(trainer.backward_time, f)
+        # with open(f'{training_args.output_dir}/train_forward_cpu_utils.json', 'w') as f:
+        #     json.dump(profiler.layer_forward_cpu_utils, f)
+        # with open(f'{training_args.output_dir}/train_backward_cpu_utils.json', 'w') as f:
+        #     json.dump(profiler.layer_backward_cpu_utils, f)
+        # with open(f'{training_args.output_dir}/train_forward_gpu_utils.json', 'w') as f:
+        #     json.dump(profiler.layer_forward_gpu_utils, f)
+        # with open(f'{training_args.output_dir}/train_backward_gpu_utils.json', 'w') as f:
+        #     json.dump(profiler.layer_backward_gpu_utils, f)
 
     # Evaluation
     if training_args.do_eval:
@@ -734,12 +740,12 @@ def main():
         trainer.save_metrics("eval", metrics)
         
         # Save profiling results
-        with open(f'{training_args.output_dir}/eval_latency_forward.json', 'w') as f:
-            json.dump(layer_time_forward, f)
-        with open(f'{training_args.output_dir}/eval_memory_forward.json', 'w') as f:
-            json.dump(layer_memory_forward, f)
+        with open(f'{training_args.output_dir}/eval_forward_latency.json', 'w') as f:
+            json.dump(profiler.layer_time_forward, f)
+        with open(f'{training_args.output_dir}/eval_forward_memory.json', 'w') as f:
+            json.dump(profiler.layer_memory_forward, f)
         with open(f'{training_args.output_dir}/eval_input_length.json', 'w') as f:
-            json.dump(layer_input_length, f)
+            json.dump(profiler.layer_input_length, f)
 
     if training_args.do_predict:
         logger.info("*** Predict ***")
