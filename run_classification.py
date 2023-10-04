@@ -49,7 +49,11 @@ from transformers.utils.versions import require_version
 import json
 sys.dont_write_bytecode = True
 from layer_profiler import LayerProfiler
-from utils import BackwardProfileTrainer, BackwardSelectionTrainer, BertForSequenceClassification, BackwardAccumulateTrainer
+from utils import (
+    BackwardSelectionTrainer, 
+    AdaptiveTrainer,
+    BertForSequenceClassification,
+)
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.34.0.dev0")
@@ -196,6 +200,9 @@ class DataTrainingArguments:
     )
     backward_accumulation: bool = field(
         default=False, metadata={"help": "Whether to use backward accumulation."}
+    )
+    do_profiling: bool = field(
+        default=False, metadata={"help": "Whether to do backward profiling."}
     )
 
     def __post_init__(self):
@@ -695,36 +702,17 @@ def main():
         data_collator = None
 
     # Initialize our Trainer
-    if data_args.backward_accumulation:
-        logger.info("Using backward accumulation !!!")
-        trainer = BackwardAccumulateTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset if training_args.do_train else None,
-            eval_dataset=eval_dataset if training_args.do_eval else None,
-            compute_metrics=compute_metrics,
-            tokenizer=tokenizer,
-            data_collator=data_collator,
-        )
-    else:
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset if training_args.do_train else None,
-            eval_dataset=eval_dataset if training_args.do_eval else None,
-            compute_metrics=compute_metrics,
-            tokenizer=tokenizer,
-            data_collator=data_collator,
-        )
-    # trainer = BackwardProfileTrainer(
-    #     model=model,
-    #     args=training_args,
-    #     train_dataset=train_dataset if training_args.do_train else None,
-    #     eval_dataset=eval_dataset if training_args.do_eval else None,
-    #     compute_metrics=compute_metrics,
-    #     tokenizer=tokenizer,
-    #     data_collator=data_collator,
-    # )
+    trainer = AdaptiveTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        compute_metrics=compute_metrics,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        do_profiling=data_args.do_profiling,
+        backward_accumulation=data_args.backward_accumulation,
+    )
     # trainer = BackwardSelectionTrainer(
     #     model=model,
     #     args=training_args,
@@ -757,14 +745,24 @@ def main():
         trainer.save_state()
 
         # Save profiling results
+        if data_args.do_profiling:
+            if training_args.gradient_accumulation_steps == 1:
+                strategy = 'standard'
+            else:
+                if data_args.backward_accumulation:
+                    strategy = 'backward-accumulation'
+                else:
+                    strategy = 'gradient-accumulation'
+            b_size = training_args.per_device_train_batch_size if data_args.selection_batch_size == -1 else data_args.selection_batch_size
+            a_step = training_args.gradient_accumulation_steps
+            with open(f'{training_args.output_dir}/{strategy}(batch={b_size},accum={a_step}).json', 'w') as f:
+                json.dump(trainer.backward_time, f)
         # with open(f'{training_args.output_dir}/train_forward_latency.json', 'w') as f:
         #     json.dump(profiler.layer_time_forward, f)
         # with open(f'{training_args.output_dir}/train_forward_memory.json', 'w') as f:
         #     json.dump(profiler.layer_memory_forward, f)
         # with open(f'{training_args.output_dir}/train_input_length.json', 'w') as f:
         #     json.dump(profiler.layer_input_length, f)
-        # with open(f'{training_args.output_dir}/train_backward_latency(batch={data_args.selection_batch_size}).json', 'w') as f:
-        #     json.dump(trainer.backward_time, f)
         # with open(f'{training_args.output_dir}/train_forward_cpu_utils.json', 'w') as f:
         #     json.dump(profiler.layer_forward_cpu_utils, f)
         # with open(f'{training_args.output_dir}/train_backward_cpu_utils.json', 'w') as f:

@@ -18,7 +18,7 @@ from transformers.models.bert.modeling_bert import (
     BertModel,
     BERT_START_DOCSTRING,
     BERT_INPUTS_DOCSTRING,
-    _TOKENIZER_FOR_DOC,
+    # _TOKENIZER_FOR_DOC,
     _CHECKPOINT_FOR_SEQUENCE_CLASSIFICATION,
     _CONFIG_FOR_DOC,
     _SEQ_CLASS_EXPECTED_OUTPUT,
@@ -211,7 +211,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
+        # processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_SEQUENCE_CLASSIFICATION,
         output_type=SequenceClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -291,49 +291,6 @@ class BertForSequenceClassification(BertPreTrainedModel):
 
 
 
-class BackwardProfileTrainer(Trainer):
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Initialize the list to store backwad time
-        self.backward_time = []
-        
-        
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
-        model.train()
-        inputs = self._prepare_inputs(inputs)
-
-        if is_sagemaker_mp_enabled():
-            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
-            return loss_mb.reduce_mean().detach().to(self.args.device)
-
-        with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs)
-
-        if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
-
-        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
-            # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
-            loss = loss / self.args.gradient_accumulation_steps
-
-        # Backward
-        backward_start_time = time.time()
-        if self.do_grad_scaling:
-            self.scaler.scale(loss).backward()
-        elif self.use_apex:
-            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
-        elif self.deepspeed:
-            # loss gets scaled under gradient_accumulation_steps in deepspeed
-            loss = self.deepspeed.backward(loss)
-        else:
-            loss.backward()
-        self.backward_time.append(time.time() - backward_start_time)
-
-        return loss.detach()
-
-
 
 class BackwardSelectionTrainer(Trainer):
     
@@ -390,51 +347,132 @@ class BackwardSelectionTrainer(Trainer):
     
     
     
-class BackwardAccumulateTrainer(Trainer):
+class AdaptiveTrainer(Trainer):
     
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self, 
+        do_profiling: bool = False,
+        backward_accumulation: bool = False, 
+        *args, 
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.accumulated_loss = 0
         self.step_counter = 0
+        self.do_profiling = do_profiling
+        if self.do_profiling:
+            self.backward_time = []
+        self.backward_accumulation = backward_accumulation
         
         
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
-        model.train()
-        inputs = self._prepare_inputs(inputs)
-
-        if is_sagemaker_mp_enabled():
-            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
-            return loss_mb.reduce_mean().detach().to(self.args.device)
-
-        with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs)
-
-        if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
-
-        # if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
-        #     # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
-        #     loss = loss / self.args.gradient_accumulation_steps
-
-        # Backward
-        self.step_counter += 1
-        self.accumulated_loss += loss
+    def training_step(
+        self, 
+        model: nn.Module, 
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+    ) -> torch.Tensor:
         
-        if self.step_counter % self.args.gradient_accumulation_steps == 0:
+        if self.backward_accumulation:
+            model.train()
+            inputs = self._prepare_inputs(inputs)
+
+            if is_sagemaker_mp_enabled():
+                loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+                return loss_mb.reduce_mean().detach().to(self.args.device)
+
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+
+            if self.args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+            # if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+            #     # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+            #     loss = loss / self.args.gradient_accumulation_steps
+
+            # Backward
+            self.step_counter += 1
+            self.accumulated_loss += loss
             
-            actual_loss = self.accumulated_loss / self.args.gradient_accumulation_steps
-
-            if self.do_grad_scaling:
-                self.scaler.scale(actual_loss).backward()
-            elif self.use_apex:
-                with amp.scale_loss(actual_loss, self.optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            elif self.deepspeed:
-                # loss gets scaled under gradient_accumulation_steps in deepspeed
-                loss = self.deepspeed.backward(loss)
-            else:
-                actual_loss.backward()
+            if self.step_counter % self.args.gradient_accumulation_steps == 0:
                 
-            self.accumulated_loss = 0
+                actual_loss = self.accumulated_loss / self.args.gradient_accumulation_steps
+                
+                if self.do_profiling:
+                    
+                    backward_start_time = time.time()
+                    if self.do_grad_scaling:
+                        self.scaler.scale(actual_loss).backward()
+                    elif self.use_apex:
+                        with amp.scale_loss(actual_loss, self.optimizer) as scaled_loss:
+                            scaled_loss.backward()
+                    elif self.deepspeed:
+                        # loss gets scaled under gradient_accumulation_steps in deepspeed
+                        loss = self.deepspeed.backward(loss)
+                    else:
+                        actual_loss.backward()
+                    self.backward_time.append(time.time() - backward_start_time)
+                    
+                else:
+                    
+                    if self.do_grad_scaling:
+                        self.scaler.scale(actual_loss).backward()
+                    elif self.use_apex:
+                        with amp.scale_loss(actual_loss, self.optimizer) as scaled_loss:
+                            scaled_loss.backward()
+                    elif self.deepspeed:
+                        # loss gets scaled under gradient_accumulation_steps in deepspeed
+                        loss = self.deepspeed.backward(loss)
+                    else:
+                        actual_loss.backward()
+                    
+                self.accumulated_loss = 0
 
-        return loss.detach()
+            return loss.detach()
+        
+        else:
+            model.train()
+            inputs = self._prepare_inputs(inputs)
+
+            if is_sagemaker_mp_enabled():
+                loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+                return loss_mb.reduce_mean().detach().to(self.args.device)
+
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+
+            if self.args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+            if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+                # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+                loss = loss / self.args.gradient_accumulation_steps
+
+            # Backward
+            if self.do_profiling:
+            
+                backward_start_time = time.time()
+                if self.do_grad_scaling:
+                    self.scaler.scale(loss).backward()
+                elif self.use_apex:
+                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                elif self.deepspeed:
+                    # loss gets scaled under gradient_accumulation_steps in deepspeed
+                    loss = self.deepspeed.backward(loss)
+                else:
+                    loss.backward()
+                self.backward_time.append(time.time() - backward_start_time)
+                
+            else:
+                if self.do_grad_scaling:
+                    self.scaler.scale(loss).backward()
+                elif self.use_apex:
+                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                elif self.deepspeed:
+                    # loss gets scaled under gradient_accumulation_steps in deepspeed
+                    loss = self.deepspeed.backward(loss)
+                else:
+                    loss.backward()
+
+            return loss.detach()
