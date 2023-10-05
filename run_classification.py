@@ -746,17 +746,14 @@ def main():
 
         # Save profiling results
         if data_args.do_profiling:
-            if training_args.gradient_accumulation_steps == 1:
-                strategy = 'standard'
-            else:
-                if data_args.backward_accumulation:
-                    strategy = 'backward-accumulation'
-                else:
-                    strategy = 'gradient-accumulation'
             b_size = training_args.per_device_train_batch_size if data_args.selection_batch_size == -1 else data_args.selection_batch_size
             a_step = training_args.gradient_accumulation_steps
-            with open(f'{training_args.output_dir}/{strategy}(batch={b_size},accum={a_step}).json', 'w') as f:
+            with open(f'{training_args.output_dir}/forward(batch={b_size},accum={a_step}).json', 'w') as f:
+                json.dump(trainer.forward_time, f)
+            with open(f'{training_args.output_dir}/backward(batch={b_size},accum={a_step}).json', 'w') as f:
                 json.dump(trainer.backward_time, f)
+            with open(f'{training_args.output_dir}/optimization(batch={b_size},accum={a_step}).json', 'w') as f:
+                json.dump(trainer.optimization_time, f)
         # with open(f'{training_args.output_dir}/train_forward_latency.json', 'w') as f:
         #     json.dump(profiler.layer_time_forward, f)
         # with open(f'{training_args.output_dir}/train_forward_memory.json', 'w') as f:
