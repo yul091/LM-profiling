@@ -27,13 +27,7 @@ from transformers.modeling_outputs import (
 )
 from utils import get_transformer_layers
 
-# Set the logging format
-logging.basicConfig(
-    filename='profiling.log',
-    filemode='w', # overwrite the log file every time
-    format='%(asctime)s - %(levelname)s - %(message)s', 
-    level=logging.INFO,
-)
+
 
 class ReLUSquaredActivation(nn.Module):
     """
@@ -413,16 +407,24 @@ if __name__ == "__main__":
     # loss = outputs.mean()
     # scaler.scale(loss).backward()
     
-    model_name_or_path = args.model_name_or_path
+    model_name = args.model_name_or_path
     batch_size = args.batch_size
     grad_accum_steps = args.gradient_accumulation_steps
     back_accum_steps = args.backward_accumulation_steps
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     
-    model = BertForSequenceClassificationPipelineParallel.from_pretrained(model_name_or_path)
+    # Set the logging format
+    logging.basicConfig(
+        filename=f'{output_dir}/{model_name}_{batch_size}_{back_accum_steps}.log',
+        filemode='w', # overwrite the log file every time
+        format='%(asctime)s - %(levelname)s - %(message)s', 
+        level=logging.INFO,
+    )
+    
+    model = BertForSequenceClassificationPipelineParallel.from_pretrained(model_name)
     logging.info(f'Putting {model.__class__.__name__} to devices {model.devices} !!!')
-    tokenizer = BertTokenizer.from_pretrained(model_name_or_path)
+    tokenizer = BertTokenizer.from_pretrained(model_name)
     
     # Assign layers to GPUs
     for i, layer in enumerate(get_transformer_layers(model)):
@@ -510,7 +512,7 @@ if __name__ == "__main__":
     total_time = time.time() - start
     logging.info("Finished training !!!")
     logging.info("Settings: Model {} - Step {} - Back accum steps {}".format(
-        model_name_or_path, step+1, back_accum_steps
+        model_name, step+1, back_accum_steps
     ))
     logging.info(f"Total training time: {total_time:.0f}s")
     logging.info(f"Data time: {data_time:.0f}s ({data_time * 100 / total_time:.2f}%)")
