@@ -1,1 +1,6 @@
-GPUtil
+matplotlib
+evaluate
+torch
+torchvision
+torchaudio
+transformers[torch]

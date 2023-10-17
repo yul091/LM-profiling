@@ -5,6 +5,7 @@ import math
 import shutil
 import logging
 from typing import Dict, Union, Any, List, Tuple, Optional
+from collections.abc import Mapping
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -17,7 +18,17 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from packaging import version
-from transformers import Trainer
+from transformers import (
+    BertModel,
+    BertForSequenceClassification,
+    GPT2Model,
+    GPT2ForSequenceClassification,
+    XLNetModel,
+    XLNetForSequenceClassification,
+    BartModel,
+    BartForSequenceClassification,
+    Trainer,
+)
 from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from transformers.integrations.deepspeed import deepspeed_init, deepspeed_load_checkpoint
 from transformers.training_args import OptimizerNames, ParallelMode, TrainingArguments
@@ -85,6 +96,31 @@ COLOR_MAP = {
     'dropout': 'grey',
     'backward': 'green',
 }
+
+
+
+
+def get_transformer_layers(
+    model: Union[
+        BertForSequenceClassification, 
+        GPT2ForSequenceClassification, 
+        XLNetForSequenceClassification, 
+        BartForSequenceClassification,
+    ]
+) -> List[Union[BertModel, GPT2Model, XLNetModel, BartModel]]:
+    model_name = model.__class__.__name__.lower()
+    layers = []
+    if "bert" in model_name:
+        layers = model.bert.encoder.layer
+    elif "gpt2" in model_name:
+        layers = model.transformer.h
+    elif "xlnet" in model_name:
+        layers = model.transformer.layer
+    elif "bart" in model_name:
+        encoder_layers = model.model.encoder.layers
+        decoder_layers = model.model.decoder.layers
+        layers = encoder_layers + decoder_layers
+    return layers
 
 def get_colors(index: List[str], color_map: dict = COLOR_MAP):
     return [
@@ -389,9 +425,18 @@ class AdaptiveTrainer(Trainer):
         self, 
         do_profiling: bool = False,
         backward_accumulation: bool = False, 
+        devices: List[str] = None,
         *args, 
         **kwargs,
     ):
+        if devices is None:
+            self.num_gpus = torch.cuda.device_count()
+            self.devices = [f"cuda:{i}" for i in range(self.num_gpus)]
+        else:
+            self.num_gpus = len(devices)
+            self.devices = devices
+        print(f'Using devices: {self.devices} !!!')
+
         super().__init__(*args, **kwargs)
         self.accumulated_loss = 0
         self.step_counter = 0
@@ -401,7 +446,63 @@ class AdaptiveTrainer(Trainer):
             self.backward_time = []
             self.optimization_time = []
         self.backward_accumulation = backward_accumulation
-        
+    
+
+    def _prepare_input(self, data: Union[torch.Tensor, Any], key: Optional[str] = None) -> Union[torch.Tensor, Any]:
+        """
+        Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
+        """
+        if isinstance(data, Mapping):
+            return type(data)({k: self._prepare_input(v, k) for k, v in data.items()})
+        elif isinstance(data, (tuple, list)):
+            return type(data)(self._prepare_input(v) for v in data)
+        elif isinstance(data, torch.Tensor):
+            target_device = self.devices[-1] if key == "labels" else self.devices[0]
+            kwargs = {"device": target_device}
+            if self.is_deepspeed_enabled and (torch.is_floating_point(data) or torch.is_complex(data)):
+                # NLP models inputs are int/uint and those get adjusted to the right dtype of the
+                # embedding. Other models such as wav2vec2's inputs are already float and thus
+                # may need special handling to match the dtypes of the model
+                kwargs.update({"dtype": self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()})
+            return data.to(**kwargs)
+        return data
+
+    def _prepare_inputs(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
+        """
+        Prepare `inputs` before feeding them to the model, converting them to tensors if they are not already and
+        handling potential state.
+        """
+        for key, value in inputs.items():
+            inputs[key] = self._prepare_input(value, key)
+        if len(inputs) == 0:
+            raise ValueError(
+                "The batch received was empty, your model won't be able to train on it. Double-check that your "
+                f"training dataset contains keys expected by the model: {','.join(self._signature_columns)}."
+            )
+        if self.args.past_index >= 0 and self._past is not None:
+            inputs["mems"] = self._past
+
+        return inputs
+    
+    
+    def _move_model_to_device(self, model, device):
+        # model = model.to(device)
+        # Assign layers to GPUs
+        for i, layer in enumerate(get_transformer_layers(model)):
+            device_idx = i * self.num_gpus // model.config.num_hidden_layers
+            device = self.devices[device_idx]
+            layer.to(device)
+
+        # Other components
+        model.bert.embeddings.to(self.devices[0])
+        model.bert.pooler.to(self.devices[-1])
+        model.dropout.to(self.devices[-1])
+        model.classifier.to(self.devices[-1])
+    
+        # Moving a model to an XLA device disconnects the tied weights, so we have to retie them.
+        if self.args.parallel_mode == ParallelMode.TPU and hasattr(model, "tie_weights"):
+            model.tie_weights()
+
         
     def _forward(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]):
         if is_sagemaker_mp_enabled():
@@ -442,6 +543,10 @@ class AdaptiveTrainer(Trainer):
         
         model.train()
         inputs = self._prepare_inputs(inputs)
+        
+        # Check the devices of inputs and models
+        # print([f'{k}:{v.device}' for k, v in inputs.items()])
+        # print([f'{k}:{v.device}' for k, v in model.named_parameters()])
 
         # Forward
         if self.do_profiling:
@@ -582,7 +687,9 @@ class AdaptiveTrainer(Trainer):
         if args.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        model = self._wrap_model(self.model_wrapped)
+        # model = self._wrap_model(self.model_wrapped)
+        model = self.model_wrapped
+        print([f'{k}: {v.device}' for k, v in model.named_parameters()])
 
         if (is_sagemaker_mp_enabled() or self.is_fsdp_enabled) and resume_from_checkpoint is not None:
             self._load_from_checkpoint(resume_from_checkpoint, model)

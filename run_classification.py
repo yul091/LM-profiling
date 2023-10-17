@@ -28,7 +28,7 @@ import datasets
 import evaluate
 import numpy as np
 from datasets import Value, load_dataset
-
+import torch
 import transformers
 from transformers import (
     AutoConfig,
@@ -54,6 +54,7 @@ from utils import (
     AdaptiveTrainer,
     BertForSequenceClassification,
 )
+from test_model_parallel import BertForSequenceClassificationPipelineParallel
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.34.0.dev0")
@@ -62,6 +63,7 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text
 
 
 logger = logging.getLogger(__name__)
+
 
 
 @dataclass
@@ -530,7 +532,7 @@ def main():
         token=model_args.token,
         trust_remote_code=model_args.trust_remote_code,
     )
-    model = AutoModelForSequenceClassification.from_pretrained(
+    model = BertForSequenceClassificationPipelineParallel.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
