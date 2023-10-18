@@ -372,7 +372,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--backward_accumulation_steps', type=int, default=1)
-    parser.add_argument('--eval_per_steps', type=int, default=10)
+    parser.add_argument('--eval_per_steps', type=int, default=100)
     parser.add_argument('--output_dir', type=str, default='logging')
     parser.add_argument('--learning_rate', type=float, default=2e-5)
     parser.add_argument('--weight_decay', type=float, default=0.01)
@@ -426,10 +426,10 @@ if __name__ == "__main__":
     
     # Set the logging format
     logging.basicConfig(
-        # filename=f'{output_dir}/{model_name}_{batch_size}_{back_accum_steps}.log',
-        # filemode='w', # overwrite the log file every time
+        filename=f'{output_dir}/{model_name}_{batch_size}_{back_accum_steps}.log',
+        filemode='w', # overwrite the log file every time
         format='%(asctime)s - %(levelname)s - %(message)s', 
-        level=logging.DEBUG,
+        level=logging.INFO,
     )
     
     config = AutoConfig.from_pretrained(model_name, num_labels=20)
@@ -462,11 +462,11 @@ if __name__ == "__main__":
     train_dataset = Dataset.from_dict({
         'text': train_data['data'],
         'label': train_data['target'],
-    }).select(range(1000))
+    })
     test_dataset = Dataset.from_dict({
         'text': test_data['data'],
         'label': test_data['target'],
-    }).select(range(100))
+    })
     
     train_dataset = train_dataset.map(tokenize_data, batched=True).remove_columns(['text'])
     test_dataset = test_dataset.map(tokenize_data, batched=True).remove_columns(['text'])
