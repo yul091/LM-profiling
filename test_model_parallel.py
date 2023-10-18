@@ -8,7 +8,6 @@ import logging
 from datasets import Dataset
 import torch
 import torch.nn as nn
-from torch.optim import Adam
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
@@ -17,7 +16,9 @@ from torch.cuda.amp import GradScaler
 from transformers import (
     BertPreTrainedModel, 
     BertModel, 
-    BertTokenizer,
+    AutoConfig,
+    AutoTokenizer,
+    AdamW,
     DataCollatorWithPadding,   
 )
 from transformers.modeling_outputs import (
@@ -364,13 +365,17 @@ class BertForSequenceClassificationPipelineParallel(BertPreTrainedModel):
     
 if __name__ == "__main__":
     import argparse
+    from sklearn.datasets import fetch_20newsgroups
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name_or_path', type=str, default='bert-base-uncased')
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=16)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--backward_accumulation_steps', type=int, default=1)
+    parser.add_argument('--eval_per_steps', type=int, default=10)
     parser.add_argument('--output_dir', type=str, default='logging')
+    parser.add_argument('--learning_rate', type=float, default=2e-5)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
     
     args = parser.parse_args()
     
@@ -412,19 +417,25 @@ if __name__ == "__main__":
     grad_accum_steps = args.gradient_accumulation_steps
     back_accum_steps = args.backward_accumulation_steps
     output_dir = args.output_dir
+    eval_per_steps = args.eval_per_steps
+    model_kwargs = {
+        'lr': args.learning_rate,
+        'weight_decay': args.weight_decay,
+    }
     os.makedirs(output_dir, exist_ok=True)
     
     # Set the logging format
     logging.basicConfig(
-        filename=f'{output_dir}/{model_name}_{batch_size}_{back_accum_steps}.log',
-        filemode='w', # overwrite the log file every time
+        # filename=f'{output_dir}/{model_name}_{batch_size}_{back_accum_steps}.log',
+        # filemode='w', # overwrite the log file every time
         format='%(asctime)s - %(levelname)s - %(message)s', 
-        level=logging.INFO,
+        level=logging.DEBUG,
     )
     
-    model = BertForSequenceClassificationPipelineParallel.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, num_labels=20)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = BertForSequenceClassificationPipelineParallel.from_pretrained(model_name, config=config, devices=None)
     logging.info(f'Putting {model.__class__.__name__} to devices {model.devices} !!!')
-    tokenizer = BertTokenizer.from_pretrained(model_name)
     
     # Assign layers to GPUs
     for i, layer in enumerate(get_transformer_layers(model)):
@@ -438,46 +449,70 @@ if __name__ == "__main__":
     model.dropout.to(model.devices[-1])
     model.classifier.to(model.devices[-1])
     
-    optimizer = Adam(model.parameters(), lr=0.001, weight_decay=0.01)
-    accumulated_loss = 0
+    optimizer = AdamW(model.parameters(), **model_kwargs)
     
-    logging.info("Start training !!!")
-    data_time, forward_time, backward_time, opt_time = 0, 0, 0, 0
-    input_texts = [
-        "Hello, my dog is cute",
-        "Hello, I like your hat, where did you get it?",
-        "What day is it today?",
-        "How are you doing?",
-        "I am doing great!",
-        "The weather is nice today.",
-        "Can you please help me with the homework? I am stuck.",
-        "I am going to the park.",
-        "I am going to the park with my friends.",
-        "You are the most beautiful person I have ever met.",
-    ]*10000
-    labels = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0] * 10000
-
-    dataset = Dataset.from_pandas(pd.DataFrame({
-        'text': input_texts,
-        'label': labels,
-    }))
-    
+    # Prepare data
     def tokenize_data(examples):
         return tokenizer(examples['text'], truncation=True)
     
-    dataset = dataset.map(tokenize_data, batched=True).remove_columns(['text'])
     collate_fn = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
     
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=8, 
+    train_data = fetch_20newsgroups(subset='train')
+    test_data = fetch_20newsgroups(subset='test')
+    train_dataset = Dataset.from_dict({
+        'text': train_data['data'],
+        'label': train_data['target'],
+    }).select(range(1000))
+    test_dataset = Dataset.from_dict({
+        'text': test_data['data'],
+        'label': test_data['target'],
+    }).select(range(100))
+    
+    train_dataset = train_dataset.map(tokenize_data, batched=True).remove_columns(['text'])
+    test_dataset = test_dataset.map(tokenize_data, batched=True).remove_columns(['text'])
+    
+    train_dataloader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4,
+    )
+    test_dataloader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        collate_fn=collate_fn,
     )
     
+    # Define evaluation accuracy function
+    def compute_accuracy(
+        model: BertForSequenceClassificationPipelineParallel, 
+        dataloader: DataLoader,
+    ):
+        model.eval()
+        total_correct = 0
+        total_samples = 0
+        total_loss = 0
+        with torch.no_grad():
+            for batch in tqdm(dataloader):
+                inputs = {k: v.to(model.devices[0]) if k != "labels" else v.to(model.devices[-1]) for k, v in batch.items()}
+                outputs = model(**inputs)
+                logits = outputs.logits
+                labels = inputs['labels']
+                total_correct += (logits.argmax(dim=-1) == labels).sum().item()
+                total_samples += labels.shape[0]
+                total_loss += outputs.loss.item() 
+        avg_loss = total_loss / len(dataloader)
+        avg_acc = total_correct / total_samples
+        return avg_loss, avg_acc
+    
+    # Training
+    logging.info("Start training !!!")
+    data_time, forward_time, backward_time, opt_time, eval_time = 0, 0, 0, 0, 0
+    accumulated_loss = 0
+    
     start = time.time()
-    pbar = tqdm(enumerate(dataloader), total=len(dataloader))
+    pbar = tqdm(enumerate(train_dataloader), total=len(train_dataloader))
     for step, batch in pbar:
         epoch_start = time.time()
         model.train()
@@ -485,13 +520,14 @@ if __name__ == "__main__":
         # Prepare inputs for model
         inputs = {k: v.to(model.devices[0]) if k != "labels" else v.to(model.devices[-1]) for k, v in batch.items()}
         data_end = time.time()
-        
         optimizer.zero_grad()
+        
         # Forward pass
         outputs = model(**inputs)    
         loss = outputs.loss
         accumulated_loss += loss / grad_accum_steps
         forward_end = time.time()
+        pbar.set_description(f"loss: {accumulated_loss.item():.4f}")
         
         # Backward pass
         if (step + 1) % back_accum_steps == 0:
@@ -501,12 +537,19 @@ if __name__ == "__main__":
         
         if (step + 1) % grad_accum_steps == 0:
             optimizer.step()
+            
+        optimizer_end = time.time()
+            
+        if (step + 1) % eval_per_steps == 0:
+            test_loss, test_acc = compute_accuracy(model, test_dataloader)
+            logging.info(f"step {step+1} - eval loss: {test_loss:.4f} - eval acc: {test_acc:.4f}")
         
         # Accumulate time
-        opt_time += time.time() - backward_end
+        eval_time += time.time() - optimizer_end
         data_time += data_end - epoch_start
         forward_time += forward_end - data_end
         backward_time += backward_end - forward_end
+        opt_time += optimizer_end - backward_end
         
         
     total_time = time.time() - start
@@ -515,10 +558,11 @@ if __name__ == "__main__":
         model_name, step+1, back_accum_steps
     ))
     logging.info(f"Total training time: {total_time:.0f}s")
-    logging.info(f"Data time: {data_time:.0f}s ({data_time * 100 / total_time:.2f}%)")
+    logging.info(f"Data process time: {data_time:.0f}s ({data_time * 100 / total_time:.2f}%)")
     logging.info(f"Forward time: {forward_time:.0f}s ({forward_time * 100 / total_time:.2f}%)")
     logging.info(f"Backward time: {backward_time:.0f}s ({backward_time * 100 / total_time:.2f}%)")
-    logging.info(f"Opt time: {opt_time:.0f}s ({opt_time * 100 / total_time:.2f}%)")
+    logging.info(f"Optimization time: {opt_time:.0f}s ({opt_time * 100 / total_time:.2f}%)")
+    logging.info(f"Evaluation time: {eval_time:.0f}s ({eval_time * 100 / total_time:.2f}%)")
 
     
     
