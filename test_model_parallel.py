@@ -2,14 +2,16 @@ import os
 import sys
 sys.dont_write_bytecode = True
 import time
+import math
 from tqdm import tqdm
-import pandas as pd
+import numpy as np
 import logging
+from functools import partial
 from datasets import Dataset
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.nn.utils.rnn import pad_sequence
+from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
 from typing import Optional, Tuple, List, Union
 from torch.cuda.amp import GradScaler
@@ -26,6 +28,7 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     BaseModelOutputWithPoolingAndCrossAttentions,
 )
+from transformers.trainer_pt_utils import nested_detach
 from utils import get_transformer_layers
 
 
@@ -370,67 +373,45 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name_or_path', type=str, default='bert-base-uncased')
     parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--num_epochs', type=int, default=10)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
+    parser.add_argument('--eval_batch_size', type=int, default=16)
     parser.add_argument('--backward_accumulation_steps', type=int, default=1)
     parser.add_argument('--eval_per_steps', type=int, default=100)
     parser.add_argument('--output_dir', type=str, default='logging')
-    parser.add_argument('--learning_rate', type=float, default=2e-5)
-    parser.add_argument('--weight_decay', type=float, default=0.01)
-    
+    parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
-    
-    # inputs = torch.rand(8, 256).cuda(0)
-    # labels = torch.randint_like(inputs, 10).contiguous().cuda(3)
-    
-    # model = MLPParallel()
-    # optimizer = Adam(model.parameters(), lr=0.001, weight_decay=0.01)
-    
-    # outputs = model(inputs)
-    # print(outputs.shape)
-    
-    # loss_fct = CrossEntropyLoss()
-    # loss = loss_fct(outputs, labels)
-    
-    # loss.backward()
-    # print(model.c_fc.weight)
-    # print(model.c_fc.weight.grad)
-    
-    # optimizer.step()
-    # optimizer.zero_grad()
-    # print(model.c_fc.weight)
-    # print(model.c_fc.weight.grad)
-    
-    # print(outputs[0].shape)
-    # input_data = torch.rand((32, 128)).long()  # Random input data
-    # chunks = 4
-    # outputs = model_pipeline(model, input_data, chunks)
-
-    # # For backpropagation, use GradScaler for efficient gradient scaling
-    # scaler = GradScaler()
-
-    # # Define a loss and backward pass
-    # loss = outputs.mean()
-    # scaler.scale(loss).backward()
     
     model_name = args.model_name_or_path
     batch_size = args.batch_size
     grad_accum_steps = args.gradient_accumulation_steps
     back_accum_steps = args.backward_accumulation_steps
+    eval_batch_size = args.eval_batch_size
     output_dir = args.output_dir
+    num_epochs = args.num_epochs
     eval_per_steps = args.eval_per_steps
-    model_kwargs = {
-        'lr': args.learning_rate,
-        'weight_decay': args.weight_decay,
+    seed = args.seed
+    training_args = {
+        'lr': 5e-5,
+        'weight_decay': 0.0,
+        'adam_beta1': 0.9,
+        'adam_beta2': 0.999,
+        'adam_epsilon': 1e-8,
+        'max_grad_norm': 1.0,
     }
     os.makedirs(output_dir, exist_ok=True)
     
     # Set the logging format
     logging.basicConfig(
         filename=f'{output_dir}/{model_name}_{batch_size}_{back_accum_steps}.log',
-        filemode='w', # overwrite the log file every time
+        filemode='a', # append the log file every time
         format='%(asctime)s - %(levelname)s - %(message)s', 
         level=logging.INFO,
     )
+    
+    # Reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     
     config = AutoConfig.from_pretrained(model_name, num_labels=20)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -442,14 +423,10 @@ if __name__ == "__main__":
         device_idx = i * model.num_gpus // model.config.num_hidden_layers
         device = model.devices[device_idx]
         layer.to(device)
-
-    # Other components
     model.bert.embeddings.to(model.devices[0])
     model.bert.pooler.to(model.devices[-1])
     model.dropout.to(model.devices[-1])
     model.classifier.to(model.devices[-1])
-    
-    optimizer = AdamW(model.parameters(), **model_kwargs)
     
     # Prepare data
     def tokenize_data(examples):
@@ -470,6 +447,8 @@ if __name__ == "__main__":
     
     train_dataset = train_dataset.map(tokenize_data, batched=True).remove_columns(['text'])
     test_dataset = test_dataset.map(tokenize_data, batched=True).remove_columns(['text'])
+    logging.info(f"Train dataset labels: {set(train_dataset['label'])}, [0]-th entry: {train_dataset[0]}")
+    logging.info(f"Test dataset labels: {set(test_dataset['label'])}, [0]-th entry: {test_dataset[0]}")
     
     train_dataloader = DataLoader(
         train_dataset, 
@@ -479,11 +458,40 @@ if __name__ == "__main__":
     )
     test_dataloader = DataLoader(
         test_dataset, 
-        batch_size=batch_size, 
+        batch_size=eval_batch_size, 
         shuffle=False,
         collate_fn=collate_fn,
     )
     
+    def _get_linear_schedule_with_warmup_lr_lambda(current_step: int, *, num_warmup_steps: int, num_training_steps: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        return max(0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps)))
+    
+    def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
+        lr_lambda = partial(
+            _get_linear_schedule_with_warmup_lr_lambda,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+        return LambdaLR(optimizer, lr_lambda, last_epoch)
+    
+    # Configure learning rate scheduler
+    optimizer = AdamW(
+        model.parameters(), 
+        lr = training_args['lr'],
+        weight_decay = training_args['weight_decay'],
+        betas = (training_args['adam_beta1'], training_args['adam_beta2']),
+        eps = training_args['adam_epsilon'],
+    )
+    num_training_steps = len(train_dataloader) * num_epochs
+    warmup_ratio = 0.1
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=math.ceil(num_training_steps * warmup_ratio),
+        num_training_steps=num_training_steps,
+    )
+
     # Define evaluation accuracy function
     def compute_accuracy(
         model: BertForSequenceClassificationPipelineParallel, 
@@ -496,12 +504,16 @@ if __name__ == "__main__":
         with torch.no_grad():
             for batch in tqdm(dataloader):
                 inputs = {k: v.to(model.devices[0]) if k != "labels" else v.to(model.devices[-1]) for k, v in batch.items()}
+                labels = inputs['labels']
                 outputs = model(**inputs)
                 logits = outputs.logits
-                labels = inputs['labels']
+                logits = nested_detach(logits)
+                if len(logits) == 1:
+                    logits = logits[0]
+                loss = outputs.loss.mean().detach()
                 total_correct += (logits.argmax(dim=-1) == labels).sum().item()
                 total_samples += labels.shape[0]
-                total_loss += outputs.loss.item() 
+                total_loss += loss.item()
         avg_loss = total_loss / len(dataloader)
         avg_acc = total_correct / total_samples
         return avg_loss, avg_acc
@@ -512,44 +524,50 @@ if __name__ == "__main__":
     accumulated_loss = 0
     
     start = time.time()
-    pbar = tqdm(enumerate(train_dataloader), total=len(train_dataloader))
-    for step, batch in pbar:
-        epoch_start = time.time()
-        model.train()
-        
-        # Prepare inputs for model
-        inputs = {k: v.to(model.devices[0]) if k != "labels" else v.to(model.devices[-1]) for k, v in batch.items()}
-        data_end = time.time()
-        optimizer.zero_grad()
-        
-        # Forward pass
-        outputs = model(**inputs)    
-        loss = outputs.loss
-        accumulated_loss += loss / grad_accum_steps
-        forward_end = time.time()
-        pbar.set_description(f"loss: {accumulated_loss.item():.4f}")
-        
-        # Backward pass
-        if (step + 1) % back_accum_steps == 0:
-            accumulated_loss.backward()
-            accumulated_loss = 0
-        backward_end = time.time()
-        
-        if (step + 1) % grad_accum_steps == 0:
-            optimizer.step()
+    for epoch in range(num_epochs):
+        logging.info(f"Epoch {epoch+1}/{num_epochs}")
+        pbar = tqdm(enumerate(train_dataloader), total=len(train_dataloader))
+        for step, batch in pbar:
+            epoch_start = time.time()
+            model.train()
+            optimizer.zero_grad()
             
-        optimizer_end = time.time()
+            # Prepare inputs for model
+            inputs = {k: v.to(model.devices[0]) if k != "labels" else v.to(model.devices[-1]) for k, v in batch.items()}
+            data_end = time.time()
             
-        if (step + 1) % eval_per_steps == 0:
-            test_loss, test_acc = compute_accuracy(model, test_dataloader)
-            logging.info(f"step {step+1} - eval loss: {test_loss:.4f} - eval acc: {test_acc:.4f}")
-        
-        # Accumulate time
-        eval_time += time.time() - optimizer_end
-        data_time += data_end - epoch_start
-        forward_time += forward_end - data_end
-        backward_time += backward_end - forward_end
-        opt_time += optimizer_end - backward_end
+            # Forward pass
+            outputs = model(**inputs)    
+            loss = outputs.loss
+            accumulated_loss += loss / grad_accum_steps
+            forward_end = time.time()
+            pbar.set_description(f"loss: {accumulated_loss.item():.4f}")
+            
+            # Backward pass
+            if (step + 1) % back_accum_steps == 0:
+                accumulated_loss.backward()
+                accumulated_loss = 0
+                # torch.nn.utils.clip_grad_norm_(
+                #     model.parameters(), 
+                #     max_norm=training_args['max_grad_norm'],
+                # )
+            backward_end = time.time()
+            
+            if (step + 1) % grad_accum_steps == 0:
+                optimizer.step()
+                lr_scheduler.step()
+            optimizer_end = time.time()
+                
+            if (step + 1) % eval_per_steps == 0:
+                test_loss, test_acc = compute_accuracy(model, test_dataloader)
+                logging.info(f"step {step+1}: test loss: {test_loss:.4f}, test acc: {test_acc:.4f}")
+            
+            # Accumulate time
+            eval_time += time.time() - optimizer_end
+            data_time += data_end - epoch_start
+            forward_time += forward_end - data_end
+            backward_time += backward_end - forward_end
+            opt_time += optimizer_end - backward_end
         
         
     total_time = time.time() - start

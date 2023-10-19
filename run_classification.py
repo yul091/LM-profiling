@@ -49,11 +49,7 @@ from transformers.utils.versions import require_version
 import json
 sys.dont_write_bytecode = True
 from layer_profiler import LayerProfiler
-from utils import (
-    BackwardSelectionTrainer, 
-    AdaptiveTrainer,
-    BertForSequenceClassification,
-)
+from utils import AdaptiveTrainer
 from test_model_parallel import BertForSequenceClassificationPipelineParallel
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
