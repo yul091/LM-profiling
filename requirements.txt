@@ -3,5 +3,5 @@ evaluate
 torch
 torchvision
 torchaudio
-transformers[torch]
+transformers[torch]==4.34.1
 wandb

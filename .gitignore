@@ -3,3 +3,4 @@ figures/*
 scripts/*
 logging/*
 results/*
+wandb/*
