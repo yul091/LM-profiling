@@ -436,7 +436,7 @@ class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification
                     loss = loss_fct(logits, labels)
             if batch_loss and irreducible_loss is not None:
                 loss = loss - irreducible_loss
-                print("model loss minus irreducible loss: ", loss)
+
         elif self.config.problem_type == "single_label_classification":
             loss_fct = CrossEntropyLoss() if not batch_loss else CrossEntropyLoss(reduction='none')
             if indices is not None:
@@ -445,9 +445,8 @@ class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification
             else:
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
             if batch_loss and irreducible_loss is not None:
-                print("loss: {}, irreducible_loss: {}".format(loss, irreducible_loss))
                 loss = loss - irreducible_loss
-                print("model loss minus irreducible loss: ", loss)
+  
         elif self.config.problem_type == "multi_label_classification":
             loss_fct = BCEWithLogitsLoss() if not batch_loss else BCEWithLogitsLoss(reduction='none')
             if indices is not None:
@@ -456,7 +455,6 @@ class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification
                 loss = loss_fct(logits, labels)
             if batch_loss and irreducible_loss is not None:
                 loss = loss - irreducible_loss
-                print("model loss minus irreducible loss: ", loss)
         
         return loss
         
@@ -544,8 +542,13 @@ class ActiveSelectionTrainer(Trainer):
         else:
             loss_dict = irreducible_loss
             sorted_items = sorted(loss_dict.items(), key=lambda x: x[0])
-            self._irreducible_loss = torch.cat([item[1].unsqueeze(0) for item in sorted_items], dim=0)
-            print(f"sorted_losses ({self._irreducible_loss.shape}): {self._irreducible_loss}")
+            self._irreducible_loss = torch.zeros(
+                max(loss_dict.keys()) + 1, 
+                dtype=torch.float32, 
+                device=next(iter(loss_dict.values())).device,
+            )
+            for (old_idx, loss_value) in sorted_items:
+                self._irreducible_loss[old_idx] = loss_value
         
             
     def _selection_and_forward(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor, SequenceClassifierOutput]:

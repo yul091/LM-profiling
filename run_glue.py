@@ -539,10 +539,15 @@ def main():
     else:
         data_collator = None
 
-
+    original_num_train_epochs = training_args.num_train_epochs
+    original_output_dir = training_args.output_dir
+    original_do_eval = training_args.do_eval
+    original_evaluation_strategy = training_args.evaluation_strategy
     if data_args.strategy == 'IL':
         training_args.output_dir = training_args.output_dir + '/IL-record'
         training_args.num_train_epochs = 1
+        training_args.do_eval = False
+        training_args.evaluation_strategy = 'no'
         IL_trainer = ActiveSelectionTrainer(
             model=IL_model,
             args=training_args,
@@ -551,15 +556,17 @@ def main():
             compute_metrics=compute_metrics,
             tokenizer=tokenizer,
             data_collator=data_collator,
-            minibatch=data_args.minibatch,
             strategy='all',
             record_mode=True,
         )
-        
         train_result = IL_trainer.train()
         loss_dict = IL_trainer._irreducible_loss
         
     # Initialize our Trainer
+    training_args.output_dir = original_output_dir
+    training_args.num_train_epochs = original_num_train_epochs
+    training_args.do_eval = original_do_eval
+    training_args.evaluation_strategy = original_evaluation_strategy
     trainer = ActiveSelectionTrainer(
         model=model,
         args=training_args,
@@ -570,7 +577,7 @@ def main():
         data_collator=data_collator,
         minibatch=data_args.minibatch,
         strategy=data_args.strategy,
-        irreducible_loss=loss_dict,
+        irreducible_loss=loss_dict if data_args.strategy == 'IL' else None,
     )
 
     # Training
