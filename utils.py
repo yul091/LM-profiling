@@ -411,6 +411,8 @@ class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification
         logits: torch.Tensor,
         labels: torch.Tensor,
         indices: Optional[torch.Tensor] = None,
+        batch_loss: bool = False,
+        irreducible_loss: Optional[torch.Tensor] = None,
     ):
         if self.config.problem_type is None:
             if self.num_labels == 1:
@@ -421,7 +423,7 @@ class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification
                 self.config.problem_type = "multi_label_classification"
 
         if self.config.problem_type == "regression":
-            loss_fct = MSELoss()
+            loss_fct = MSELoss() if not batch_loss else MSELoss(reduction='none')
             if self.num_labels == 1:
                 if indices is not None:
                     loss = loss_fct(logits.squeeze()[indices], labels.squeeze()[indices])
@@ -432,19 +434,29 @@ class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification
                     loss = loss_fct(logits[indices], labels[indices])
                 else:
                     loss = loss_fct(logits, labels)
+            if batch_loss and irreducible_loss is not None:
+                loss = loss - irreducible_loss
+                print("model loss minus irreducible loss: ", loss)
         elif self.config.problem_type == "single_label_classification":
-            loss_fct = CrossEntropyLoss()
+            loss_fct = CrossEntropyLoss() if not batch_loss else CrossEntropyLoss(reduction='none')
             if indices is not None:
                 # print("Using active selection for CE loss computation") 
                 loss = loss_fct(logits[indices].view(-1, self.num_labels), labels[indices].view(-1))
             else:
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            if batch_loss and irreducible_loss is not None:
+                print("loss: {}, irreducible_loss: {}".format(loss, irreducible_loss))
+                loss = loss - irreducible_loss
+                print("model loss minus irreducible loss: ", loss)
         elif self.config.problem_type == "multi_label_classification":
-            loss_fct = BCEWithLogitsLoss()
+            loss_fct = BCEWithLogitsLoss() if not batch_loss else BCEWithLogitsLoss(reduction='none')
             if indices is not None:
                 loss = loss_fct(logits[indices], labels[indices])
             else:
                 loss = loss_fct(logits, labels)
+            if batch_loss and irreducible_loss is not None:
+                loss = loss - irreducible_loss
+                print("model loss minus irreducible loss: ", loss)
         
         return loss
         
@@ -513,6 +525,8 @@ class ActiveSelectionTrainer(Trainer):
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         minibatch: Optional[int] = None,
         strategy: Optional[str] = None,
+        record_mode: bool = False,
+        irreducible_loss: Optional[Dict[int, torch.Tensor]] = None,
     ):
         super().__init__(model, args, data_collator, train_dataset, eval_dataset, tokenizer, model_init, compute_metrics, callbacks, optimizers, preprocess_logits_for_metrics)
         self.minibatch = -1 if minibatch is None else minibatch
@@ -524,20 +538,14 @@ class ActiveSelectionTrainer(Trainer):
             self.label_smoother = ActiveSelectionLabelSmoother(epsilon=self.args.label_smoothing_factor)
         else:
             self.label_smoother = None
-        self.irreducible_loss = {}
-        
-        # # start a new wandb run to track this script
-        # wandb.init(
-        #     # set the wandb project where this run will be logged
-        #     project=f"run_glue_{model.__class__.__name__}_{self.strategy}_{self.minibatch}",
-        #     # track hyperparameters and run metadata
-        #     config={
-        #     "learning_rate": args.learning_rate,
-        #     "architecture": model.__class__.__name__,
-        #     "dataset": 'glue',
-        #     "epochs": args.num_train_epochs,
-        #     }
-        # )
+        self.record_mode = record_mode
+        if irreducible_loss is None:
+            self._irreducible_loss = {}
+        else:
+            loss_dict = irreducible_loss
+            sorted_items = sorted(loss_dict.items(), key=lambda x: x[0])
+            self._irreducible_loss = torch.cat([item[1].unsqueeze(0) for item in sorted_items], dim=0)
+            print(f"sorted_losses ({self._irreducible_loss.shape}): {self._irreducible_loss}")
         
             
     def _selection_and_forward(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor, SequenceClassifierOutput]:
@@ -557,6 +565,11 @@ class ActiveSelectionTrainer(Trainer):
         elif self.strategy == 'all':
             outputs = model(**inputs, compute_loss=False)
             indices = None
+        elif self.strategy == 'IL':
+            outputs = model(**inputs, compute_loss=False)
+            irreducible_loss = self._irreducible_loss[inputs['idx']]
+            batch_losses = model._get_loss(outputs.logits, inputs['labels'], batch_loss=True, irreducible_loss=irreducible_loss)
+            indices = torch.argsort(batch_losses, descending=True)[:self.minibatch]  # (B',)
         else:
             raise NotImplementedError(f'Unknown strategy: {self.strategy}')
         
@@ -574,10 +587,17 @@ class ActiveSelectionTrainer(Trainer):
         else:
             labels = None
         
-        #################################################################################
+        ###############################################################################################
         indices, outputs = self._selection_and_forward(model, inputs)
-        outputs['loss'] = model._get_loss(outputs.logits, inputs['labels'], indices)
-        #################################################################################
+        if 'loss' not in outputs:
+            if self.record_mode:
+                batch_losses = model._get_loss(outputs.logits, inputs['labels'], indices, batch_loss=True)
+                outputs['loss'] = batch_losses.mean()
+                for id, single_loss in zip(inputs['idx'], batch_losses):
+                    self._irreducible_loss[id.item()] = single_loss
+            else:
+                outputs['loss'] = model._get_loss(outputs.logits, inputs['labels'], indices)
+        ###############################################################################################
         
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.

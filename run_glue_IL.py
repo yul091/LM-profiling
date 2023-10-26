@@ -28,7 +28,6 @@ import datasets
 import numpy as np
 from datasets import load_dataset
 
-import torch
 import evaluate
 import transformers
 from transformers import (
@@ -184,10 +183,6 @@ class ModelArguments:
     """
 
     model_name_or_path: str = field(
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
-    )
-    IL_model_path: str = field(
-        default=None,
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
     config_name: Optional[str] = field(
@@ -395,16 +390,6 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
         ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
     )
-    if data_args.strategy == 'IL':
-        IL_model = ActiveSelectionBertForSequenceClassification.from_pretrained(
-            model_args.IL_model_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-            ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
-        )
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -481,12 +466,12 @@ def main():
             desc="Running tokenizer on dataset",
         )
     if training_args.do_train:
-        if "train" not in raw_datasets:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = raw_datasets["train"]
-        if data_args.max_train_samples is not None:
-            max_train_samples = min(len(train_dataset), data_args.max_train_samples)
-            train_dataset = train_dataset.select(range(max_train_samples))
+        if "test" not in raw_datasets and "test_matched" not in raw_datasets:
+            raise ValueError("--do_predict requires a test dataset")
+        predict_dataset = raw_datasets["test_matched" if data_args.task_name == "mnli" else "test"]
+        if data_args.max_predict_samples is not None:
+            max_predict_samples = min(len(predict_dataset), data_args.max_predict_samples)
+            predict_dataset = predict_dataset.select(range(max_predict_samples))
 
     if training_args.do_eval:
         if "validation" not in raw_datasets and "validation_matched" not in raw_datasets:
@@ -497,12 +482,13 @@ def main():
             eval_dataset = eval_dataset.select(range(max_eval_samples))
 
     if training_args.do_predict or data_args.task_name is not None or data_args.test_file is not None:
-        if "test" not in raw_datasets and "test_matched" not in raw_datasets:
-            raise ValueError("--do_predict requires a test dataset")
-        predict_dataset = raw_datasets["test_matched" if data_args.task_name == "mnli" else "test"]
-        if data_args.max_predict_samples is not None:
-            max_predict_samples = min(len(predict_dataset), data_args.max_predict_samples)
-            predict_dataset = predict_dataset.select(range(max_predict_samples))
+        if "train" not in raw_datasets:
+            raise ValueError("--do_train requires a train dataset")
+        train_dataset = raw_datasets["train"]
+        if data_args.max_train_samples is not None:
+            max_train_samples = min(len(train_dataset), data_args.max_train_samples)
+            train_dataset = train_dataset.select(range(max_train_samples))
+        
 
     # Log a few random samples from the training set:
     if training_args.do_train:
@@ -539,38 +525,17 @@ def main():
     else:
         data_collator = None
 
-
-    if data_args.strategy == 'IL':
-        training_args.output_dir = training_args.output_dir + '/IL-record'
-        training_args.num_train_epochs = 1
-        IL_trainer = ActiveSelectionTrainer(
-            model=IL_model,
-            args=training_args,
-            train_dataset=train_dataset if training_args.do_train else None,
-            eval_dataset=eval_dataset if training_args.do_eval else None,
-            compute_metrics=compute_metrics,
-            tokenizer=tokenizer,
-            data_collator=data_collator,
-            minibatch=data_args.minibatch,
-            strategy='all',
-            record_mode=True,
-        )
-        
-        train_result = IL_trainer.train()
-        loss_dict = IL_trainer._irreducible_loss
-        
     # Initialize our Trainer
     trainer = ActiveSelectionTrainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
+        train_dataset=predict_dataset if training_args.do_train else None,
+        eval_dataset=predict_dataset if training_args.do_eval else None,
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
         data_collator=data_collator,
         minibatch=data_args.minibatch,
         strategy=data_args.strategy,
-        irreducible_loss=loss_dict,
     )
 
     # Training
@@ -592,6 +557,7 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
+    
 
     # Evaluation
     if training_args.do_eval:
