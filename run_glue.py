@@ -540,11 +540,9 @@ def main():
         data_collator = None
 
     original_num_train_epochs = training_args.num_train_epochs
-    original_output_dir = training_args.output_dir
     original_do_eval = training_args.do_eval
     original_evaluation_strategy = training_args.evaluation_strategy
     if data_args.strategy == 'IL':
-        training_args.output_dir = training_args.output_dir + '/IL-record'
         training_args.num_train_epochs = 1
         training_args.do_eval = False
         training_args.evaluation_strategy = 'no'
@@ -563,7 +561,6 @@ def main():
         loss_dict = IL_trainer._irreducible_loss
         
     # Initialize our Trainer
-    training_args.output_dir = original_output_dir
     training_args.num_train_epochs = original_num_train_epochs
     training_args.do_eval = original_do_eval
     training_args.evaluation_strategy = original_evaluation_strategy
