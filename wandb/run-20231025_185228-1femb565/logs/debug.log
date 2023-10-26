@@ -1,0 +1,36 @@
+2023-10-25 18:52:28,132 INFO    MainThread:2643623 [wandb_setup.py:_flush():76] Current SDK version is 0.15.12
+2023-10-25 18:52:28,132 INFO    MainThread:2643623 [wandb_setup.py:_flush():76] Configure stats pid to 2643623
+2023-10-25 18:52:28,132 INFO    MainThread:2643623 [wandb_setup.py:_flush():76] Loading settings from /home/yli927/.config/wandb/settings
+2023-10-25 18:52:28,132 INFO    MainThread:2643623 [wandb_setup.py:_flush():76] Loading settings from /data/yli927/LM-profiling/wandb/settings
+2023-10-25 18:52:28,132 WARNING MainThread:2643623 [wandb_setup.py:_flush():76] Unknown environment variable: WANDB_LOG_MODEL
+2023-10-25 18:52:28,132 INFO    MainThread:2643623 [wandb_setup.py:_flush():76] Loading settings from environment variables: {'project': '<my_project>'}
+2023-10-25 18:52:28,133 INFO    MainThread:2643623 [wandb_setup.py:_flush():76] Applying setup settings: {'_disable_service': False}
+2023-10-25 18:52:28,133 INFO    MainThread:2643623 [wandb_setup.py:_flush():76] Inferring run settings from compute environment: {'program_relpath': 'run_glue.py', 'program_abspath': '/data/yli927/LM-profiling/run_glue.py', 'program': '/data/yli927/LM-profiling/run_glue.py'}
+2023-10-25 18:52:28,133 INFO    MainThread:2643623 [wandb_init.py:_log_setup():528] Logging user logs to /data/yli927/LM-profiling/wandb/run-20231025_185228-1femb565/logs/debug.log
+2023-10-25 18:52:28,133 INFO    MainThread:2643623 [wandb_init.py:_log_setup():529] Logging internal logs to /data/yli927/LM-profiling/wandb/run-20231025_185228-1femb565/logs/debug-internal.log
+2023-10-25 18:52:28,133 INFO    MainThread:2643623 [wandb_init.py:init():568] calling init triggers
+2023-10-25 18:52:28,133 INFO    MainThread:2643623 [wandb_init.py:init():575] wandb.init called with sweep_config: {}
+config: {}
+2023-10-25 18:52:28,133 INFO    MainThread:2643623 [wandb_init.py:init():618] starting backend
+2023-10-25 18:52:28,133 INFO    MainThread:2643623 [wandb_init.py:init():622] setting up manager
+2023-10-25 18:52:28,135 INFO    MainThread:2643623 [backend.py:_multiprocessing_setup():105] multiprocessing start_methods=fork,spawn,forkserver, using: spawn
+2023-10-25 18:52:28,137 INFO    MainThread:2643623 [wandb_init.py:init():628] backend started and connected
+2023-10-25 18:52:28,140 INFO    MainThread:2643623 [wandb_init.py:init():720] updated telemetry
+2023-10-25 18:52:28,147 INFO    MainThread:2643623 [wandb_init.py:init():753] communicating run to backend with 90.0 second timeout
+2023-10-25 18:52:40,778 WARNING MainThread:2643623 [wandb_init.py:init():1192] interrupted
+Traceback (most recent call last):
+  File "/home/yli927/anaconda3/envs/py3.10/lib/python3.10/site-packages/wandb/sdk/wandb_init.py", line 1170, in init
+    run = wi.init()
+  File "/home/yli927/anaconda3/envs/py3.10/lib/python3.10/site-packages/wandb/sdk/wandb_init.py", line 756, in init
+    result = run_init_handle.wait(
+  File "/home/yli927/anaconda3/envs/py3.10/lib/python3.10/site-packages/wandb/sdk/lib/mailbox.py", line 283, in wait
+    found, abandoned = self._slot._get_and_clear(timeout=wait_timeout)
+  File "/home/yli927/anaconda3/envs/py3.10/lib/python3.10/site-packages/wandb/sdk/lib/mailbox.py", line 130, in _get_and_clear
+    if self._wait(timeout=timeout):
+  File "/home/yli927/anaconda3/envs/py3.10/lib/python3.10/site-packages/wandb/sdk/lib/mailbox.py", line 126, in _wait
+    return self._event.wait(timeout=timeout)
+  File "/home/yli927/anaconda3/envs/py3.10/lib/python3.10/threading.py", line 607, in wait
+    signaled = self._cond.wait(timeout)
+  File "/home/yli927/anaconda3/envs/py3.10/lib/python3.10/threading.py", line 324, in wait
+    gotit = waiter.acquire(True, timeout)
+KeyboardInterrupt

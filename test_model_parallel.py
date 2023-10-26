@@ -367,19 +367,21 @@ class BertForSequenceClassificationPipelineParallel(BertPreTrainedModel):
 
     
 if __name__ == "__main__":
+    import random
     import argparse
     from sklearn.datasets import fetch_20newsgroups
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name_or_path', type=str, default='bert-base-uncased')
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=10)
+    parser.add_argument('--num_epochs', type=int, default=5)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--eval_batch_size', type=int, default=16)
     parser.add_argument('--backward_accumulation_steps', type=int, default=1)
     parser.add_argument('--eval_per_steps', type=int, default=100)
     parser.add_argument('--output_dir', type=str, default='logging')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--n_data', type=int, default=-1)
     args = parser.parse_args()
     
     model_name = args.model_name_or_path
@@ -390,6 +392,7 @@ if __name__ == "__main__":
     output_dir = args.output_dir
     num_epochs = args.num_epochs
     eval_per_steps = args.eval_per_steps
+    n_data = args.n_data
     seed = args.seed
     training_args = {
         'lr': 5e-5,
@@ -404,7 +407,7 @@ if __name__ == "__main__":
     # Set the logging format
     logging.basicConfig(
         filename=f'{output_dir}/{model_name}_{batch_size}_{back_accum_steps}.log',
-        filemode='a', # append the log file every time
+        filemode='w', # append the log file every time
         format='%(asctime)s - %(levelname)s - %(message)s', 
         level=logging.INFO,
     )
@@ -412,6 +415,7 @@ if __name__ == "__main__":
     # Reproducibility
     torch.manual_seed(seed)
     np.random.seed(seed)
+    random.seed(seed)
     
     config = AutoConfig.from_pretrained(model_name, num_labels=20)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -444,6 +448,9 @@ if __name__ == "__main__":
         'text': test_data['data'],
         'label': test_data['target'],
     })
+    if n_data > 0:
+        train_dataset = train_dataset.select(random.sample(range(len(train_dataset)), n_data))
+        test_dataset = test_dataset.select(random.sample(range(len(test_dataset)), n_data))
     
     train_dataset = train_dataset.map(tokenize_data, batched=True).remove_columns(['text'])
     test_dataset = test_dataset.map(tokenize_data, batched=True).remove_columns(['text'])
