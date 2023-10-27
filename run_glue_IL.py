@@ -47,8 +47,8 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
-from utils import ActiveSelectionBertForSequenceClassification
-from tranier import ActiveSelectionTrainer
+from active_model import ActiveSelectionBertForSequenceClassification
+from active_trainer import ActiveSelectionTrainer
 
 os.environ["WANDB_PROJECT"] = "<my_project>" # name your W&B project 
 os.environ["WANDB_LOG_MODEL"] = "checkpoint" # log all model checkpoints

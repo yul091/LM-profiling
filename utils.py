@@ -1,27 +1,10 @@
-import os
-import sys
-import time
-import math
-import inspect
-import shutil
-# import wandb
+
 import logging
 from typing import Dict, Union, Any, List, Tuple, Optional, Callable
-from collections.abc import Mapping
 import pandas as pd
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 
-# Integrations must be imported before ML frameworks:
-# isort: off
-from transformers.integrations import hp_params
-
-import torch
-import torch.distributed as dist
-import torch.nn as nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
-from packaging import version
 from transformers import (
     BertModel,
     BertForSequenceClassification,
@@ -31,79 +14,10 @@ from transformers import (
     XLNetForSequenceClassification,
     BartModel,
     BartForSequenceClassification,
-    Trainer,
 )
-from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.integrations.deepspeed import deepspeed_init, deepspeed_load_checkpoint
-from transformers.training_args import OptimizerNames, ParallelMode, TrainingArguments
-from transformers.data.data_collator import DataCollator
-from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    add_code_sample_docstrings,
-    is_sagemaker_mp_enabled,
-    is_apex_available,
-    is_torch_tpu_available,
-    is_accelerate_available,
-    is_peft_available,
-    is_datasets_available,
-)
-from transformers.trainer_utils import (
-    HPSearchBackend,
-    ShardedDDPOption,
-    TrainOutput,
-    EvalPrediction,
-    has_length,
-    speed_metrics,
-    seed_worker,
-)
-from transformers.modeling_utils import unwrap_model, PreTrainedModel
-from transformers.trainer_pt_utils import get_model_param_count, get_dataloader_sampler
-from transformers.trainer_callback import TrainerState, TrainerCallback
-from transformers.models.bert.modeling_bert import (
-    BertPreTrainedModel, 
-    BertModel,
-    BERT_START_DOCSTRING,
-    BERT_INPUTS_DOCSTRING,
-    # _TOKENIZER_FOR_DOC,
-    _CHECKPOINT_FOR_SEQUENCE_CLASSIFICATION,
-    _CONFIG_FOR_DOC,
-    _SEQ_CLASS_EXPECTED_OUTPUT,
-    _SEQ_CLASS_EXPECTED_LOSS,
-)
-from transformers.pytorch_utils import is_torch_less_than_1_11
-from transformers.modeling_outputs import SequenceClassifierOutput
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+from transformers.models.bert.modeling_bert import BertModel
 
-if is_datasets_available():
-    import datasets
 
-if is_apex_available():
-    from apex import amp
-    
-if is_torch_tpu_available(check_device=False):
-    import torch_xla.core.xla_model as xm
-    import torch_xla.debug.metrics as met
-
-if is_sagemaker_mp_enabled():
-    import smdistributed.modelparallel.torch as smp
-    from smdistributed.modelparallel import __version__ as SMP_VERSION
-
-    IS_SAGEMAKER_MP_POST_1_10 = version.parse(SMP_VERSION) >= version.parse("1.10")
-
-    from transformers.trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
-else:
-    IS_SAGEMAKER_MP_POST_1_10 = False
-    
-if is_accelerate_available():
-    from accelerate import Accelerator, skip_first_batches
-    from accelerate import __version__ as accelerate_version
-    
-if is_peft_available():
-    from peft import PeftModel
-
-# logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
    
@@ -114,6 +28,13 @@ COLOR_MAP = {
     'dropout': 'grey',
     'backward': 'green',
 }
+# Name of the files used for checkpointing
+TRAINING_ARGS_NAME = "training_args.bin"
+TRAINER_STATE_NAME = "trainer_state.json"
+OPTIMIZER_NAME = "optimizer.pt"
+OPTIMIZER_NAME_BIN = "optimizer.bin"
+SCHEDULER_NAME = "scheduler.pt"
+SCALER_NAME = "scaler.pt"
 
 
 def get_transformer_layers(
@@ -264,18 +185,7 @@ def plot_layer_profiling_dist(
         plt.savefig(save_file, bbox_inches='tight')
     plt.show()
     
-
-
-
-# Name of the files used for checkpointing
-TRAINING_ARGS_NAME = "training_args.bin"
-TRAINER_STATE_NAME = "trainer_state.json"
-OPTIMIZER_NAME = "optimizer.pt"
-OPTIMIZER_NAME_BIN = "optimizer.bin"
-SCHEDULER_NAME = "scheduler.pt"
-SCALER_NAME = "scaler.pt"
-    
-        
+       
         
 # @dataclass
 # class ActiveSelectionLabelSmoother:

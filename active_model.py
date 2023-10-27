@@ -1,5 +1,27 @@
 
+from typing import Dict, Union, Any, List, Tuple, Optional, Callable
 
+import torch
+import torch.nn as nn
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers import (
+    BertForSequenceClassification,
+)
+from transformers.utils import (
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    add_code_sample_docstrings,
+)
+
+from transformers.models.bert.modeling_bert import (
+    BERT_START_DOCSTRING,
+    BERT_INPUTS_DOCSTRING,
+    _CHECKPOINT_FOR_SEQUENCE_CLASSIFICATION,
+    _CONFIG_FOR_DOC,
+    _SEQ_CLASS_EXPECTED_OUTPUT,
+    _SEQ_CLASS_EXPECTED_LOSS,
+)
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 
 
