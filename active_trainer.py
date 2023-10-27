@@ -2,6 +2,7 @@ import os
 import sys
 import inspect
 import logging
+import argparse
 from typing import Dict, Union, Any, List, Tuple, Optional, Callable
 
 import torch
@@ -69,6 +70,7 @@ class ActiveSelectionTrainer(Trainer):
         strategy: Optional[str] = None,
         record_mode: bool = False,
         irreducible_loss: Optional[Dict[int, torch.Tensor]] = None,
+        ue_config: Optional[argparse.Namespace] = None,
     ):
         super().__init__(model, args, data_collator, train_dataset, eval_dataset, tokenizer, model_init, compute_metrics, callbacks, optimizers, preprocess_logits_for_metrics)
         self.minibatch = -1 if minibatch is None else minibatch
@@ -89,6 +91,9 @@ class ActiveSelectionTrainer(Trainer):
             )
             for (old_idx, loss_value) in sorted_items:
                 self._irreducible_loss[old_idx] = loss_value
+                
+        self.ue_config = ue_config if ue_config is not None else {}
+        self._num_samples = 10 if 'num_samples' not in self.ue_config else self.ue_config['num_samples']
         
             
     def _selection_and_forward(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor, SequenceClassifierOutput]:
@@ -96,18 +101,44 @@ class ActiveSelectionTrainer(Trainer):
             outputs = model(**inputs, compute_loss=False)
             # indices = torch.randperm(inputs['input_ids'].shape[0])[:self.minibatch]
             indices = torch.arange(self.minibatch)
+            
         elif self.strategy == 'entropy':
             outputs = model(**inputs, compute_loss=False)
             probs = torch.softmax(outputs.logits, dim=-1)  # (B, C)
             entropy = - torch.sum(probs * torch.log(probs), dim=-1)  # (B,)
             indices = torch.argsort(entropy, descending=True)[:self.minibatch]  # (B',)
+            
         elif self.strategy == 'vanilla':
             outputs = model(**inputs, compute_loss=False)
             probs = torch.softmax(outputs.logits, dim=-1)  # (B, C)
             indices = torch.argmax(probs, dim=-1)[:self.minibatch]  # (B',)
+            
         elif self.strategy == 'all':
             outputs = model(**inputs, compute_loss=False)
             indices = None
+            
+        elif self.strategy == 'perplexity':
+            outputs = model(**inputs, compute_loss=False)
+            batch_losses = model._get_loss(outputs.logits, inputs['labels'], batch_loss=True)  # (B,)
+            perplexity = torch.exp(batch_losses)
+            indices = torch.argsort(perplexity, descending=True)[:self.minibatch]  # (B',)
+            
+        elif self.strategy == 'dropout':
+            model.train()
+            logits_sum = None
+            logits_samples = []
+            for _ in range(self._num_samples):
+                outputs = model(**inputs, compute_loss=False)
+                if logits_sum is None:
+                    logits_sum = outputs.logits # (B, C)
+                else:
+                    logits_sum += outputs.logits
+                logits_samples.append(outputs.logits.detach())
+            outputs.logits = logits_sum / self._num_samples # (B, C)
+            # Compute probability variance (PV)
+            pv_scores = torch.var(torch.stack(logits_samples, dim=0), dim=0).mean(dim=-1)  # (B,)
+            indices = torch.argsort(pv_scores, descending=True)[:self.minibatch]  # (B',)
+            
         elif self.strategy == 'IL':
             outputs = model(**inputs, compute_loss=False)
             irreducible_loss = self._irreducible_loss[inputs['idx']]
