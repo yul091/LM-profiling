@@ -1,8 +1,6 @@
-import os
-import sys
+
 import inspect
 import logging
-import argparse
 from typing import Dict, Union, Any, List, Tuple, Optional, Callable
 
 import torch
@@ -37,9 +35,7 @@ if is_apex_available():
 if is_sagemaker_mp_enabled():
     import smdistributed.modelparallel.torch as smp
     from smdistributed.modelparallel import __version__ as SMP_VERSION
-
     IS_SAGEMAKER_MP_POST_1_10 = version.parse(SMP_VERSION) >= version.parse("1.10")
-
     from transformers.trainer_pt_utils import smp_forward_backward
 else:
     IS_SAGEMAKER_MP_POST_1_10 = False
@@ -53,6 +49,8 @@ logger = logging.getLogger(__name__)
 
 
 class ActiveSelectionTrainer(Trainer):
+    UNCERTAINTY_STRATEGIES = set(['entropy', 'vanilla', 'perplexity', 'dropout'])
+    
     def __init__(
         self,
         model: Union[PreTrainedModel, nn.Module] = None,
@@ -70,7 +68,7 @@ class ActiveSelectionTrainer(Trainer):
         strategy: Optional[str] = None,
         record_mode: bool = False,
         irreducible_loss: Optional[Dict[int, torch.Tensor]] = None,
-        ue_config: Optional[argparse.Namespace] = None,
+        ue_config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(model, args, data_collator, train_dataset, eval_dataset, tokenizer, model_init, compute_metrics, callbacks, optimizers, preprocess_logits_for_metrics)
         self.minibatch = -1 if minibatch is None else minibatch
@@ -93,7 +91,8 @@ class ActiveSelectionTrainer(Trainer):
                 self._irreducible_loss[old_idx] = loss_value
                 
         self.ue_config = ue_config if ue_config is not None else {}
-        self._num_samples = 10 if 'num_samples' not in self.ue_config else self.ue_config['num_samples']
+        self._num_samples = self.ue_config.get('stochastic_samples', 10)
+        self._input_len_rate = self.ue_config.get('input_len_rate', 1.0)
         
             
     def _selection_and_forward(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor, SequenceClassifierOutput]:
@@ -200,9 +199,16 @@ class ActiveSelectionTrainer(Trainer):
         
         
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
-        # return super().training_step(model, inputs)
         model.train()
-        inputs = self._prepare_inputs(inputs)
+        # {labels: B, idx: B, input_ids: B X T, token_type_ids: B X T, attention_mask: B X T}
+        # print("inputs (before cut): ", {k: v.shape if isinstance(v, torch.Tensor) else v for k, v in inputs.items()})
+        if self._input_len_rate != 1 and self.strategy in self.UNCERTAINTY_STRATEGIES:
+            cutted_inputs = {k: v[:, :int(v.shape[1] * self._input_len_rate)] if len(v.shape) == 2 else v for k, v in inputs.items()}
+        else:
+            cutted_inputs = inputs
+        
+        inputs = self._prepare_inputs(cutted_inputs)
+        # print("inputs (after cut): ", {k: v.shape if isinstance(v, torch.Tensor) else v for k, v in inputs.items()})
 
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)

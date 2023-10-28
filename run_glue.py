@@ -52,7 +52,7 @@ from active_trainer import ActiveSelectionTrainer
 
 os.environ["WANDB_PROJECT"] = "<my_project>" # name your W&B project 
 os.environ["WANDB_LOG_MODEL"] = "checkpoint" # log all model checkpoints
-
+os.environ["WANDB_MODE"] = "dryrun" # don't create a W&B run
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.26.0.dev0")
@@ -156,6 +156,14 @@ class DataTrainingArguments:
     strategy: str = field(
         default=None,
         metadata={"help": "The strategy to select samples."},
+    )
+    stochastic_samples: int = field(
+        default=10,
+        metadata={"help": "The number of samples for dropout stochastic variational inference."},
+    )
+    input_len_rate: float = field(
+        default=1.0,
+        metadata={"help": "The ratio of input length to the maximum length."},
     )
     
 
@@ -564,6 +572,10 @@ def main():
     training_args.num_train_epochs = original_num_train_epochs
     training_args.do_eval = original_do_eval
     training_args.evaluation_strategy = original_evaluation_strategy
+    ue_config = {
+        "input_len_rate": data_args.input_len_rate,
+        "stochastic_samples": data_args.stochastic_samples,
+    }
     trainer = ActiveSelectionTrainer(
         model=model,
         args=training_args,
@@ -575,6 +587,7 @@ def main():
         minibatch=data_args.minibatch,
         strategy=data_args.strategy,
         irreducible_loss=loss_dict if data_args.strategy == 'IL' else None,
+        ue_config=ue_config,
     )
 
     # Training
