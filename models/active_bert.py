@@ -2,7 +2,6 @@
 from typing import Dict, Union, Any, List, Tuple, Optional, Callable
 
 import torch
-import torch.nn as nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import (
     BertForSequenceClassification,
@@ -21,7 +20,10 @@ from transformers.models.bert.modeling_bert import (
     _SEQ_CLASS_EXPECTED_OUTPUT,
     _SEQ_CLASS_EXPECTED_LOSS,
 )
-from transformers.modeling_outputs import SequenceClassifierOutput
+from transformers.modeling_outputs import (
+    SequenceClassifierOutput, 
+)
+from .active_base import ActiveSelectionBase
 
 
 
@@ -32,7 +34,7 @@ from transformers.modeling_outputs import SequenceClassifierOutput
     """,
     BERT_START_DOCSTRING,
 )
-class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification):
+class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification, ActiveSelectionBase):
     def __init__(self, config):
         super().__init__(config)
 
@@ -44,7 +46,6 @@ class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification
         expected_output=_SEQ_CLASS_EXPECTED_OUTPUT,
         expected_loss=_SEQ_CLASS_EXPECTED_LOSS,
     )
-    
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,

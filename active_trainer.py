@@ -26,6 +26,8 @@ from transformers.trainer_callback import TrainerCallback
 from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from models import ActiveSelectionBase
+
 if is_datasets_available():
     import datasets
 
@@ -95,7 +97,11 @@ class ActiveSelectionTrainer(Trainer):
         self._input_len_rate = self.ue_config.get('input_len_rate', 1.0)
         
             
-    def _selection_and_forward(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor, SequenceClassifierOutput]:
+    def _selection_and_forward(
+        self, 
+        model: Union[PreTrainedModel, ActiveSelectionBase], 
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+    ) -> Tuple[torch.Tensor, SequenceClassifierOutput]:
         if self.strategy == 'random':
             outputs = model(**inputs, compute_loss=False)
             # indices = torch.randperm(inputs['input_ids'].shape[0])[:self.minibatch]
@@ -149,7 +155,12 @@ class ActiveSelectionTrainer(Trainer):
         # minibatch_inputs = {key: val[indices] for key, val in inputs.items() if isinstance(val, torch.Tensor)}
         return indices, outputs
         
-    def _compute_loss(self, model, inputs, return_outputs=False):
+    def _compute_loss(
+        self,
+        model: Union[PreTrainedModel, ActiveSelectionBase], 
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        return_outputs: bool = False,
+    ):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
