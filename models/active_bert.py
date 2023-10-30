@@ -11,7 +11,6 @@ from transformers.utils import (
     add_start_docstrings_to_model_forward,
     add_code_sample_docstrings,
 )
-
 from transformers.models.bert.modeling_bert import (
     BERT_START_DOCSTRING,
     BERT_INPUTS_DOCSTRING,
@@ -129,8 +128,6 @@ class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification
                     loss = loss_fct(logits[indices], labels[indices])
                 else:
                     loss = loss_fct(logits, labels)
-            if batch_loss and irreducible_loss is not None:
-                loss = loss - irreducible_loss
 
         elif self.config.problem_type == "single_label_classification":
             loss_fct = CrossEntropyLoss() if not batch_loss else CrossEntropyLoss(reduction='none')
@@ -139,8 +136,6 @@ class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification
                 loss = loss_fct(logits[indices].view(-1, self.num_labels), labels[indices].view(-1))
             else:
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            if batch_loss and irreducible_loss is not None:
-                loss = loss - irreducible_loss
   
         elif self.config.problem_type == "multi_label_classification":
             loss_fct = BCEWithLogitsLoss() if not batch_loss else BCEWithLogitsLoss(reduction='none')
@@ -148,7 +143,8 @@ class ActiveSelectionBertForSequenceClassification(BertForSequenceClassification
                 loss = loss_fct(logits[indices], labels[indices])
             else:
                 loss = loss_fct(logits, labels)
-            if batch_loss and irreducible_loss is not None:
-                loss = loss - irreducible_loss
+        
+        if batch_loss and irreducible_loss is not None:
+            loss = loss - irreducible_loss
         
         return loss

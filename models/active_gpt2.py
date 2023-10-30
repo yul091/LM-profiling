@@ -5,6 +5,7 @@ import torch
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import (
     GPT2ForSequenceClassification,
+    logging,
 )
 from transformers.utils import (
     add_start_docstrings,
@@ -21,7 +22,7 @@ from transformers.modeling_outputs import (
 )
 from .active_base import ActiveSelectionBase
     
-    
+logger = logging.get_logger(__name__)
     
 @add_start_docstrings(
     """
@@ -60,6 +61,8 @@ class ActiveSelectionGPT2ForSequenceClassification(GPT2ForSequenceClassification
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        compute_loss: bool = True,
+        idx: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -110,27 +113,9 @@ class ActiveSelectionGPT2ForSequenceClassification(GPT2ForSequenceClassification
         pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
 
         loss = None
-        if labels is not None:
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.config.problem_type = "single_label_classification"
-                else:
-                    self.config.problem_type = "multi_label_classification"
-
-            if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(pooled_logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
-                loss = loss_fct(pooled_logits, labels)
+        if compute_loss:
+            loss = self._get_loss(pooled_logits, labels)
+        
         if not return_dict:
             output = (pooled_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
@@ -142,3 +127,51 @@ class ActiveSelectionGPT2ForSequenceClassification(GPT2ForSequenceClassification
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+        
+        
+    def _get_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        indices: Optional[torch.Tensor] = None,
+        batch_loss: bool = False,
+        irreducible_loss: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+
+        if self.config.problem_type is None:
+            if self.num_labels == 1:
+                self.config.problem_type = "regression"
+            elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                self.config.problem_type = "single_label_classification"
+            else:
+                self.config.problem_type = "multi_label_classification"
+
+        if self.config.problem_type == "regression":
+            loss_fct = MSELoss() if not batch_loss else MSELoss(reduction='none')
+            if self.num_labels == 1:
+                if indices is not None:
+                    loss = loss_fct(logits.squeeze()[indices], labels.squeeze()[indices])
+                else:
+                    loss = loss_fct(logits.squeeze(), labels.squeeze())
+            else:
+                if indices is not None:
+                    loss = loss_fct(logits[indices], labels[indices])
+                else:
+                    loss = loss_fct(logits, labels)
+        elif self.config.problem_type == "single_label_classification":
+            loss_fct = CrossEntropyLoss() if not batch_loss else CrossEntropyLoss(reduction='none')
+            if indices is not None:
+                loss = loss_fct(logits[indices].view(-1, self.num_labels), labels[indices].view(-1))
+            else:
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        elif self.config.problem_type == "multi_label_classification":
+            loss_fct = BCEWithLogitsLoss() if not batch_loss else BCEWithLogitsLoss(reduction='none')
+            if indices is not None:
+                loss = loss_fct(logits[indices], labels[indices])
+            else:
+                loss = loss_fct(logits, labels)
+                
+        if batch_loss and irreducible_loss is not None:
+            loss = loss - irreducible_loss
+            
+        return loss

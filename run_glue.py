@@ -47,7 +47,10 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
-from active_model import ActiveSelectionBertForSequenceClassification
+from models import (
+    ActiveSelectionBertForSequenceClassification, 
+    ActiveSelectionGPT2ForSequenceClassification,
+)
 from active_trainer import ActiveSelectionTrainer
 
 os.environ["WANDB_PROJECT"] = "<my_project>" # name your W&B project 
@@ -387,6 +390,10 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    # Check if the configuration has a padding token ID
+    if config.pad_token_id is None:
+        # If not, set it to a specific value (e.g., the EOS token ID)
+        config.pad_token_id = config.eos_token_id
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
@@ -394,15 +401,31 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    model = ActiveSelectionBertForSequenceClassification.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-        ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
-    )
+    # # Check if the tokenizer has a padding token
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    
+    if 'bert' in model_args.model_name_or_path:
+        model = ActiveSelectionBertForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+            ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+        )
+    elif 'gpt' in model_args.model_name_or_path:
+        model = ActiveSelectionGPT2ForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+            ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+        )
+        model.resize_token_embeddings(len(tokenizer))
     if data_args.strategy == 'IL':
         IL_model = ActiveSelectionBertForSequenceClassification.from_pretrained(
             model_args.IL_model_path,
