@@ -55,7 +55,7 @@ from active_trainer import ActiveSelectionTrainer
 
 os.environ["WANDB_PROJECT"] = "<my_project>" # name your W&B project 
 os.environ["WANDB_LOG_MODEL"] = "checkpoint" # log all model checkpoints
-os.environ["WANDB_MODE"] = "dryrun" # don't create a W&B run
+# os.environ["WANDB_MODE"] = "dryrun" # don't create a W&B run
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.26.0.dev0")
