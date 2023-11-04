@@ -5,3 +5,6 @@ torchvision
 torchaudio
 transformers[torch]==4.34.1
 wandb
+portalocker
+torchdata
+torchtext

@@ -53,7 +53,7 @@ from models import (
 )
 from active_trainer import ActiveSelectionTrainer
 
-os.environ["WANDB_PROJECT"] = "<my_project>" # name your W&B project 
+os.environ["WANDB_PROJECT"] = "<my_project_new>" # name your W&B project 
 os.environ["WANDB_LOG_MODEL"] = "checkpoint" # log all model checkpoints
 # os.environ["WANDB_MODE"] = "dryrun" # don't create a W&B run
 
