@@ -63,19 +63,7 @@ def get_total_params(module: torch.nn.Module):
     return total_params
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='PyTorch Wikitext-2 Transformer Language Model')
-    parser.add_argument('--bptt', type=int, default=25, help='batch size')
-    parser.add_argument('--emsize', type=int, default=4096, help='embedding dimension')
-    parser.add_argument('--nhid', type=int, default=4096, help='the dimension of the feedforward network model in nn.TransformerEncoder')
-    parser.add_argument('--nlayers', type=int, default=12, help='the number of nn.TransformerEncoderLayer in nn.TransformerEncoder')
-    parser.add_argument('--nhead', type=int, default=16, help='the number of heads in the multiheadattention models')
-    parser.add_argument('--dropout', type=float, default=0.2, help='the dropout value')
-    parser.add_argument('--lr', type=float, default=5.0, help='learning rate')
-    parser.add_argument('--epochs', type=int, default=3, help='epochs')
-    parser.add_argument('--chunks', type=int, default=8, help='number of micro-batches')
-
-    args = parser.parse_args()
+def main():
 
     # Model scale and pipe initialization
     bptt = args.bptt
@@ -224,3 +212,25 @@ if __name__ == "__main__":
     print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
         test_loss, math.exp(test_loss)))
     print('=' * 89)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='PyTorch Wikitext-2 Transformer Language Model')
+    parser.add_argument('--bptt', type=int, default=25, help='batch size')
+    parser.add_argument('--emsize', type=int, default=4096, help='embedding dimension')
+    parser.add_argument('--nhid', type=int, default=4096, help='the dimension of the feedforward network model in nn.TransformerEncoder')
+    parser.add_argument('--nlayers', type=int, default=12, help='the number of nn.TransformerEncoderLayer in nn.TransformerEncoder')
+    parser.add_argument('--nhead', type=int, default=16, help='the number of heads in the multiheadattention models')
+    parser.add_argument('--dropout', type=float, default=0.2, help='the dropout value')
+    parser.add_argument('--lr', type=float, default=5.0, help='learning rate')
+    parser.add_argument('--epochs', type=int, default=3, help='epochs')
+    parser.add_argument('--chunks', type=int, default=8, help='number of micro-batches')
+    parser.add_argument('--profile', action='store_true', help='profile training')
+
+    args = parser.parse_args()
+    
+    if args.profile:
+        with torch.cuda.profiler.profile():
+            main()
+    else:
+        main()
