@@ -3,7 +3,7 @@ sys.dont_write_bytecode = True
 import math
 import time
 import argparse
-
+from tqdm import tqdm
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -13,7 +13,7 @@ from torchtext.datasets import WikiText2
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
 
-from torch.nn import TransformerEncoderLayer
+from torch.nn import TransformerEncoderLayer, TransformerDecoderLayer
 from torch.distributed import rpc
 from torch.distributed.pipeline.sync import Pipe
 
@@ -75,6 +75,8 @@ def main():
     lr = args.lr
     epochs = args.epochs
     chunks = args.chunks
+    do_train = args.do_train
+    do_eval = args.do_eval
     
     train_data, val_data, test_data, vocab = get_data()
     ntokens = len(vocab) # the size of vocabulary
@@ -143,7 +145,7 @@ def main():
         # Train only for 50 batches to keep script execution time low.
         nbatches = min(50 * bptt, train_data.size(0) - 1)
 
-        for batch, i in enumerate(range(0, nbatches, bptt)):
+        for batch, i in tqdm(enumerate(range(0, nbatches, bptt)), total=nbatches // bptt):
             data, targets = get_batch(train_data, i) # (B X T), (B*T)
             # print('input text[0]: ', vocab.lookup_tokens(data[0].tolist()))
             # print('target text[0]: ', vocab.lookup_tokens(targets[:bptt].tolist()))
@@ -182,7 +184,7 @@ def main():
         # Evaluate only for 50 batches to keep script execution time low.
         nbatches = min(50 * bptt, data_source.size(0) - 1)
         with torch.no_grad():
-            for i in range(0, nbatches, bptt):
+            for i in tqdm(range(0, nbatches, bptt)):
                 data, targets = get_batch(data_source, i)
                 output = eval_model(data).local_value()
                 output_flat = output.view(-1, ntokens)
@@ -191,31 +193,40 @@ def main():
                 total_loss += len(data) * criterion(output_flat, targets.to(output.device)).item()
         return total_loss / (len(data_source) - 1)
 
-
-    best_val_loss = float("inf")
     best_model = None
-
-    for epoch in range(1, epochs + 1):
-        epoch_start_time = time.time()
-        train()
-        val_loss = evaluate(model, val_data)
-        print('-' * 89)
-        print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-            'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
-                                        val_loss, math.exp(val_loss)))
-        print('-' * 89)
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model = model
-
-        scheduler.step()
+    if do_train:
+        best_val_loss = float("inf")
+        print("***** Running training *****")
+        print(f"  Num examples = {len(train_data)}")
+        print(f"  Num Epochs = {epochs}")
         
-    test_loss = evaluate(best_model, test_data)
-    print('=' * 89)
-    print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
-        test_loss, math.exp(test_loss)))
-    print('=' * 89)
+        for epoch in range(1, epochs + 1):
+            epoch_start_time = time.time()
+            train()
+            val_loss = evaluate(model, val_data)
+            print('-' * 89)
+            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
+                                            val_loss, math.exp(val_loss)))
+            print('-' * 89)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model = model
+
+            scheduler.step()
+
+    best_model = model if best_model is None else best_model
+        
+    if do_eval:
+        print("***** Running evaluation *****")
+        print(f"  Num examples = {len(test_data)}")
+        
+        test_loss = evaluate(best_model, test_data)
+        print('=' * 89)
+        print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
+            test_loss, math.exp(test_loss)))
+        print('=' * 89)
 
 
 if __name__ == "__main__":
@@ -230,6 +241,8 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=3, help='epochs')
     parser.add_argument('--chunks', type=int, default=8, help='number of micro-batches')
     parser.add_argument('--profile', action='store_true', help='profile training')
+    parser.add_argument('--do_train', action='store_true', help='do training')
+    parser.add_argument('--do_eval', action='store_true', help='do evaluation')
 
     args = parser.parse_args()
     

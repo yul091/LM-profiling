@@ -554,10 +554,10 @@ if __name__ == "__main__":
             if (step + 1) % back_accum_steps == 0:
                 accumulated_loss.backward()
                 accumulated_loss = 0
-                # torch.nn.utils.clip_grad_norm_(
-                #     model.parameters(), 
-                #     max_norm=training_args['max_grad_norm'],
-                # )
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), 
+                    max_norm=training_args['max_grad_norm'],
+                )
             backward_end = time.time()
             
             if (step + 1) % grad_accum_steps == 0:
