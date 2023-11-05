@@ -80,9 +80,10 @@ def main():
     ntokens = len(vocab) # the size of vocabulary
     
     def get_batch(source, i):
+        # Source (N X T) where T is the chunk size
         seq_len = min(bptt, len(source) - 1 - i)
-        data = source[i:i+seq_len]
-        target = source[i+1:i+1+seq_len].view(-1)
+        data = source[i:i+seq_len] # (B X T) where B is the batch size
+        target = source[i+1:i+1+seq_len].view(-1) # (B*T) the corresponding next sentences
         # Need batch dimension first for pipeline parallelism.
         return data.t(), target
 
@@ -143,12 +144,15 @@ def main():
         nbatches = min(50 * bptt, train_data.size(0) - 1)
 
         for batch, i in enumerate(range(0, nbatches, bptt)):
-            data, targets = get_batch(train_data, i)
+            data, targets = get_batch(train_data, i) # (B X T), (B*T)
+            # print('input text[0]: ', vocab.lookup_tokens(data[0].tolist()))
+            # print('target text[0]: ', vocab.lookup_tokens(targets[:bptt].tolist()))
             optimizer.zero_grad()
             # Since the Pipe is only within a single host and process the ``RRef``
             # returned by forward method is local to this node and can simply
             # retrieved via ``RRef.local_value()``.
-            output = model(data).local_value()
+            output = model(data).local_value() # (B X T X C) where C is vocab size
+            # print('output text[0]: ', vocab.lookup_tokens(output[0].argmax(dim=-1).detach().tolist()))
             # Need to move targets to the device where the output of the
             # pipeline resides.
             loss = criterion(output.view(-1, ntokens), targets.to(output.device))
