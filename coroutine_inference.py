@@ -13,7 +13,6 @@ from typing import Dict, List
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-import tempfile
 
 from torchtext.datasets import WikiText2
 from torchtext.data.utils import get_tokenizer
@@ -242,12 +241,6 @@ def main():
     if coroutine:
         print("  Running coroutine inference ...")
         asyncio.run(coroutine_evaluate(stages, test_data))
-        # loop = asyncio.new_event_loop()
-        # asyncio.set_event_loop(loop)
-        # try:
-        #     loop.run_until_complete(evaluate(stages, test_data))
-        # finally:
-        #     loop.close()
     else:
         print("  Running synchronous inference ...")
         test_loss = evaluate(stages, test_data)
