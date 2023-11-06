@@ -104,21 +104,6 @@ def main():
         # Need batch dimension first for pipeline parallelism.
         return data.t(), target
 
-    tmpfile = tempfile.NamedTemporaryFile()
-    rpc.init_rpc(
-        name="worker",
-        rank=0,
-        world_size=1,
-        rpc_backend_options=rpc.TensorPipeRpcBackendOptions(
-            init_method="file://{}".format(tmpfile.name),
-            # Specifying _transports and _channels is a workaround and we no longer
-            # will have to specify _transports and _channels for PyTorch
-            # versions >= 1.8.1
-            _transports=["ibv", "uv"],
-            _channels=["cuda_ipc", "cuda_basic"],
-        )
-    )
-
     num_gpus = torch.cuda.device_count()
     partition_len = ((nlayers - 1) // num_gpus) + 1
     print("partition (block) size: {}".format(partition_len))
@@ -143,11 +128,22 @@ def main():
     tmp_list.append(Decoder(ntokens, emsize))
     stages.append(PipelineStage(tmp_list, stage_device + 1))
     print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device + 1))
+    print ('Total parameters in model: {:,}'.format(get_total_params(torch.nn.Sequential(*stages))))
 
     # Run the model
     criterion = nn.CrossEntropyLoss()
     # Dictionary to hold all timing information
     timing_info = defaultdict(list)
+    
+    async def producer(queue, data_source, bptt):
+        # Evaluate only for 50 batches to keep script execution time low.
+        # nbatches = min(50 * bptt, data_source.size(0) - 1)
+        nbatches = data_source.size(0) - 1
+        for i in tqdm(range(0, nbatches, bptt)):
+            data, targets = get_batch(data_source, i)
+            await queue.put((data, targets))
+            await asyncio.sleep(0)  # Simulates a long-running task
+        await queue.put((None, None))  # Signal the end of the dataset
     
     async def coroutine_evaluate_stage(stage, queue_in, queue_out, device, next_device=None):
         while True:
@@ -158,32 +154,21 @@ def main():
             with torch.no_grad():
                 # Record the start time of the stage on this GPU
                 record_time(device, 'start', timing_info)
-                data = data.to(device)  # Move data to the current stage's device.
                 output = stage(data)
+                record_time(device, 'end', timing_info)
                 if next_device:
                     output = output.to(next_device)  # Move output to the next stage's device.
-                record_time(device, 'end', timing_info)
             await queue_out.put((output, targets))
             
-    async def producer(queue, data_source, bptt):
-        # Evaluate only for 50 batches to keep script execution time low.
-        nbatches = min(50 * bptt, data_source.size(0) - 1)
-        for i in tqdm(range(0, nbatches, bptt)):
-            data, targets = get_batch(data_source, i)
-            await queue.put((data, targets))
-        await queue.put((None, None))  # Signal the end of the dataset
-        
     async def consumer(queue, ntokens):
         total_loss = 0.
-        nitems = 0
         while True:
             output, targets = await queue.get() # (B X T X C) and (B*T)
             if output is None:
                 break
             output_flat = output.contiguous().view(-1, ntokens) # (B*T) X C
             total_loss += output.size(0) * criterion(output_flat, targets.to(output.device)).item() 
-            nitems += output.size(0)
-        return total_loss / nitems
+        return total_loss / (len(test_data) - 1)
     
     async def coroutine_evaluate(stages, data_source):
         queues = [asyncio.Queue() for _ in range(len(stages) + 1)]
@@ -194,8 +179,8 @@ def main():
         # Start stage coroutines
         stages_coros = [coroutine_evaluate_stage(
             stages[i], 
-            queues[i], 
-            queues[i + 1], 
+            queues[i],  # input queue (of data) for stage i
+            queues[i + 1],  # output queue (of data) for stage i+1
             device=i, 
             next_device=i+1 if i < len(stages) - 1 else None,
         ) for i in range(len(stages))]
@@ -232,15 +217,16 @@ def main():
         total_loss = 0.
         ntokens = len(vocab)
         # Evaluate only for 50 batches to keep script execution time low.
-        nbatches = min(50 * bptt, data_source.size(0) - 1)
+        # nbatches = min(50 * bptt, data_source.size(0) - 1)
+        nbatches = data_source.size(0) - 1
         with torch.no_grad():
             for i in tqdm(range(0, nbatches, bptt)):
                 data, targets = get_batch(data_source, i)
-                output = data.to(0)
+                output = data
                 for i, stage in enumerate(stages):
                     record_time(i, 'start', timing_info)
                     stage.eval()
-                    output = output.to(i)
+                    output = output.cuda(i)
                     output = stage(output)
                     record_time(i, 'end', timing_info)
 
@@ -254,7 +240,7 @@ def main():
     print(f"  Num examples = {len(test_data)}")
     
     if coroutine:
-        print("Running coroutine inference")
+        print("  Running coroutine inference ...")
         asyncio.run(coroutine_evaluate(stages, test_data))
         # loop = asyncio.new_event_loop()
         # asyncio.set_event_loop(loop)
@@ -263,14 +249,15 @@ def main():
         # finally:
         #     loop.close()
     else:
-        print("Running synchronous inference")
+        print("  Running synchronous inference ...")
         test_loss = evaluate(stages, test_data)
         print('test loss {:5.2f} | test ppl {:8.2f}'.format(test_loss, math.exp(test_loss)))
         
         
     # After all batches are processed, save the timing information to a file
     os.makedirs(output_dir, exist_ok=True)
-    with open(f'{output_dir}/timing_info.json', 'w') as f:
+    stats_f = f'{output_dir}/timing_info_coroutine.json' if coroutine else f'{output_dir}/timing_info.json'
+    with open(stats_f, 'w') as f:
         json.dump(timing_info, f, indent=4)
 
 
