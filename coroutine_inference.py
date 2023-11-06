@@ -1,12 +1,15 @@
+import os
 import sys
 sys.dont_write_bytecode = True
 import math
 import time
+import json
 import argparse
 from tqdm import tqdm
-
 import asyncio
-from torch.cuda.amp import autocast
+from collections import defaultdict
+from typing import Dict, List
+
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -25,6 +28,10 @@ from models import Encoder, Decoder
 if torch.cuda.device_count() < 2:
     print('Need at least two GPU devices for this tutorial')
     sys.exit(0)
+    
+def record_time(device: int, event_type: str, timing_info: Dict[str, List[float]]):
+    # event_type can be 'start' or 'end'
+    timing_info[f"{device}_{event_type}"].append(time.time())
     
 # Load and batch data 
 def data_process(vocab, tokenizer, raw_text_iter):
@@ -83,6 +90,8 @@ def main():
     nlayers = args.nlayers
     nhead = args.nhead
     dropout = args.dropout
+    output_dir = args.output_dir
+    coroutine = args.coroutine
     
     train_data, val_data, test_data, vocab = get_data()
     ntokens = len(vocab) # the size of vocabulary
@@ -132,27 +141,34 @@ def main():
 
     # Add decoder in the end.
     tmp_list.append(Decoder(ntokens, emsize))
-    stages.append(PipelineStage(tmp_list, num_gpus - 1))
-    print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], num_gpus - 1))
+    stages.append(PipelineStage(tmp_list, stage_device + 1))
+    print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device + 1))
 
     # Run the model
     criterion = nn.CrossEntropyLoss()
+    # Dictionary to hold all timing information
+    timing_info = defaultdict(list)
     
-    async def evaluate_stage(stage, queue_in, queue_out, device, next_device=None):
+    async def coroutine_evaluate_stage(stage, queue_in, queue_out, device, next_device=None):
         while True:
             data, targets = await queue_in.get()
             if data is None:  # None is sent as a signal to shut down.
                 await queue_out.put((None, None))
                 break
             with torch.no_grad():
+                # Record the start time of the stage on this GPU
+                record_time(device, 'start', timing_info)
                 data = data.to(device)  # Move data to the current stage's device.
                 output = stage(data)
                 if next_device:
                     output = output.to(next_device)  # Move output to the next stage's device.
+                record_time(device, 'end', timing_info)
             await queue_out.put((output, targets))
             
     async def producer(queue, data_source, bptt):
-        for i in tqdm(range(0, data_source.size(0) - 1, bptt)):
+        # Evaluate only for 50 batches to keep script execution time low.
+        nbatches = min(50 * bptt, data_source.size(0) - 1)
+        for i in tqdm(range(0, nbatches, bptt)):
             data, targets = get_batch(data_source, i)
             await queue.put((data, targets))
         await queue.put((None, None))  # Signal the end of the dataset
@@ -161,22 +177,22 @@ def main():
         total_loss = 0.
         nitems = 0
         while True:
-            output, targets = await queue.get()
+            output, targets = await queue.get() # (B X T X C) and (B*T)
             if output is None:
                 break
-            output_flat = output.view(-1, ntokens)
-            total_loss += criterion(output_flat, targets).item()
-            nitems += output_flat.size(0)
+            output_flat = output.contiguous().view(-1, ntokens) # (B*T) X C
+            total_loss += output.size(0) * criterion(output_flat, targets.to(output.device)).item() 
+            nitems += output.size(0)
         return total_loss / nitems
     
-    async def evaluate(stages, data_source):
+    async def coroutine_evaluate(stages, data_source):
         queues = [asyncio.Queue() for _ in range(len(stages) + 1)]
         
         # Start the producer coroutine
         producer_coro = producer(queues[0], data_source, bptt)
 
         # Start stage coroutines
-        stages_coros = [evaluate_stage(
+        stages_coros = [coroutine_evaluate_stage(
             stages[i], 
             queues[i], 
             queues[i + 1], 
@@ -189,7 +205,6 @@ def main():
 
         # Run the coroutines
         coros = [producer_coro] + stages_coros + [consumer_coro]
-        # completed, pending = await asyncio.wait(coros, return_when=asyncio.FIRST_EXCEPTION)
         tasks = [asyncio.create_task(coro) for coro in coros]
         completed, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
 
@@ -203,80 +218,73 @@ def main():
                 # Rethrow the exception
                 raise task.exception()
         
-        # Get the result from the consumer
-        loss = await consumer_coro
-        print(f"Test Loss: {loss}")
-        # return loss
+        # # Get the result from the consumer
+        # loss = await consumer_coro
+        # Instead of awaiting the consumer coroutine again, get the result from the Task object
+        consumer_task = tasks[-1]  # This assumes that the consumer task is the last in the list
+        if consumer_task.done():
+            loss = consumer_task.result()
+        else:
+            loss = None  # or handle accordingly
+        print(f"Test Loss: {loss}, perplexity: {math.exp(loss)}")
+        
+    def evaluate(stages, data_source):
+        total_loss = 0.
+        ntokens = len(vocab)
+        # Evaluate only for 50 batches to keep script execution time low.
+        nbatches = min(50 * bptt, data_source.size(0) - 1)
+        with torch.no_grad():
+            for i in tqdm(range(0, nbatches, bptt)):
+                data, targets = get_batch(data_source, i)
+                output = data.to(0)
+                for i, stage in enumerate(stages):
+                    record_time(i, 'start', timing_info)
+                    stage.eval()
+                    output = output.to(i)
+                    output = stage(output)
+                    record_time(i, 'end', timing_info)
 
-            
-    # # Assuming that model is a list of partitions, each on its respective GPU.
-    # async def evaluate_partition(data, model_partition, next_partition=None):
-    #     model_partition.eval()
-    #     # Move data to the GPU where this partition of the model is.
-    #     data_gpu = data.to(f'cuda:{model_partition.device}')
-    #     # Forward pass through this partition.
-    #     with torch.no_grad():
-    #         output = model_partition(data_gpu)
-    #     # Pass output to the next partition if there is one.
-    #     if next_partition is not None:
-    #         return await evaluate_partition(output, next_partition)
-    #     else:
-    #         # On the last partition, return the output to be collected.
-    #         return output.cpu()
-
-    # async def evaluate_coroutine(model, data_source, ntokens):
-    #     total_loss = 0.
-    #     # We assume that bptt and criterion are defined elsewhere.
-    #     with torch.no_grad():
-    #         for i in tqdm(range(0, data_source.size(0) - 1, bptt)):
-    #             data, targets = get_batch(data_source, i)
-    #             # Initiate coroutine chain for each batch.
-    #             output_flat = await evaluate_partition(data, model[0], next_partition=model[1:])
-    #             # Flatten the output for loss calculation
-    #             output_flat = output_flat.view(-1, ntokens)
-    #             # Move targets to the CPU.
-    #             total_loss += len(data) * criterion(output_flat, targets).item()
-    #     # Average the loss.
-    #     return total_loss / (len(data_source) - 1)
-
-    # # Function to start the evaluation coroutine for the whole dataset.
-    # async def evaluate(model, data_source):
-    #     ntokens = len(vocab)
-    #     # Start evaluating the whole dataset asynchronously.
-    #     total_loss = await evaluate_coroutine(model, data_source, ntokens)
-    #     return total_loss
+                output_flat = output.contiguous().view(-1, ntokens)
+                # Need to move targets to the device where the output of the
+                # pipeline resides.
+                total_loss += len(data) * criterion(output_flat, targets.to(output.device)).item()
+        return total_loss / (len(data_source) - 1)
         
     print("***** Running evaluation *****")
     print(f"  Num examples = {len(test_data)}")
     
-    # test_loss = asyncio.run(evaluate(stages, test_data))
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(evaluate(stages, test_data))
-    finally:
-        loop.close()
-    
-    # print('=' * 89)
-    # print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
-    #     test_loss, math.exp(test_loss)))
-    # print('=' * 89)
+    if coroutine:
+        print("Running coroutine inference")
+        asyncio.run(coroutine_evaluate(stages, test_data))
+        # loop = asyncio.new_event_loop()
+        # asyncio.set_event_loop(loop)
+        # try:
+        #     loop.run_until_complete(evaluate(stages, test_data))
+        # finally:
+        #     loop.close()
+    else:
+        print("Running synchronous inference")
+        test_loss = evaluate(stages, test_data)
+        print('test loss {:5.2f} | test ppl {:8.2f}'.format(test_loss, math.exp(test_loss)))
+        
+        
+    # After all batches are processed, save the timing information to a file
+    os.makedirs(output_dir, exist_ok=True)
+    with open(f'{output_dir}/timing_info.json', 'w') as f:
+        json.dump(timing_info, f, indent=4)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='PyTorch Wikitext-2 Transformer Language Model')
+    parser.add_argument('--output_dir', type=str, default='prof', help='output directory')
     parser.add_argument('--bptt', type=int, default=25, help='batch size')
     parser.add_argument('--emsize', type=int, default=4096, help='embedding dimension')
     parser.add_argument('--nhid', type=int, default=4096, help='the dimension of the feedforward network model in nn.TransformerEncoder')
     parser.add_argument('--nlayers', type=int, default=12, help='the number of nn.TransformerEncoderLayer in nn.TransformerEncoder')
     parser.add_argument('--nhead', type=int, default=16, help='the number of heads in the multiheadattention models')
     parser.add_argument('--dropout', type=float, default=0.2, help='the dropout value')
-    parser.add_argument('--profile', action='store_true', help='profile training')
+    parser.add_argument('--coroutine', action='store_true', help='coroutine inference')
 
     args = parser.parse_args()
     
-    if args.profile:
-        with torch.cuda.profiler.profile():
-            main()
-    else:
-        main()
+    main()
