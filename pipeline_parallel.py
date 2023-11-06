@@ -64,7 +64,6 @@ def get_total_params(module: torch.nn.Module):
 
 
 def main():
-
     # Model scale and pipe initialization
     bptt = args.bptt
     emsize = args.emsize
@@ -130,6 +129,7 @@ def main():
     # Build the pipeline.
     model = Pipe(torch.nn.Sequential(*module_list), chunks=chunks)
     print ('Total parameters in model: {:,}'.format(get_total_params(model)))
+    # model[0] is the Encoder, model[-1] is the Decoder.
 
     # Run the model
     criterion = nn.CrossEntropyLoss()
