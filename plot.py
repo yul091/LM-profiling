@@ -8,13 +8,16 @@ def plot():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--coroutine', action='store_true')
+    parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], default='identical', help='workload setting')
     args = parser.parse_args()
     
     output_dir = args.output_dir
     coroutine = args.coroutine
+    setting = args.setting
     
     # Load timing information
-    stats_f = f'{output_dir}/timing_info_coroutine.json' if coroutine else f'{output_dir}/timing_info.json'
+    execution = 'coroutine' if coroutine else 'sync'
+    stats_f = f'{output_dir}/timing_info_{execution}_{setting}.json'
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
 

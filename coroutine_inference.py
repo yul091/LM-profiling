@@ -4,6 +4,8 @@ sys.dont_write_bytecode = True
 import math
 import time
 import json
+import wandb
+import random
 import argparse
 from tqdm import tqdm
 import asyncio
@@ -13,14 +15,14 @@ from typing import Dict, List
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset, DataLoader
 
 from torchtext.datasets import WikiText2
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
 
 from torch.nn import TransformerEncoderLayer, TransformerDecoderLayer
-from torch.distributed import rpc
-
 from models import Encoder, Decoder
 
 
@@ -31,35 +33,60 @@ if torch.cuda.device_count() < 2:
 def record_time(device: int, event_type: str, timing_info: Dict[str, List[float]]):
     # event_type can be 'start' or 'end'
     timing_info[f"{device}_{event_type}"].append(time.time())
-    
+            
 # Load and batch data 
 def data_process(vocab, tokenizer, raw_text_iter):
   data = [torch.tensor(vocab(tokenizer(item)), dtype=torch.long) for item in raw_text_iter]
   return torch.cat(tuple(filter(lambda t: t.numel() > 0, data)))
 
-def batchify(data: Tensor, bsz: int, device: int):
-    # Divide the dataset into ``bsz`` parts.
-    nbatch = data.size(0) // bsz
-    # Trim off any extra elements that wouldn't cleanly fit (remainders).
-    data = data.narrow(0, 0, nbatch * bsz)
-    # Evenly divide the data across the ``bsz` batches.
-    data = data.view(bsz, -1).t().contiguous()
-    return data.cuda(device)
+def batchify(data: Tensor, bsz: int, setting: str, min_len: int = 10, max_len: int = 128):
+    # # Divide the dataset into ``bsz`` parts.
+    # nbatch = data.size(0) // bsz
+    # # Trim off any extra elements that wouldn't cleanly fit (remainders).
+    # data = data.narrow(0, 0, nbatch * bsz) # tensor(#tokens)
+    # # Evenly divide the data across the ``bsz` batches.
+    # data = data.view(bsz, -1).t().contiguous() # (N X bsz)
+    # return data.cuda(0)
+    
+    # List to store sentence tensors
+    sentences = []
+    data_len = data.size(0)
+    i = 0
+    # Loop through the 'data' to create sentences with random lengths
+    while i < data_len:
+        # Generate a random length for the sentence
+        if setting != 'identical':
+            rand_length = min(random.randint(min_len, max_len), data_len - i)
+        else:
+            rand_length = bsz
+        # Slice the data to get a "sentence" of 'rand_length'
+        sentence = data[i:i+rand_length]
+        # Add the tensor representing the sentence to the list
+        sentences.append(sentence)
+        # Increment 'i' to the next starting point
+        i += rand_length
+    # return sentences
+    if setting == 'increasing':
+        sentences.sort(key=lambda x: x.size(0))
+    elif setting == 'decreasing':
+        sentences.sort(key=lambda x: x.size(0), reverse=True)
+    return sentences
+        
 
-def get_data(batch_size: int = 20, eval_batch_size: int = 10, device: int = 0):
+def get_data(batch_size: int = 20, eval_batch_size: int = 20, setting: str = 'identical', min_len: int = 10, max_len: int = 128):
     train_iter = WikiText2(split='train')
     tokenizer = get_tokenizer('basic_english')
     vocab = build_vocab_from_iterator(map(tokenizer, train_iter), specials=["<unk>"])
     vocab.set_default_index(vocab["<unk>"])
 
     train_iter, val_iter, test_iter = WikiText2()
-    train_data = data_process(vocab, tokenizer, train_iter)
-    val_data = data_process(vocab, tokenizer, val_iter)
-    test_data = data_process(vocab, tokenizer, test_iter)
+    train_data = data_process(vocab, tokenizer, train_iter) # tensor(#train_tokens)
+    val_data = data_process(vocab, tokenizer, val_iter) # tensor(#val_tokens)
+    test_data = data_process(vocab, tokenizer, test_iter) # tensor(#test_tokens)
 
-    train_data = batchify(train_data, batch_size, device)
-    val_data = batchify(val_data, eval_batch_size, device)
-    test_data = batchify(test_data, eval_batch_size, device)
+    train_data = batchify(train_data, batch_size, setting, min_len, max_len)
+    val_data = batchify(val_data, eval_batch_size, setting, min_len, max_len)
+    test_data = batchify(test_data, eval_batch_size, setting, min_len, max_len)
     
     return train_data, val_data, test_data, vocab
 
@@ -79,6 +106,25 @@ class PipelineStage(nn.Module):
 
     def forward(self, x):
         return self.layers(x)
+    
+
+class SentencePairDataset(Dataset):
+    def __init__(self, data_list):
+        """
+        Args:
+            data_list (list of Tensors): A list where each element is a tensor corresponding to a sentence.
+        """
+        self.data_list = data_list
+
+    def __len__(self):
+        # We return the length minus one because we are creating pairs of sentences
+        return len(self.data_list) - 1
+
+    def __getitem__(self, idx):
+        # Return the current sentence and the next sentence as the data and target, respectively.
+        data = self.data_list[idx]
+        target = self.data_list[idx + 1]
+        return data, target
 
 
 def main():
@@ -91,17 +137,33 @@ def main():
     dropout = args.dropout
     output_dir = args.output_dir
     coroutine = args.coroutine
+    setting = args.setting
+    profiling = args.profiling
+    seed = args.seed
     
-    train_data, val_data, test_data, vocab = get_data()
+    train_data, val_data, test_data, vocab = get_data(setting=setting)
+    
+    def collate_batch(batch):
+        # 'batch' is a list of tuples with (sequence, target)
+        batch_data, batch_target = zip(*batch)
+        combined_list = batch_data + batch_target
+        # Dynamically pad the batch
+        padded = pad_sequence(combined_list, batch_first=True, padding_value=vocab['<pad>'])
+        padded_data = padded[:len(batch_data)]
+        padded_target = padded[len(batch_data):]
+        return padded_data, padded_target.view(-1)
+    
+    # def get_batch(source, i):
+    #     # Source (N X T) where T is the chunk size
+    #     seq_len = min(bptt, len(source) - 1 - i)
+    #     data = source[i:i+seq_len] # (B X T) where B is the batch size
+    #     target = source[i+1:i+1+seq_len].view(-1) # (B*T) the corresponding next sentences
+    #     # Need batch dimension first for pipeline parallelism.
+    #     return data.t(), target
+    
+    test_dataset = SentencePairDataset(test_data)
     ntokens = len(vocab) # the size of vocabulary
-    
-    def get_batch(source, i):
-        # Source (N X T) where T is the chunk size
-        seq_len = min(bptt, len(source) - 1 - i)
-        data = source[i:i+seq_len] # (B X T) where B is the batch size
-        target = source[i+1:i+1+seq_len].view(-1) # (B*T) the corresponding next sentences
-        # Need batch dimension first for pipeline parallelism.
-        return data.t(), target
+    test_loader = DataLoader(test_dataset, batch_size=bptt, collate_fn=collate_batch)
 
     num_gpus = torch.cuda.device_count()
     partition_len = ((nlayers - 1) // num_gpus) + 1
@@ -130,17 +192,18 @@ def main():
     print ('Total parameters in model: {:,}'.format(get_total_params(torch.nn.Sequential(*stages))))
 
     # Run the model
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=vocab['<pad>'])
     # Dictionary to hold all timing information
     timing_info = defaultdict(list)
     
-    async def producer(queue, data_source, bptt):
+    async def producer(queue: asyncio.Queue, data_source: DataLoader, bptt: int):
         # Evaluate only for 50 batches to keep script execution time low.
         # nbatches = min(50 * bptt, data_source.size(0) - 1)
-        nbatches = data_source.size(0) - 1
-        for i in tqdm(range(0, nbatches, bptt)):
-            data, targets = get_batch(data_source, i)
-            await queue.put((data, targets))
+        # nbatches = data_source.size(0) - 1
+        # for i in tqdm(range(0, nbatches, bptt)):
+        for i, (data, targets) in tqdm(enumerate(data_source), total=len(data_source)):
+            # data, targets = get_batch(data_source, i)
+            await queue.put((data.cuda(0), targets))
             await asyncio.sleep(0)  # Simulates a long-running task
         await queue.put((None, None))  # Signal the end of the dataset
     
@@ -202,8 +265,6 @@ def main():
                 # Rethrow the exception
                 raise task.exception()
         
-        # # Get the result from the consumer
-        # loss = await consumer_coro
         # Instead of awaiting the consumer coroutine again, get the result from the Task object
         consumer_task = tasks[-1]  # This assumes that the consumer task is the last in the list
         if consumer_task.done():
@@ -211,45 +272,73 @@ def main():
         else:
             loss = None  # or handle accordingly
         print(f"Test Loss: {loss}, perplexity: {math.exp(loss)}")
+        # wandb.log({"test_loss": loss, "test_ppl": math.exp(loss)})
         
-    def evaluate(stages, data_source):
+    def evaluate(stages: List[nn.Sequential], data_source: DataLoader):
         total_loss = 0.
         ntokens = len(vocab)
         # Evaluate only for 50 batches to keep script execution time low.
         # nbatches = min(50 * bptt, data_source.size(0) - 1)
-        nbatches = data_source.size(0) - 1
+        # nbatches = data_source.size(0) - 1
         with torch.no_grad():
-            for i in tqdm(range(0, nbatches, bptt)):
-                data, targets = get_batch(data_source, i)
-                output = data
-                for i, stage in enumerate(stages):
-                    record_time(i, 'start', timing_info)
+            # for i in tqdm(range(0, nbatches, bptt)):
+            for i, (data, targets) in tqdm(enumerate(data_source), total=len(data_source)):
+                # data, targets = get_batch(data_source, i) # (B X T) and (B*T)
+                data = data.cuda(0)
+                output = data 
+                for j, stage in enumerate(stages):
+                    record_time(j, 'start', timing_info)
                     stage.eval()
-                    output = output.cuda(i)
-                    output = stage(output)
-                    record_time(i, 'end', timing_info)
+                    output = output.cuda(j)
+                    output = stage(output) # (B X T X C)
+                    record_time(j, 'end', timing_info)
 
-                output_flat = output.contiguous().view(-1, ntokens)
-                # Need to move targets to the device where the output of the
-                # pipeline resides.
-                total_loss += len(data) * criterion(output_flat, targets.to(output.device)).item()
-        return total_loss / (len(data_source) - 1)
+                output_flat = output.contiguous().view(-1, ntokens) # (B*T) X C
+                # Need to move targets to the device where the output of the pipeline resides.
+                batch_loss = criterion(output_flat, targets.to(output.device)).item()
+                # print(f"Batch {i} loss: {batch_loss}")
+                total_loss += len(data) * batch_loss
+                
+        return total_loss / (len(test_data) - 1)
         
     print("***** Running evaluation *****")
     print(f"  Num examples = {len(test_data)}")
+    print(f"  Workload setting = {setting}")
+    
+    random.seed(seed)
+    execution = 'coroutine' if coroutine else 'sync'
+    
+    if profiling:
+        wandb.login()
+        
+        wandb.init(
+            project="coroutine_inference",
+            name=f"{execution}_{setting}_workload",
+            config={
+                "bptt": bptt,
+                "emsize": emsize,
+                "nhid": nhid,
+                "nlayers": nlayers,
+                "nhead": nhead,
+                "dropout": dropout,
+                "coroutine": coroutine,
+            }
+        )
     
     if coroutine:
         print("  Running coroutine inference ...")
-        asyncio.run(coroutine_evaluate(stages, test_data))
+        # asyncio.run(coroutine_evaluate(stages, test_data))
+        asyncio.run(coroutine_evaluate(stages, test_loader))
     else:
         print("  Running synchronous inference ...")
-        test_loss = evaluate(stages, test_data)
+        # test_loss = evaluate(stages, test_data)
+        test_loss = evaluate(stages, test_loader)
         print('test loss {:5.2f} | test ppl {:8.2f}'.format(test_loss, math.exp(test_loss)))
-        
+        # wandb.log({"test_loss": test_loss, "test_ppl": math.exp(test_loss)})
         
     # After all batches are processed, save the timing information to a file
     os.makedirs(output_dir, exist_ok=True)
-    stats_f = f'{output_dir}/timing_info_coroutine.json' if coroutine else f'{output_dir}/timing_info.json'
+    stats_f = f'{output_dir}/timing_info_{execution}_{setting}.json'
     with open(stats_f, 'w') as f:
         json.dump(timing_info, f, indent=4)
 
@@ -263,7 +352,10 @@ if __name__ == "__main__":
     parser.add_argument('--nlayers', type=int, default=12, help='the number of nn.TransformerEncoderLayer in nn.TransformerEncoder')
     parser.add_argument('--nhead', type=int, default=16, help='the number of heads in the multiheadattention models')
     parser.add_argument('--dropout', type=float, default=0.2, help='the dropout value')
+    parser.add_argument('--profiling', action='store_true', help='enable profiling')
     parser.add_argument('--coroutine', action='store_true', help='coroutine inference')
+    parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], default='identical', help='workload setting')
+    parser.add_argument('--seed', type=int, default=42, help='random seed')
 
     args = parser.parse_args()
     
