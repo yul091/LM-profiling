@@ -310,10 +310,13 @@ def main():
     
     if profiling:
         wandb.login()
-        
         wandb.init(
             project="coroutine_inference",
             name=f"{execution}_{setting}_workload",
+            settings=wandb.Settings(
+                _stats_sample_rate_seconds=2, # high resolution system metrics
+                _stats_samples_to_average=1,
+            ),
             config={
                 "bptt": bptt,
                 "emsize": emsize,
