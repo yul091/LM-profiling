@@ -32,11 +32,19 @@ def plot():
     fig, ax = plt.subplots(figsize=(20, num_gpus))
 
     colors = cycle('bgrcmk')  # Cycle through a list of colors for the plot
-
+    idle_dict = {}
     # Plot the timings for each GPU
     for gpu_id in range(num_gpus):
         start_times = timing_info.get(f"{gpu_id}_start", [])
         end_times = timing_info.get(f"{gpu_id}_end", [])
+        idles = [start - end for start, end in zip(start_times[1:], end_times[:-1])]
+        idle_dict[f'{gpu_id}'] = idles
+        # idle_dict[f'{gpu_id}_stats'] = {
+        #     'mean': np.mean(idles),
+        #     'var': np.var(idles),
+        #     'median': np.median(idles),
+        # }
+        print(f'GPU {gpu_id} idle time statistics: mean {np.mean(idles)}, var {np.var(idles)}, median {np.median(idles)}')
         color = next(colors)
         
         # Plot each task for this GPU, increase the linewidth for a wider bar
@@ -64,6 +72,11 @@ def plot():
     plt.savefig(f'{stats_f.split(".")[0]}.png')
     # Show the plot
     plt.show()
+    
+    # Save idle time statistics
+    idle_f = f'{output_dir}/idle_time_{execution}_{setting}.json'
+    with open(idle_f, 'w') as f:
+        json.dump(idle_dict, f)
 
 
 if __name__ == '__main__':
