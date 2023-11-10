@@ -25,12 +25,18 @@ class Task:
 
 
 class Producer:
-    def __init__(self, task_queue: asyncio.Queue(), args: argparse.Namespace):
+    def __init__(
+        self, 
+        task_queue: asyncio.Queue, 
+        args: argparse.Namespace,
+        task_complete_flag: asyncio.Event,
+    ):
         self.task_queue = task_queue
         self.rate_lambda = args.rate_lambda
         train_data, val_data, test_data, vocab = get_data(setting=args.setting)
         # self.dataset = SentencePairDataset(train_data)
         self.dataset = SentencePairDataset(test_data)
+        self.task_complete_flag = task_complete_flag
         
     async def produce(self):
         # Produce using the dataset
@@ -44,15 +50,18 @@ class Producer:
                 task = Task(query=instance[0], timestamp=time.time())
             await self.task_queue.put(task)
             # print(f"Produced a task {task} at time {task.timestamp}")
+        self.task_complete_flag.set()
+        print("Producer finished producing tasks")
             
-            
+
+
 if __name__ == "__main__":
     
     # Test the producer
     parser = argparse.ArgumentParser()
     parser.add_argument('--rate_lambda', type=float, default=100, help='Average number of tasks produced per minute')
     parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], 
-                        default='identical', help='workload setting')
+                        default='random', help='workload setting')
     args = parser.parse_args()
     
     task_queue = asyncio.Queue()
