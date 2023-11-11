@@ -94,3 +94,4 @@ class SentencePairDataset(Dataset):
         data = self.data_list[idx]
         target = self.data_list[idx + 1]
         return data, target
+    

@@ -21,22 +21,11 @@ from torch.utils.data import DataLoader
 from torch.nn import TransformerEncoderLayer, TransformerDecoderLayer
 from dataset import get_data, SentencePairDataset
 from models import Encoder, Decoder
-
+from utils import record_time, get_total_params
 
 if torch.cuda.device_count() < 2:
     print('Need at least two GPU devices for this tutorial')
     sys.exit(0)
-    
-def record_time(device: int, event_type: str, timing_info: Dict[str, List[float]]):
-    # event_type can be 'start' or 'end'
-    timing_info[f"{device}_{event_type}"].append(time.time())
-            
-
-def get_total_params(module: torch.nn.Module):
-    total_params = 0
-    for param in module.parameters():
-        total_params += param.numel()
-    return total_params
 
 
 class PipelineStage(nn.Module):

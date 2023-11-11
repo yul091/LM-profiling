@@ -1,10 +1,10 @@
-
+import time
 import logging
 from typing import Dict, Union, Any, List, Tuple, Optional, Callable
 import pandas as pd
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
-
+import torch
 from transformers import (
     BertModel,
     BertForSequenceClassification,
@@ -35,6 +35,18 @@ OPTIMIZER_NAME = "optimizer.pt"
 OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
+
+
+def record_time(device: int, event_type: str, timing_info: Dict[str, List[float]]):
+    # event_type can be 'start' or 'end'
+    timing_info[f"{device}_{event_type}"].append(time.time())
+    
+
+def get_total_params(module: torch.nn.Module):
+    total_params = 0
+    for param in module.parameters():
+        total_params += param.numel()
+    return total_params
 
 
 def get_transformer_layers(

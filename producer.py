@@ -6,14 +6,15 @@ import time
 import argparse
 from tqdm import tqdm
 from torch import Tensor
-
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
 from dataset import get_data, SentencePairDataset
 
 
 class Task:
     """
     This class encapsulates a task to be processed by the system.
-    query (str): the query to be processed
+    query (str): the query batch to be processed
     timestamp (float): the time at which the task was generated
     feedback (str): the feedback for the query (optional) from the user
     """
@@ -33,21 +34,35 @@ class Producer:
     ):
         self.task_queue = task_queue
         self.rate_lambda = args.rate_lambda
-        train_data, val_data, test_data, vocab = get_data(setting=args.setting)
-        # self.dataset = SentencePairDataset(train_data)
+        
+        train_data, val_data, test_data, self.vocab = get_data(setting=args.setting)
+        
+        def collate_batch(batch):
+            # 'batch' is a list of tuples with (sequence, target)
+            batch_data, batch_target = zip(*batch)
+            combined_list = batch_data + batch_target
+            # Dynamically pad the batch
+            padded = pad_sequence(combined_list, batch_first=True, padding_value=self.vocab['<pad>'])
+            padded_data = padded[:len(batch_data)]
+            padded_target = padded[len(batch_data):]
+            return padded_data, padded_target.view(-1)
+        
+        # dataset = SentencePairDataset(train_data)
         self.dataset = SentencePairDataset(test_data)
+        self.dataloader = DataLoader(self.dataset, batch_size=args.bptt, collate_fn=collate_batch)
+        
         self.task_complete_flag = task_complete_flag
         
     async def produce(self):
         # Produce using the dataset
         # while True:
-        for i, instance in tqdm(enumerate(self.dataset), total=len(self.dataset)):
+        for i, batch in tqdm(enumerate(self.dataloader), total=len(self.dataloader)):
             await asyncio.sleep(random.expovariate(self.rate_lambda))
             # 5% of the time, produce a task with feedback
             if random.random() < 0.05:
-                task = Task(query=instance[0], timestamp=time.time(), feedback=instance[1])
+                task = Task(query=batch[0], timestamp=time.time(), feedback=batch[1])
             else:
-                task = Task(query=instance[0], timestamp=time.time())
+                task = Task(query=batch[0], timestamp=time.time())
             await self.task_queue.put(task)
             # print(f"Produced a task {task} at time {task.timestamp}")
         self.task_complete_flag.set()
@@ -62,6 +77,7 @@ if __name__ == "__main__":
     parser.add_argument('--rate_lambda', type=float, default=100, help='Average number of tasks produced per minute')
     parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], 
                         default='random', help='workload setting')
+    parser.add_argument('--bptt', type=int, default=5, help='batch size')
     args = parser.parse_args()
     
     task_queue = asyncio.Queue()
