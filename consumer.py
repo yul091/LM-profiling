@@ -20,7 +20,7 @@ class DeviceQueue:
         self.stop_signal = asyncio.Event()
 
     async def add_task(self, task: Task):
-        await self.queue.put(task)
+        await self.queue.put(task.query.cuda(self.cuda_id))
         
     # async def process_tasks(self, stage: nn.Module, next_cuda_id: int = None):
     #     # while not self.stop_signal.is_set():
@@ -41,7 +41,7 @@ class DeviceQueue:
     #                 break  # Exit the loop if stop signal is set and queue is empty
     #     print(f"Stopped processing on CUDA device {self.cuda_id}")
 
-    async def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None):
+    def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None):
         print(f"Processing task on CUDA device {self.cuda_id} at time {time.time()}")
         # Inference / training
         ############################################################
@@ -53,6 +53,7 @@ class DeviceQueue:
             if next_cuda_id:
                 output = output.cuda(next_cuda_id)  # Move output to the next stage's device
             task.query = output
+            print(f"task query shape: {task.query.shape}")
         ############################################################
         task.processed = True
         
@@ -81,8 +82,9 @@ class Node:
         total_loss = 0.
         while True:
             task: Task = await queue.get() # (B X T X C) and (B*T)
-            if task is None:
+            if task.feedback is None:
                 break
+            print(f"query shape: {task.query.shape}, target shape: {task.feedback.shape}")
             output_flat = task.query.contiguous().view(-1, ntokens) # (B*T) X C
             total_loss += task.feedback.size(0) * self.criterion(output_flat, task.feedback.to(task.query.device)).item() 
         return total_loss / total_size

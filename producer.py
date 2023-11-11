@@ -57,6 +57,8 @@ class Producer:
         # Produce using the dataset
         # while True:
         for i, batch in tqdm(enumerate(self.dataloader), total=len(self.dataloader)):
+            # print("batch: ", batch)
+            print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
             await asyncio.sleep(random.expovariate(self.rate_lambda))
             # 5% of the time, produce a task with feedback
             if random.random() < 0.05:

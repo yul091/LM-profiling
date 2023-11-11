@@ -22,6 +22,33 @@ class PipelineStage(nn.Module):
 
     def forward(self, x):
         return self.layers(x)
+    
+    
+def create_pipelines(ntokens, emsize, dropout, nlayers, nhead, nhid, partition_len, init_gpu_id=0):
+    tmp_list = [Encoder(ntokens, emsize, dropout)]
+    stages = []
+
+    # Add all the necessary transformer blocks.
+    for i in range(nlayers):
+        transformer_block = TransformerEncoderLayer(emsize, nhead, nhid, dropout)
+        if i != 0 and i % (partition_len) == 0:
+            # Create a new pipeline stage
+            stage_device = i // (partition_len) - 1 + init_gpu_id
+            print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device))
+            stages.append(PipelineStage(tmp_list, stage_device))
+            tmp_list = []
+            
+        tmp_list.append(transformer_block)
+
+    # Add decoder in the end.
+    tmp_list.append(Decoder(ntokens, emsize))
+    stages.append(PipelineStage(tmp_list, stage_device + 1))
+    print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device + 1))
+    print('Total parameters in model: {:,}'.format(get_total_params(nn.Sequential(*stages))))
+    
+    return stages
+
+
 
 async def main(args: argparse.Namespace):
     bptt = args.bptt
@@ -47,36 +74,13 @@ async def main(args: argparse.Namespace):
     nodes = [node1, node2]
     scheduler = GlobalScheduler(task_queue, nodes, task_complete_flag)
     
-    num_gpus = 4
+    num_gpus = len(nodes[0].devices) # we split pipelines into number of devices in each node
     partition_len = ((nlayers - 1) // num_gpus) + 1
     print("partition (block) size: {}".format(partition_len))
 
     # Add encoder in the beginning.
     ntokens = len(producer.vocab)
-    tmp_list = [Encoder(ntokens, emsize, dropout)]
-    stages = []
-
-    # Add all the necessary transformer blocks.
-    for i in range(nlayers):
-        transformer_block = TransformerEncoderLayer(emsize, nhead, nhid, dropout)
-        if i != 0 and i % (partition_len) == 0:
-            # Create a new pipeline stage
-            stage_device = i // (partition_len) - 1
-            print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device))
-            stages.append(PipelineStage(tmp_list, stage_device))
-            tmp_list = []
-            
-        tmp_list.append(transformer_block)
-        
-    # Dictionary to hold all timing information
-    timing_info = defaultdict(list)
-
-    # Add decoder in the end.
-    tmp_list.append(Decoder(ntokens, emsize))
-    stages.append(PipelineStage(tmp_list, stage_device + 1))
-    print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device + 1))
-    print ('Total parameters in model: {:,}'.format(get_total_params(nn.Sequential(*stages))))
-
+    
     # Start all components as asyncio tasks
     producer_task = asyncio.create_task(producer.produce())
     scheduler_task = asyncio.create_task(scheduler.schedule())
@@ -84,25 +88,35 @@ async def main(args: argparse.Namespace):
     
     consumer_tasks = []
     for node in nodes:
-        # for device in node.devices:
-        #     device_task = asyncio.create_task(device.process_tasks())
-        #     device_tasks.append(device_task)
         queues = [device.queue for device in node.devices] + [asyncio.Queue()]
-            
+        # Dictionary to hold all timing information
+        node_timing_info = defaultdict(list)
+        # Create pipelines for model parallel
+        stages = create_pipelines(
+            ntokens=ntokens,
+            emsize=emsize,
+            dropout=dropout,
+            nlayers=nlayers,
+            nhead=nhead,
+            nhid=nhid,
+            partition_len=partition_len,
+            init_gpu_id=node.devices[0].cuda_id,
+        )
+        
         # Start stage coroutines
         stages_coros = [node.coroutine_inference_stage(
             stages[i], 
             queues[i],  # input queue (of data) for stage i
             queues[i + 1],  # output queue (of data) for stage i+1
-            device=i, 
-            timing_info=timing_info,
-            next_device=i+1 if i < len(stages) - 1 else None,
+            cuda_id=i, 
+            timing_info=node_timing_info,
+            next_cuda_id=i+1 if i < len(stages) - 1 else None,
         ) for i in range(len(stages))]
         
         # Start the consumer coroutine
         consumer_coro = node.compute_loss(queues[-1], ntokens, len(producer.dataset))
         coros = stages_coros + [consumer_coro]
-        consumer_tasks.append(asyncio.gather(*coros))
+        consumer_tasks.extend(coros)
     
     # Run all tasks until complete
     await asyncio.gather(producer_task, scheduler_task, *consumer_tasks)
