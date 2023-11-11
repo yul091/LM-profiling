@@ -4,20 +4,14 @@ import numpy as np
 from itertools import cycle
 import argparse
 
-def plot(node: int = 0):
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--output_dir', type=str, default='prof')
-    parser.add_argument('--coroutine', action='store_true')
-    parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], default='random', help='workload setting')
-    args = parser.parse_args()
-    
+def plot(args, node: int = None):
     output_dir = args.output_dir
     coroutine = args.coroutine
     setting = args.setting
     
     # Load timing information
     execution = 'coroutine' if coroutine else 'sync'
-    stats_f = f'{output_dir}/timing_info_{execution}_{setting}_node{node}.json'
+    stats_f = f'{output_dir}/timing_info_{execution}_{setting}_node{node}.json' if node is not None else f'{output_dir}/timing_info_{execution}_{setting}.json'
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
 
@@ -75,12 +69,21 @@ def plot(node: int = 0):
     plt.show()
     
     # Save idle time statistics
-    idle_f = f'{output_dir}/idle_time_{execution}_{setting}_node{node}.json'
+    idle_f = f'{output_dir}/idle_time_{execution}_{setting}_node{node}.json' if node is not None else f'{output_dir}/idle_time_{execution}_{setting}.json'
     with open(idle_f, 'w') as f:
         json.dump(idle_dict, f)
 
 
 if __name__ == '__main__':
-    # plot()
-    for node in [0, 1]:
-        plot(node)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output_dir', type=str, default='prof')
+    parser.add_argument('--coroutine', action='store_true')
+    parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], default='random', help='workload setting')
+    parser.add_argument('--node', type=int, default=None, help='node id')
+    args = parser.parse_args()
+    
+    if not args.node:
+        plot(args)
+    else:
+        for node in range(args.node):
+            plot(args, node)

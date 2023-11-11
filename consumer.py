@@ -41,7 +41,7 @@ class DeviceQueue:
     #                 break  # Exit the loop if stop signal is set and queue is empty
     #     print(f"Stopped processing on CUDA device {self.cuda_id}")
 
-    async def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None):
+    def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None):
         print(f"Processing task on CUDA device {self.cuda_id} at time {time.time()}")
         # Inference
         #####################################################################################################################
@@ -107,7 +107,7 @@ class Node:
                 # if task is None:  # None is sent as a signal to shut down
                 #     await device_queue_out.put((None, None))
                 #     break
-                await self.devices[device_id].process_task(task, timing_info, stage, next_device_id)
+                self.devices[device_id].process_task(task, timing_info, stage, next_device_id)
                 await device_queue_out.put(task)
             except:
                 if self.devices[device_id].stop_signal.is_set() and device_queue_in.empty():

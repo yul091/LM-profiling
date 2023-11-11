@@ -16,7 +16,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from torch.nn import TransformerEncoderLayer, TransformerDecoderLayer
 from dataset import get_data, SentencePairDataset
@@ -51,6 +51,7 @@ def main():
     setting = args.setting
     profiling = args.profiling
     seed = args.seed
+    n_samples = args.n_samples
     
     train_data, val_data, test_data, vocab = get_data(setting=setting)
     
@@ -73,6 +74,8 @@ def main():
     #     return data.t(), target
     
     test_dataset = SentencePairDataset(test_data)
+    if n_samples > 0:
+        test_dataset = Subset(test_dataset, random.sample(range(len(test_dataset)), n_samples))
     ntokens = len(vocab) # the size of vocabulary
     test_loader = DataLoader(test_dataset, batch_size=bptt, collate_fn=collate_batch)
 
@@ -107,11 +110,7 @@ def main():
     # Dictionary to hold all timing information
     timing_info = defaultdict(list)
     
-    async def producer(queue: asyncio.Queue, data_source: DataLoader, bptt: int):
-        # Evaluate only for 50 batches to keep script execution time low.
-        # nbatches = min(50 * bptt, data_source.size(0) - 1)
-        # nbatches = data_source.size(0) - 1
-        # for i in tqdm(range(0, nbatches, bptt)):
+    async def producer(queue: asyncio.Queue, data_source: DataLoader):
         for i, (data, targets) in tqdm(enumerate(data_source), total=len(data_source)):
             # data, targets = get_batch(data_source, i)
             await queue.put((data.cuda(0), targets))
@@ -147,7 +146,7 @@ def main():
         queues = [asyncio.Queue() for _ in range(len(stages) + 1)]
         
         # Start the producer coroutine
-        producer_coro = producer(queues[0], data_source, bptt)
+        producer_coro = producer(queues[0], data_source)
 
         # Start stage coroutines
         stages_coros = [coroutine_evaluate_stage(
@@ -188,9 +187,6 @@ def main():
     def evaluate(stages: List[nn.Sequential], data_source: DataLoader):
         total_loss = 0.
         ntokens = len(vocab)
-        # Evaluate only for 50 batches to keep script execution time low.
-        # nbatches = min(50 * bptt, data_source.size(0) - 1)
-        # nbatches = data_source.size(0) - 1
         with torch.no_grad():
             # for i in tqdm(range(0, nbatches, bptt)):
             for i, (data, targets) in tqdm(enumerate(data_source), total=len(data_source)):
@@ -251,6 +247,11 @@ def main():
         # wandb.log({"test_loss": test_loss, "test_ppl": math.exp(test_loss)})
         
     # After all batches are processed, save the timing information to a file
+    # Remove the first start and end time for each GPU
+    for gpu_id in range(num_gpus):
+        timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start'][1:]
+        timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end'][1:]
+    
     os.makedirs(output_dir, exist_ok=True)
     stats_f = f'{output_dir}/timing_info_{execution}_{setting}.json'
     with open(stats_f, 'w') as f:
@@ -260,7 +261,7 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='PyTorch Wikitext-2 Transformer Language Model')
     parser.add_argument('--output_dir', type=str, default='prof', help='output directory')
-    parser.add_argument('--bptt', type=int, default=25, help='batch size')
+    parser.add_argument('--bptt', type=int, default=5, help='batch size')
     parser.add_argument('--emsize', type=int, default=4096, help='embedding dimension')
     parser.add_argument('--nhid', type=int, default=4096, help='the dimension of the feedforward network model in nn.TransformerEncoder')
     parser.add_argument('--nlayers', type=int, default=12, help='the number of nn.TransformerEncoderLayer in nn.TransformerEncoder')
@@ -270,6 +271,7 @@ if __name__ == "__main__":
     parser.add_argument('--coroutine', action='store_true', help='coroutine inference')
     parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], default='identical', help='workload setting')
     parser.add_argument('--seed', type=int, default=42, help='random seed')
+    parser.add_argument('--n_samples', type=int, default=-1, help='number of samples to profile')
 
     args = parser.parse_args()
     

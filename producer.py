@@ -64,6 +64,7 @@ class Producer:
             # print("batch: ", batch)
             print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
             await asyncio.sleep(random.expovariate(self.rate_lambda))
+            # await asyncio.sleep(0)
             # 5% of the time, produce a task with feedback
             if random.random() < 0.05:
                 task = Task(query=batch[0], timestamp=time.time(), feedback=batch[1])

@@ -133,7 +133,7 @@ if __name__ == "__main__":
     
     # Test the producer
     parser = argparse.ArgumentParser()
-    parser.add_argument('--rate_lambda', type=float, default=10, help='Average number of tasks produced per minute')
+    parser.add_argument('--rate_lambda', type=float, default=60, help='Average number of tasks produced per minute')
     parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], 
                         default='random', help='workload setting')
     parser.add_argument('--output_dir', type=str, default='prof', help='output directory')
@@ -156,6 +156,11 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
     execution = 'coroutine' if args.coroutine else 'sync'
     for idx, timing_info in enumerate(timing_infos):
+        gpus = list(set(int(key.split('_')[0]) for key in timing_info))
+        # Remove the first start and end time for each GPU
+        for gpu_id in gpus:
+            timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start'][1:]
+            timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end'][1:]
         stats_f = f'{args.output_dir}/timing_info_{execution}_{args.setting}_node{idx}.json'
         with open(stats_f, 'w') as f:
             json.dump(timing_info, f, indent=4)
