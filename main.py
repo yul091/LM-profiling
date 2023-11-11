@@ -140,6 +140,20 @@ class DistributedTransformerPipeline:
         
         # Run all tasks until complete
         await asyncio.gather(producer_task, scheduler_task, *consumer_tasks)
+        
+        
+    def save_profiling(self): # After all batches are processed, save the timing information to a file
+        os.makedirs(self.output_dir, exist_ok=True)
+        execution = 'coroutine' if self.coroutine else 'sync'
+        for idx, timing_info in enumerate(self.timing_infos):
+            gpus = list(set(int(key.split('_')[0]) for key in timing_info))
+            # Remove the first start and end time for each GPU
+            for gpu_id in gpus:
+                timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start'][1:]
+                timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end'][1:]
+            stats_f = f'{self.output_dir}/timing_info_{execution}_{self.setting}_node{idx}.json'
+            with open(stats_f, 'w') as f:
+                json.dump(timing_info, f, indent=4)
     
     
 if __name__ == "__main__":
@@ -162,20 +176,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_samples', type=int, default=-1, help='number of samples to profile')
     args = parser.parse_args()
     
-    
     dppl = DistributedTransformerPipeline(args)
-    
     asyncio.run(dppl.main())
+    dppl.save_profiling()
     
-    # After all batches are processed, save the timing information to a file
-    os.makedirs(args.output_dir, exist_ok=True)
-    execution = 'coroutine' if args.coroutine else 'sync'
-    for idx, timing_info in enumerate(dppl.timing_infos):
-        gpus = list(set(int(key.split('_')[0]) for key in timing_info))
-        # Remove the first start and end time for each GPU
-        for gpu_id in gpus:
-            timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start'][1:]
-            timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end'][1:]
-        stats_f = f'{args.output_dir}/timing_info_{execution}_{args.setting}_node{idx}.json'
-        with open(stats_f, 'w') as f:
-            json.dump(timing_info, f, indent=4)
