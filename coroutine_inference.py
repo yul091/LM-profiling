@@ -20,22 +20,12 @@ from torch.utils.data import DataLoader, Subset
 
 from torch.nn import TransformerEncoderLayer, TransformerDecoderLayer
 from dataset import get_data, SentencePairDataset
-from models import Encoder, Decoder
+from models import Encoder, Decoder, PipelineStage
 from utils import record_time, get_total_params
 
 if torch.cuda.device_count() < 2:
     print('Need at least two GPU devices for this tutorial')
     sys.exit(0)
-
-
-class PipelineStage(nn.Module):
-    def __init__(self, layers, device):
-        super(PipelineStage, self).__init__()
-        self.layers = nn.Sequential(*layers).to(device)
-        self.device = device
-
-    def forward(self, x):
-        return self.layers(x)
 
 
 def main():

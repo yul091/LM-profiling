@@ -57,3 +57,13 @@ class Decoder(nn.Module):
     def forward(self, inp):
         # Need batch dimension first for output of pipeline.
         return self.decoder(inp).permute(1, 0, 2)
+    
+    
+class PipelineStage(nn.Module):
+    def __init__(self, layers, device):
+        super(PipelineStage, self).__init__()
+        self.layers = nn.Sequential(*layers).cuda(device)
+        self.device = device
+
+    def forward(self, x):
+        return self.layers(x)
