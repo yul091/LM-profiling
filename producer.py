@@ -7,7 +7,7 @@ import argparse
 from tqdm import tqdm
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from dataset import get_data, SentencePairDataset
 
 
@@ -49,6 +49,10 @@ class Producer:
         
         # dataset = SentencePairDataset(train_data)
         self.dataset = SentencePairDataset(test_data)
+        # Sample
+        if args.n_samples > 0:
+            self.dataset = Subset(self.dataset, random.sample(range(len(self.dataset)), args.n_samples))
+        
         self.dataloader = DataLoader(self.dataset, batch_size=args.bptt, collate_fn=collate_batch)
         
         self.task_complete_flag = task_complete_flag
@@ -76,7 +80,7 @@ if __name__ == "__main__":
     
     # Test the producer
     parser = argparse.ArgumentParser()
-    parser.add_argument('--rate_lambda', type=float, default=100, help='Average number of tasks produced per minute')
+    parser.add_argument('--rate_lambda', type=float, default=60, help='Average number of tasks produced per minute')
     parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], 
                         default='random', help='workload setting')
     parser.add_argument('--bptt', type=int, default=5, help='batch size')

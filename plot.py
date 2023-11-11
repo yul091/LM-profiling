@@ -4,11 +4,11 @@ import numpy as np
 from itertools import cycle
 import argparse
 
-def plot():
+def plot(node: int = 0):
     parser = argparse.ArgumentParser()
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--coroutine', action='store_true')
-    parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], default='identical', help='workload setting')
+    parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], default='random', help='workload setting')
     args = parser.parse_args()
     
     output_dir = args.output_dir
@@ -17,7 +17,7 @@ def plot():
     
     # Load timing information
     execution = 'coroutine' if coroutine else 'sync'
-    stats_f = f'{output_dir}/timing_info_{execution}_{setting}.json'
+    stats_f = f'{output_dir}/timing_info_{execution}_{setting}_node{node}.json'
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
 
@@ -26,17 +26,18 @@ def plot():
     timing_info = {k: [t - min_time for t in v] for k, v in timing_info.items()}
 
     # Extract the number of GPUs based on the keys
-    num_gpus = max(int(key.split('_')[0]) for key in timing_info) + 1  # GPUs are 0-indexed
-
+    gpus = list(set(int(key.split('_')[0]) for key in timing_info))  # GPUs are 0-indexed
+    init_gpu, last_gpu = min(gpus), max(gpus)
+    num_gpus = len(gpus)
     # Create a figure and axis to plot on
     fig, ax = plt.subplots(figsize=(20, num_gpus))
 
     colors = cycle('bgrcmk')  # Cycle through a list of colors for the plot
     idle_dict = {}
     # Plot the timings for each GPU
-    for gpu_id in range(num_gpus):
-        start_times = timing_info.get(f"{gpu_id}_start", [])
-        end_times = timing_info.get(f"{gpu_id}_end", [])
+    for gpu_id in range(len(gpus)):
+        start_times = timing_info.get(f"{gpu_id+init_gpu}_start", [])
+        end_times = timing_info.get(f"{gpu_id+init_gpu}_end", [])
         idles = [start - end for start, end in zip(start_times[1:], end_times[:-1])]
         idle_dict[f'{gpu_id}'] = idles
         # idle_dict[f'{gpu_id}_stats'] = {
@@ -55,8 +56,8 @@ def plot():
     ax.set_xlabel('Time (s)')
     ax.set_ylabel('GPU')
     ax.set_title('Task Inference Profiling')
-    ax.set_yticks(range(1, num_gpus + 1))
-    ax.set_yticklabels([f'GPU {i}' for i in range(num_gpus)])
+    ax.set_yticks(range(1, len(gpus) + 1))
+    ax.set_yticklabels([f'GPU {i}' for i in range(len(gpus))])
     ax.grid(True)
 
     # Reverse the y-axis so that GPU 0 is at the top
@@ -74,10 +75,12 @@ def plot():
     plt.show()
     
     # Save idle time statistics
-    idle_f = f'{output_dir}/idle_time_{execution}_{setting}.json'
+    idle_f = f'{output_dir}/idle_time_{execution}_{setting}_node{node}.json'
     with open(idle_f, 'w') as f:
         json.dump(idle_dict, f)
 
 
 if __name__ == '__main__':
-    plot()
+    # plot()
+    for node in [0, 1]:
+        plot(node)

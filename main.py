@@ -1,5 +1,8 @@
+import os
 import sys
 sys.dont_write_bytecode = True
+import json
+import random
 import argparse
 import asyncio
 from typing import List
@@ -50,8 +53,7 @@ def create_pipelines(ntokens, emsize, dropout, nlayers, nhead, nhid, partition_l
 
 
 
-async def main(args: argparse.Namespace):
-    bptt = args.bptt
+async def main(args: argparse.Namespace, timing_infos: list):
     emsize = args.emsize
     nhid = args.nhid
     nlayers = args.nlayers
@@ -62,6 +64,10 @@ async def main(args: argparse.Namespace):
     setting = args.setting
     profiling = args.profiling
     seed = args.seed
+    
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     
     task_queue = asyncio.Queue()
     task_complete_flag = asyncio.Event()
@@ -87,10 +93,10 @@ async def main(args: argparse.Namespace):
     # device_tasks = [asyncio.create_task(device.process_tasks()) for node in nodes for device in node.devices]
     
     consumer_tasks = []
-    for node in nodes:
+    for idx, node in enumerate(nodes):
+        timing_infos.append(defaultdict(list))
         queues = [device.queue for device in node.devices] + [asyncio.Queue()]
         # Dictionary to hold all timing information
-        node_timing_info = defaultdict(list)
         # Create pipelines for model parallel
         init_cuda_id = node.devices[0].cuda_id # the first cuda id of the node
         stages = create_pipelines(
@@ -110,7 +116,7 @@ async def main(args: argparse.Namespace):
             queues[i],  # input queue (of data) for stage i
             queues[i + 1],  # output queue (of data) for stage i+1
             device_id=i, 
-            timing_info=node_timing_info,
+            timing_info=timing_infos[idx],
             next_device_id=i+1 if i < len(stages) - 1 else None,
         ) for i in range(len(stages))]
         
@@ -127,19 +133,29 @@ if __name__ == "__main__":
     
     # Test the producer
     parser = argparse.ArgumentParser()
-    parser.add_argument('--rate_lambda', type=float, default=100, help='Average number of tasks produced per minute')
+    parser.add_argument('--rate_lambda', type=float, default=10, help='Average number of tasks produced per minute')
     parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], 
                         default='random', help='workload setting')
     parser.add_argument('--output_dir', type=str, default='prof', help='output directory')
     parser.add_argument('--bptt', type=int, default=5, help='batch size')
     parser.add_argument('--emsize', type=int, default=4096, help='embedding dimension')
     parser.add_argument('--nhid', type=int, default=4096, help='the dimension of the feedforward network model in nn.TransformerEncoder')
-    parser.add_argument('--nlayers', type=int, default=12, help='the number of nn.TransformerEncoderLayer in nn.TransformerEncoder')
+    parser.add_argument('--nlayers', type=int, default=6, help='the number of nn.TransformerEncoderLayer in nn.TransformerEncoder')
     parser.add_argument('--nhead', type=int, default=16, help='the number of heads in the multiheadattention models')
     parser.add_argument('--dropout', type=float, default=0.2, help='the dropout value')
     parser.add_argument('--profiling', action='store_true', help='enable profiling')
     parser.add_argument('--coroutine', action='store_true', help='coroutine inference')
     parser.add_argument('--seed', type=int, default=42, help='random seed')
+    parser.add_argument('--n_samples', type=int, default=-1, help='number of samples to profile')
     args = parser.parse_args()
     
-    asyncio.run(main(args))
+    timing_infos = []
+    asyncio.run(main(args, timing_infos))
+    
+    # After all batches are processed, save the timing information to a file
+    os.makedirs(args.output_dir, exist_ok=True)
+    execution = 'coroutine' if args.coroutine else 'sync'
+    for idx, timing_info in enumerate(timing_infos):
+        stats_f = f'{args.output_dir}/timing_info_{execution}_{args.setting}_node{idx}.json'
+        with open(stats_f, 'w') as f:
+            json.dump(timing_info, f, indent=4)

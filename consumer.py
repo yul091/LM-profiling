@@ -41,10 +41,10 @@ class DeviceQueue:
     #                 break  # Exit the loop if stop signal is set and queue is empty
     #     print(f"Stopped processing on CUDA device {self.cuda_id}")
 
-    def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None):
+    async def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None):
         print(f"Processing task on CUDA device {self.cuda_id} at time {time.time()}")
         # Inference
-        ############################################################
+        #####################################################################################################################
         with torch.no_grad():
             # Record the start time of the stage on this GPU
             record_time(self.cuda_id, 'start', timing_info)
@@ -57,7 +57,7 @@ class DeviceQueue:
                 output = output.cuda(next_cuda_id)  # Move output to the next stage's device
             task.query = output
             print(f"task query shape: {task.query.shape}")
-        ############################################################
+        #####################################################################################################################
         task.processed = True
         
         
@@ -102,13 +102,16 @@ class Node:
         next_device_id: int = None,
     ):
         while True:
-            task: Task = await device_queue_in.get()
-            if task is None:  # None is sent as a signal to shut down
-                await device_queue_out.put((None, None))
-                break
-            
-            self.devices[device_id].process_task(task, timing_info, stage, next_device_id)
-            await device_queue_out.put(task)
+            try:
+                task: Task = await asyncio.wait_for(device_queue_in.get(), timeout=1)
+                # if task is None:  # None is sent as a signal to shut down
+                #     await device_queue_out.put((None, None))
+                #     break
+                await self.devices[device_id].process_task(task, timing_info, stage, next_device_id)
+                await device_queue_out.put(task)
+            except:
+                if self.devices[device_id].stop_signal.is_set() and device_queue_in.empty():
+                    break
             
     # async def coroutine_evaluate_stages(
     #     self,
