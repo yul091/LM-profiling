@@ -20,7 +20,7 @@ class DeviceQueue:
         self.stop_signal = asyncio.Event()
 
     async def add_task(self, task: Task):
-        await self.queue.put(task.query.cuda(self.cuda_id))
+        await self.queue.put(task)
         
     # async def process_tasks(self, stage: nn.Module, next_cuda_id: int = None):
     #     # while not self.stop_signal.is_set():
@@ -43,11 +43,14 @@ class DeviceQueue:
 
     def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None):
         print(f"Processing task on CUDA device {self.cuda_id} at time {time.time()}")
-        # Inference / training
+        # Inference
         ############################################################
         with torch.no_grad():
             # Record the start time of the stage on this GPU
             record_time(self.cuda_id, 'start', timing_info)
+            # print("self cuda id: ", self.cuda_id, "stage device: ", stage.device, "task query device: ", task.query.device)
+            # First put query into cuda device
+            task.query = task.query.cuda(self.cuda_id)
             output = stage(task.query)
             record_time(self.cuda_id, 'end', timing_info)
             if next_cuda_id:
@@ -94,9 +97,9 @@ class Node:
         stage: nn.Module, 
         device_queue_in: asyncio.Queue, 
         device_queue_out: asyncio.Queue, 
-        cuda_id: int, 
+        device_id: int, 
         timing_info: dict,
-        next_cuda_id: int = None,
+        next_device_id: int = None,
     ):
         while True:
             task: Task = await device_queue_in.get()
@@ -104,7 +107,7 @@ class Node:
                 await device_queue_out.put((None, None))
                 break
             
-            self.devices[cuda_id].process_task(task, timing_info, stage, next_cuda_id)
+            self.devices[device_id].process_task(task, timing_info, stage, next_device_id)
             await device_queue_out.put(task)
             
     # async def coroutine_evaluate_stages(

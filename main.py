@@ -17,7 +17,7 @@ from consumer import Node
 class PipelineStage(nn.Module):
     def __init__(self, layers, device):
         super(PipelineStage, self).__init__()
-        self.layers = nn.Sequential(*layers).to(device)
+        self.layers = nn.Sequential(*layers).cuda(device)
         self.device = device
 
     def forward(self, x):
@@ -92,6 +92,7 @@ async def main(args: argparse.Namespace):
         # Dictionary to hold all timing information
         node_timing_info = defaultdict(list)
         # Create pipelines for model parallel
+        init_cuda_id = node.devices[0].cuda_id # the first cuda id of the node
         stages = create_pipelines(
             ntokens=ntokens,
             emsize=emsize,
@@ -100,7 +101,7 @@ async def main(args: argparse.Namespace):
             nhead=nhead,
             nhid=nhid,
             partition_len=partition_len,
-            init_gpu_id=node.devices[0].cuda_id,
+            init_gpu_id=init_cuda_id, 
         )
         
         # Start stage coroutines
@@ -108,9 +109,9 @@ async def main(args: argparse.Namespace):
             stages[i], 
             queues[i],  # input queue (of data) for stage i
             queues[i + 1],  # output queue (of data) for stage i+1
-            cuda_id=i, 
+            device_id=i, 
             timing_info=node_timing_info,
-            next_cuda_id=i+1 if i < len(stages) - 1 else None,
+            next_device_id=i+1 if i < len(stages) - 1 else None,
         ) for i in range(len(stages))]
         
         # Start the consumer coroutine
