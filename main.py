@@ -2,27 +2,109 @@ import os
 import sys
 sys.dont_write_bytecode = True
 import json
+import time
+import math
 import random
 import argparse
 import asyncio
+from tqdm import tqdm
 from typing import List
 from collections import defaultdict
+
 import torch 
 import torch.nn as nn
+from torch import Tensor
+from torch.utils.data import DataLoader, Subset
+from torch.nn.utils.rnn import pad_sequence
 from torch.nn import TransformerEncoderLayer
 
-from utils import get_total_params
+from utils import get_total_params, record_time
+from dataset import get_data, SentencePairDataset
 from models import Encoder, Decoder, PipelineStage
-from producer import Producer
-from scheduler import GlobalScheduler
-from consumer import Node
+
+
+class Task:
+    """
+    This class encapsulates a task to be processed by the system.
+    query (str): the query batch to be processed
+    timestamp (float): the time at which the task was generated
+    feedback (str): the feedback for the query (optional) from the user
+    """
+    def __init__(self, query: Tensor, timestamp: float, feedback: Tensor = None):
+        self.query = query
+        self.timestamp = timestamp
+        self.feedback = feedback
+        self.processed = False
+        
+
+class DeviceQueue:
+    def __init__(self, cuda_id: int):
+        self.queue = asyncio.Queue()
+        self.cuda_id = cuda_id
+        self.stop_signal = asyncio.Event()
+
+    async def add_task(self, task: Task):
+        await self.queue.put(task)
+
+    async def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None):
+        # Inference
+        #####################################################################################################################
+        with torch.no_grad():
+            # Record the start time of the stage on this GPU
+            record_time(self.cuda_id, 'start', timing_info, verbose=True)
+            # First put query into cuda device
+            task.query = task.query.cuda(self.cuda_id)
+            output = stage(task.query)
+            record_time(self.cuda_id, 'end', timing_info, verbose=True)
+            if next_cuda_id:
+                output = output.cuda(next_cuda_id)  # Move output to the next stage's device
+            task.query = output
+        #####################################################################################################################
+        task.processed = True
+        
+        
+
+class Node:
+    """
+    Suppose each node (server) has 2 GPUs, each having a queue.
+    """
+    def __init__(self, id: int, cuda_devices: List[int], criterion: nn.CrossEntropyLoss):
+        self.id = id
+        self.devices = [DeviceQueue(cuda_id) for cuda_id in cuda_devices]
+        self.criterion = criterion
+        
+    async def add_task(self, task):
+        # device = self.schedule_device()
+        await self.devices[0].add_task(task) # always add input data on the first device
+        
+    async def coroutine_inference_stage(
+        self,
+        stage: nn.Module, 
+        device_queue_in: asyncio.Queue, 
+        device_queue_out: asyncio.Queue, 
+        device_id: int, 
+        timing_info: dict,
+        next_device_id: int = None,
+    ):
+        while True:
+            # try:
+            task: Task = await asyncio.wait_for(device_queue_in.get(), timeout=1)
+            # task: Task = await device_queue_in.get()
+            print(f"[CUDA {device_id}] Task received at time {time.time()}")  # Log when task is received
+            if task is None:  # None is sent as a signal to shut down
+                await device_queue_out.put(None)
+                break
+            await self.devices[device_id].process_task(task, timing_info, stage, next_device_id)
+            await device_queue_out.put(task)
+            # except:
+            #     if self.devices[device_id].stop_signal.is_set() and device_queue_in.empty():
+            #         break
 
 
 class DistributedTransformerPipeline:
     
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        
         emsize = args.emsize
         nhid = args.nhid
         nlayers = args.nlayers
@@ -33,37 +115,57 @@ class DistributedTransformerPipeline:
         self.setting = args.setting
         self.profiling = args.profiling
         seed = args.seed
+        bptt = args.bptt
+        n_samples = args.n_samples
         
+        # Reproducibility
         random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         
         # Initialize async components
         self.task_queue = asyncio.Queue()
-        self.task_complete_flag = asyncio.Event()
-        
-        self.vocab = self.producer.vocab
+        train_data, val_data, test_data, self.vocab = get_data(setting=args.setting)
         self.ntokens = len(self.vocab)
-        
         self.criterion = nn.CrossEntropyLoss(ignore_index=self.vocab['<pad>'])
         node1 = Node(id=1, cuda_devices=[0, 1], criterion=self.criterion)
         node2 = Node(id=2, cuda_devices=[2, 3], criterion=self.criterion)
         self.nodes = [node1, node2]
         
-        self.producer = Producer(self.task_queue, args, self.task_complete_flag)
-        self.scheduler = GlobalScheduler(
-            self.task_queue, 
-            self.nodes, 
-            self.task_complete_flag,
-        )
+        # Create producer
+        def collate_batch(batch):
+            # 'batch' is a list of tuples with (sequence, target)
+            batch_data, batch_target = zip(*batch)
+            combined_list = batch_data + batch_target
+            # Dynamically pad the batch
+            padded = pad_sequence(
+                combined_list, 
+                batch_first=True, 
+                padding_value=self.vocab['<pad>'],
+            )
+            padded_data = padded[:len(batch_data)]
+            padded_target = padded[len(batch_data):]
+            return padded_data, padded_target.view(-1)
         
+        self.dataset = SentencePairDataset(test_data)
+        if n_samples > 0:
+            self.dataset = Subset(
+                self.dataset, 
+                random.sample(range(len(self.dataset)), n_samples),
+            )
+        self.dataloader = DataLoader(
+            self.dataset, 
+            batch_size=bptt, 
+            collate_fn=collate_batch,
+        )
+
         # Create pipelines for model parallel
         self.timing_infos = []
         self.distributed_stages = []
-        self.num_gpus = len(self.nodes[0].devices) # we split pipelines into number of devices in each node
+        self.num_gpus = len(self.nodes[0].devices) 
         self.partition_len = ((nlayers - 1) // self.num_gpus) + 1
         print("partition (block) size: {}".format(self.partition_len))
-        self.model_kwargs = {
+        model_kwargs = {
             'ntokens': self.ntokens,
             'emsize': emsize,
             'dropout': dropout,
@@ -75,17 +177,25 @@ class DistributedTransformerPipeline:
         for idx, node in enumerate(self.nodes):
             init_cuda_id = node.devices[0].cuda_id # the first cuda id of the node
             stages = self.create_pipelines(
-                **self.model_kwargs,
+                **model_kwargs,
                 init_gpu_id=init_cuda_id, 
             )
             self.distributed_stages.append(stages)
         
-        
     
-    def create_pipelines(self, ntokens, emsize, dropout, nlayers, nhead, nhid, partition_len, init_gpu_id=0):
+    def create_pipelines(
+        self, 
+        ntokens: int, 
+        emsize: int, 
+        dropout: float, 
+        nlayers: int, 
+        nhead: int, 
+        nhid: int, 
+        partition_len: int, 
+        init_gpu_id: int = 0,
+    ):
         tmp_list = [Encoder(ntokens, emsize, dropout)]
         stages = []
-
         # Add all the necessary transformer blocks.
         for i in range(nlayers):
             transformer_block = TransformerEncoderLayer(emsize, nhead, nhid, dropout)
@@ -97,7 +207,6 @@ class DistributedTransformerPipeline:
                 tmp_list = []
                 
             tmp_list.append(transformer_block)
-
         # Add decoder in the end.
         tmp_list.append(Decoder(ntokens, emsize))
         stages.append(PipelineStage(tmp_list, stage_device + 1))
@@ -105,15 +214,56 @@ class DistributedTransformerPipeline:
         print('Total parameters in model: {:,}'.format(get_total_params(nn.Sequential(*stages))))
         return stages
     
+    
+    async def produce(self):
+        # Produce using the dataset
+        for i, batch in tqdm(enumerate(self.dataloader), total=len(self.dataloader)):
+            # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
+            # 5% of the time, produce a task with feedback
+            if random.random() < 0.05:
+                task = Task(query=batch[0], timestamp=time.time(), feedback=batch[1])
+            else:
+                task = Task(query=batch[0], timestamp=time.time())
+            await self.task_queue.put(task)
+            # await asyncio.sleep(random.expovariate(self.rate_lambda))
+            await asyncio.sleep(0)
+        await self.task_queue.put(None)  # Signal the end of the dataset
+        print("Producer finished producing tasks")
+    
+    
+    async def schedule(self):
+        while True:
+            task = await self.task_queue.get()
+            if task is None:
+                print("Scheduler finished scheduling tasks")
+                # Signal nodes to stop processing
+                for node in self.nodes:
+                    for device in node.devices:
+                        device.stop_signal.set()
+                break
+            node = random.choice(self.nodes)
+            await node.add_task(task)
+            # print(f"Task scheduled to node {node.id} at time {time.time()}")
+            # print(f"Task queue size: {self.task_queue.qsize()}")
+            
+            
+    async def compute_loss(self, queue: asyncio.Queue):
+        total_loss = 0.
+        while True:
+            task: Task = await queue.get() # (B X T X C) and (B*T)
+            if task is None:
+                break
+            if task.feedback is None:
+                continue
+            print(f"query shape: {task.query.shape}, target shape: {task.feedback.shape}")
+            output_flat = task.query.contiguous().view(-1, self.ntokens) # (B*T) X C
+            total_loss += task.query.size(0) * self.criterion(output_flat, task.feedback.to(task.query.device)).item() 
+        return total_loss / len(self.dataset)
+    
 
     async def main(self):
         
-        # Start all components as asyncio tasks
-        producer_task = asyncio.create_task(self.producer.produce())
-        scheduler_task = asyncio.create_task(self.scheduler.schedule())
-        # device_tasks = [asyncio.create_task(device.process_tasks()) for node in nodes for device in node.devices]
-        
-        consumer_tasks = []
+        execution_coros = []
         for idx, node in enumerate(self.nodes):
             stages = self.distributed_stages[idx]
             self.timing_infos.append(defaultdict(list))
@@ -127,19 +277,37 @@ class DistributedTransformerPipeline:
                 timing_info=self.timing_infos[idx],
                 next_device_id=i+1 if i < len(stages) - 1 else None,
             ) for i in range(len(stages))]
+            execution_coros.extend(stages_coros)
             
             # Start the consumer coroutine
-            consumer_coro = node.compute_loss(
-                queues[-1], 
-                self.ntokens, 
-                len(self.producer.dataset),
-            )
-            coros = stages_coros + [consumer_coro]
-            tasks = [asyncio.create_task(coro) for coro in coros]
-            consumer_tasks.extend(tasks)
+            consumer_coro = self.compute_loss(queues[-1])
+            execution_coros.append(consumer_coro)
         
         # Run all tasks until complete
-        await asyncio.gather(producer_task, scheduler_task, *consumer_tasks)
+        producer_coro = self.produce()
+        scheduler_coro = self.schedule()
+        coros = [producer_coro] + [scheduler_coro] + execution_coros
+        tasks = [asyncio.create_task(coro) for coro in coros]
+        completed, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        
+        # # Handle exceptions if any
+        # for task in completed:
+        #     if task.exception():
+        #         print("Exception:", task.exception())
+        #         # Cancel pending tasks
+        #         for task in pending:
+        #             task.cancel()
+        #         # Rethrow the exception
+        #         raise task.exception()
+            
+        # Instead of awaiting the consumer coroutine again, get the result from the Task object
+        consumer_task = tasks[-1]  # This assumes that the consumer task is the last in the list
+        if consumer_task.done():
+            loss = consumer_task.result()
+        else:
+            loss = None  # or handle accordingly
+        if loss is not None:
+            print(f"Test Loss: {loss}, perplexity: {math.exp(loss)}")
         
         
     def save_profiling(self): # After all batches are processed, save the timing information to a file

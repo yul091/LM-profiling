@@ -30,7 +30,6 @@ class Producer:
         self, 
         task_queue: asyncio.Queue, 
         args: argparse.Namespace,
-        task_complete_flag: asyncio.Event,
     ):
         self.task_queue = task_queue
         self.rate_lambda = args.rate_lambda
@@ -52,10 +51,8 @@ class Producer:
         # Sample
         if args.n_samples > 0:
             self.dataset = Subset(self.dataset, random.sample(range(len(self.dataset)), args.n_samples))
-        
         self.dataloader = DataLoader(self.dataset, batch_size=args.bptt, collate_fn=collate_batch)
-        
-        self.task_complete_flag = task_complete_flag
+
         
     async def produce(self):
         # Produce using the dataset
@@ -63,16 +60,17 @@ class Producer:
         for i, batch in tqdm(enumerate(self.dataloader), total=len(self.dataloader)):
             # print("batch: ", batch)
             print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
-            # await asyncio.sleep(random.expovariate(self.rate_lambda))
-            await asyncio.sleep(0)
             # 5% of the time, produce a task with feedback
             if random.random() < 0.05:
                 task = Task(query=batch[0], timestamp=time.time(), feedback=batch[1])
             else:
                 task = Task(query=batch[0], timestamp=time.time())
             await self.task_queue.put(task)
+            # await asyncio.sleep(random.expovariate(self.rate_lambda))
+            await asyncio.sleep(0)
             # print(f"Produced a task {task} at time {task.timestamp}")
-        self.task_complete_flag.set()
+        # self.task_complete_flag.set()
+        await self.task_queue.put(None)  # Signal the end of the dataset
         print("Producer finished producing tasks")
             
 

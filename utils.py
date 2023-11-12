@@ -37,9 +37,12 @@ SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
 
-def record_time(device: int, event_type: str, timing_info: Dict[str, List[float]]):
+def record_time(device: int, event_type: str, timing_info: Dict[str, List[float]], verbose: bool = False):
     # event_type can be 'start' or 'end'
-    timing_info[f"{device}_{event_type}"].append(time.time())
+    timestamp = time.time()
+    timing_info[f"{device}_{event_type}"].append(timestamp)
+    if verbose:
+        print(f"[CUDA {device}] Task {event_type} at time {timestamp}")
     
 
 def get_total_params(module: torch.nn.Module):
