@@ -42,7 +42,7 @@ def record_time(device: int, event_type: str, timing_info: Dict[str, List[float]
     timestamp = time.time()
     timing_info[f"{device}_{event_type}"].append(timestamp)
     if verbose:
-        print(f"[CUDA {device}] Task {event_type} at time {timestamp}")
+        print(f"\t[CUDA {device}] Task {event_type} at time {timestamp}")
     
 
 def get_total_params(module: torch.nn.Module):

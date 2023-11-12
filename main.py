@@ -44,19 +44,19 @@ class DeviceQueue:
         self.stop_signal = asyncio.Event()
 
     async def add_task(self, task: Task):
+        task.query = task.query.cuda(self.cuda_id) # put query on the device
         await self.queue.put(task)
 
-    async def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None):
+    def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None):
         # Inference
         #####################################################################################################################
         with torch.no_grad():
             # Record the start time of the stage on this GPU
+            # print("[CUDA {}] stage @ {}, task @ {}".format(self.cuda_id, stage.device, task.query.device))
             record_time(self.cuda_id, 'start', timing_info, verbose=True)
-            # First put query into cuda device
-            task.query = task.query.cuda(self.cuda_id)
             output = stage(task.query)
             record_time(self.cuda_id, 'end', timing_info, verbose=True)
-            if next_cuda_id:
+            if next_cuda_id is not None:
                 output = output.cuda(next_cuda_id)  # Move output to the next stage's device
             task.query = output
         #####################################################################################################################
@@ -74,7 +74,6 @@ class Node:
         self.criterion = criterion
         
     async def add_task(self, task):
-        # device = self.schedule_device()
         await self.devices[0].add_task(task) # always add input data on the first device
         
     async def coroutine_inference_stage(
@@ -87,18 +86,19 @@ class Node:
         next_device_id: int = None,
     ):
         while True:
-            # try:
             task: Task = await asyncio.wait_for(device_queue_in.get(), timeout=1)
             # task: Task = await device_queue_in.get()
-            print(f"[CUDA {device_id}] Task received at time {time.time()}")  # Log when task is received
+            print(f"[Device {device_id} CUDA {self.devices[device_id].cuda_id}] Task received at time {time.time()}")  # Debug
             if task is None:  # None is sent as a signal to shut down
                 await device_queue_out.put(None)
                 break
-            await self.devices[device_id].process_task(task, timing_info, stage, next_device_id)
+            self.devices[device_id].process_task(
+                task=task, 
+                timing_info=timing_info, 
+                stage=stage, 
+                next_cuda_id=self.devices[next_device_id].cuda_id if next_device_id is not None else None,
+            )
             await device_queue_out.put(task)
-            # except:
-            #     if self.devices[device_id].stop_signal.is_set() and device_queue_in.empty():
-            #         break
 
 
 class DistributedTransformerPipeline:
@@ -243,7 +243,7 @@ class DistributedTransformerPipeline:
                 break
             node = random.choice(self.nodes)
             await node.add_task(task)
-            # print(f"Task scheduled to node {node.id} at time {time.time()}")
+            print(f"Task scheduled to node {node.id} at time {time.time()}")
             # print(f"Task queue size: {self.task_queue.qsize()}")
             
             
@@ -314,8 +314,8 @@ class DistributedTransformerPipeline:
         os.makedirs(self.output_dir, exist_ok=True)
         execution = 'coroutine' if self.coroutine else 'sync'
         for idx, timing_info in enumerate(self.timing_infos):
-            gpus = list(set(int(key.split('_')[0]) for key in timing_info))
             # Remove the first start and end time for each GPU
+            gpus = list(set(int(key.split('_')[0]) for key in timing_info))
             for gpu_id in gpus:
                 timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start'][1:]
                 timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end'][1:]

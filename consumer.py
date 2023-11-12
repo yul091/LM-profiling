@@ -60,8 +60,8 @@ class Node:
     ):
         while True:
             # try:
-            task: Task = await asyncio.wait_for(device_queue_in.get(), timeout=1)
-            # task: Task = await device_queue_in.get()
+            # task: Task = await asyncio.wait_for(device_queue_in.get(), timeout=1)
+            task: Task = await device_queue_in.get()
             if task is None:  # None is sent as a signal to shut down
                 await device_queue_out.put(None)
                 break
