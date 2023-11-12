@@ -286,22 +286,25 @@ class DistributedTransformerPipeline:
         total_loss = 0.
         while True:
             if self.get_node_stopping_criterion(node):
+                print(f"[node {node.id}] total loss: {total_loss/len(self.dataset)}, perplexity: {math.exp(total_loss/len(self.dataset))}")
                 break
             task: Task = await queue.get() # (B X T X C) and (B*T)
             if task is None:
+                print(f"[node {node.id}] total loss: {total_loss/len(self.dataset)}, perplexity: {math.exp(total_loss/len(self.dataset))}")
                 break
             if task.feedback is None:
                 continue
             output_flat = task.query.contiguous().view(-1, self.ntokens) # (B*T) X C
             batch_loss = self.criterion(output_flat, task.feedback.to(task.query.device))
             total_loss += task.query.size(0) * batch_loss.item() 
-            print(f"query shape: {task.query.shape}, target shape: {task.feedback.shape}, total loss: {total_loss}")
+            # print(f"query shape: {task.query.shape}, target shape: {task.feedback.shape}, total loss: {total_loss}")
             # Backpropagate the loss
             batch_loss.backward()
             # torch.nn.utils.clip_grad_norm_(nn.Sequential(*stages).parameters(), 0.5)
             optimizer.step()
-            
-        return total_loss / len(self.dataset)
+        
+        print(f"[node {node.id}] total loss: {total_loss/len(self.dataset)}, perplexity: {math.exp(total_loss/len(self.dataset))}")
+        # return total_loss / len(self.dataset)
     
 
     async def main(self):
@@ -352,13 +355,15 @@ class DistributedTransformerPipeline:
                 raise task.exception()
             
         # Instead of awaiting the consumer coroutine again, get the result from the Task object
-        consumer_task = tasks[-1]  # This assumes that the consumer task is the last in the list
-        if consumer_task.done():
-            loss = consumer_task.result()
-        else:
-            loss = None  # or handle accordingly
-        if loss is not None:
-            print(f"Test Loss: {loss}, perplexity: {math.exp(loss)}")
+        # consumer_task = tasks[-1]  # This assumes that the consumer task is the last in the list
+        # for idx, consumer_task in enumerate([tasks[-3], tasks[-1]]):
+        #     if consumer_task.done():
+        #         loss = consumer_task.result()
+        #     else:
+        #         loss = None  # or handle accordingly
+        #     if loss is not None:
+        #         # print(f"Test Loss: {loss}, perplexity: {math.exp(loss)}")
+        #         print(f"[node {self.nodes[idx].id}] Test Loss: {loss}, perplexity: {math.exp(loss)}")
         
         
     def save_profiling(self): # After all batches are processed, save the timing information to a file
