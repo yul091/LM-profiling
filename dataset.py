@@ -18,7 +18,7 @@ def batchify(
     bsz: int, 
     setting: str, 
     min_len: int = 10, 
-    max_len: int = 128,
+    max_len: int = 256,
 ):
     # # Divide the dataset into ``bsz`` parts.
     # nbatch = data.size(0) // bsz
