@@ -296,12 +296,8 @@ class DistributedTransformerPipeline:
     ):
         total_loss = 0.
         while self.task_completed < self.total_tasks:
-            print(f"{self.task_completed}/{self.total_tasks} tasks completed !!!")
+            # print(f"{self.task_completed}/{self.total_tasks} tasks completed !!!")
             task: Task = await queue.get() # (B X T X C) and (B*T)
-            # try:
-            #     task: Task = await asyncio.wait_for(queue.get(), timeout=10)
-            # except asyncio.TimeoutError:
-            #     continue
             if task is None:
                 break
             if task.feedback is None:
@@ -309,7 +305,8 @@ class DistributedTransformerPipeline:
                 continue
             output_flat = task.query.contiguous().view(-1, self.ntokens) # (B*T) X C
             batch_loss = self.criterion(output_flat, task.feedback.to(task.query.device))
-            print(f"[node {node.id}] batch loss: {batch_loss.item()}")
+            if self.verbose:
+                print(f"[node {node.id}] batch loss: {batch_loss.item()}")
             total_loss += task.query.size(0) * batch_loss.item() 
             # print(f"query shape: {task.query.shape}, target shape: {task.feedback.shape}, total loss: {total_loss}")
             # Backpropagate the loss
