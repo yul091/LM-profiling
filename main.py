@@ -8,7 +8,7 @@ import random
 import argparse
 import asyncio
 from tqdm import tqdm
-from typing import List, Union
+from typing import List
 from collections import defaultdict
 
 import torch 
@@ -41,7 +41,6 @@ class DeviceQueue:
     def __init__(self, cuda_id: int):
         self.queue = asyncio.Queue()
         self.cuda_id = cuda_id
-        # self.stop_signal = asyncio.Event()
 
     async def add_task(self, task: Task):
         if task is not None:
@@ -93,13 +92,7 @@ class Node:
         next_device_id: int = None,
         optimizer: torch.optim.Optimizer = None,
     ):
-        # while sum(device.stop_signal.is_set() for device in self.devices) < len(self.devices):
         while True:
-            # print("[node {}] {} devices have stopped: ".format(self.id, sum(device.stop_signal.is_set() for device in self.devices)))
-            # try: 
-            #     task: Task = await asyncio.wait_for(device_queue_in.get(), timeout=10)
-            # except asyncio.TimeoutError:
-            #     continue
             task: Task = await device_queue_in.get()
             if optimizer is not None:
                 optimizer.zero_grad()
@@ -259,7 +252,7 @@ class DistributedTransformerPipeline:
         for i, batch in tqdm(enumerate(self.dataloader), total=len(self.dataloader)):
             # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
             await asyncio.sleep(random.expovariate(self.rate_lambda))
-            # 5% of the time, produce a task with feedback
+            # 10% of the time, produce a task with feedback
             if random.random() < 0.1:
                 task = Task(query=batch[0], timestamp=time.time(), feedback=batch[1])
             else:
@@ -281,7 +274,6 @@ class DistributedTransformerPipeline:
                 break
             node = random.choice(self.nodes)
             await node.add_task(task)
-            # await asyncio.sleep(0)  # Simulates a long-running task
             # print(f"Task scheduled to node {node.id} at time {time.time()}")
             # print(f"Task queue size: {self.task_queue.qsize()}")
             
@@ -308,7 +300,7 @@ class DistributedTransformerPipeline:
             if self.verbose:
                 print(f"[node {node.id}] batch loss: {batch_loss.item()}")
             total_loss += task.query.size(0) * batch_loss.item() 
-            # print(f"query shape: {task.query.shape}, target shape: {task.feedback.shape}, total loss: {total_loss}")
+            # print(f"query shape: {task.query.shape}, target shape: {task.feedback.shape}")
             # Backpropagate the loss
             record_time(node.devices[-1].cuda_id, 'start', 'backward', timing_info, verbose=self.verbose)
             batch_loss.backward()
@@ -368,18 +360,6 @@ class DistributedTransformerPipeline:
                     task.cancel()
                 # Rethrow the exception
                 raise task.exception()
-            
-        # Instead of awaiting the consumer coroutine again, get the result from the Task object
-        # consumer_task = tasks[-1]  # This assumes that the consumer task is the last in the list
-        # for idx, consumer_task in enumerate([tasks[-3], tasks[-1]]):
-        #     if consumer_task.done():
-        #         loss = consumer_task.result()
-        #     else:
-        #         loss = None  # or handle accordingly
-        #     if loss is not None:
-        #         # print(f"Test Loss: {loss}, perplexity: {math.exp(loss)}")
-        #         print(f"[node {self.nodes[idx].id}] Test Loss: {loss}, perplexity: {math.exp(loss)}")
-        
         
     def save_profiling(self):
         os.makedirs(self.output_dir, exist_ok=True)
@@ -388,8 +368,8 @@ class DistributedTransformerPipeline:
             # Remove the first start and end time for each GPU
             gpus = list(set(int(key.split('_')[0]) for key in timing_info))
             for gpu_id in gpus:
-                timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start'][1:]
-                timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end'][1:]
+                timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
+                timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
             stats_f = f'{self.output_dir}/timing_info_{execution}_{self.setting}_node{idx}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)

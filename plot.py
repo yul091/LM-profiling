@@ -1,4 +1,5 @@
 import json
+from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
 from itertools import cycle
@@ -106,6 +107,7 @@ def plot_mix(args, node: int = None):
     # Define colors for each operation
     colors = {'forward': 'b', 'forward_loss': 'g', 'backward': 'r'}
     idle_dict = {}
+    latencies = defaultdict(list)
     # Plot the timings for each GPU
     for gpu_id in range(len(gpus)):
         start_times = timing_info.get(f"{gpu_id+init_gpu}_start", [])
@@ -117,6 +119,9 @@ def plot_mix(args, node: int = None):
         for (start, start_label), (end, end_label) in zip(start_times, end_times):
             color = colors.get(start_label, 'k')  # default color is black if label not found
             ax.hlines(y=gpu_id + 1, xmin=start, xmax=end, colors=color, linewidth=20, label=start_label)
+            latencies[start_label].append(end - start)
+        for start_label in colors.keys():
+            print(f'\t{start_label} latency statistics: mean {np.mean(latencies[start_label])}, var {np.var(latencies[start_label])}, median {np.median(latencies[start_label])}')
 
     # Set plot labels and grid
     ax.set_xlabel('Time (s)')
