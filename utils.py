@@ -37,10 +37,10 @@ SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
 
-def record_time(device: int, event_type: str, timing_info: Dict[str, List[float]], verbose: bool = False):
+def record_time(device: int, event_type: str, opt_type: str, timing_info: Dict[str, List[float]], verbose: bool = False):
     # event_type can be 'start' or 'end'
     timestamp = time.time()
-    timing_info[f"{device}_{event_type}"].append(timestamp)
+    timing_info[f"{device}_{event_type}"].append((timestamp, opt_type))
     if verbose:
         print(f"\t[CUDA {device}] Task {event_type} at time {timestamp}")
     

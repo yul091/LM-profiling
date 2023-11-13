@@ -51,18 +51,18 @@ class DeviceQueue:
         # Inference
         if task.feedback is not None:
             # Record the start time of the stage on this GPU
-            record_time(self.cuda_id, 'start', timing_info, verbose=verbose)
+            record_time(self.cuda_id, 'start', 'forward_loss', timing_info, verbose=verbose)
             output = stage(task.query)
-            record_time(self.cuda_id, 'end', timing_info, verbose=verbose)
+            record_time(self.cuda_id, 'end', 'forward_loss', timing_info, verbose=verbose)
             if next_cuda_id is not None:
                 output = output.cuda(next_cuda_id)  # Move output to the next stage's device
             task.query = output
         else:
             with torch.no_grad():
                 # Record the start time of the stage on this GPU
-                record_time(self.cuda_id, 'start', timing_info, verbose=verbose)
+                record_time(self.cuda_id, 'start', 'forward', timing_info, verbose=verbose)
                 output = stage(task.query)
-                record_time(self.cuda_id, 'end', timing_info, verbose=verbose)
+                record_time(self.cuda_id, 'end', 'forward',  timing_info, verbose=verbose)
                 if next_cuda_id is not None:
                     output = output.cuda(next_cuda_id)  # Move output to the next stage's device
                 task.query = output
@@ -282,6 +282,7 @@ class DistributedTransformerPipeline:
         stages: List[PipelineStage], 
         optimizer: torch.optim.Optimizer,
         node: Node,
+        timing_info: dict = None,
     ):
         total_loss = 0.
         while True:
@@ -299,9 +300,11 @@ class DistributedTransformerPipeline:
             total_loss += task.query.size(0) * batch_loss.item() 
             # print(f"query shape: {task.query.shape}, target shape: {task.feedback.shape}, total loss: {total_loss}")
             # Backpropagate the loss
+            record_time(node.devices[-1].cuda_id, 'start', 'backward', timing_info, verbose=True)
             batch_loss.backward()
             # torch.nn.utils.clip_grad_norm_(nn.Sequential(*stages).parameters(), 0.5)
             optimizer.step()
+            record_time(node.devices[-1].cuda_id, 'end', 'backward', timing_info, verbose=True)
         
         print(f"[node {node.id}] total loss: {total_loss/len(self.dataset)}, perplexity: {math.exp(total_loss/len(self.dataset))}")
         # return total_loss / len(self.dataset)
@@ -334,6 +337,7 @@ class DistributedTransformerPipeline:
                 stages=stages, 
                 optimizer=optimizer,
                 node=node,
+                timing_info=self.timing_infos[idx],
             )
             execution_coros.append(consumer_coro)
         
