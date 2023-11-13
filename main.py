@@ -312,7 +312,7 @@ class DistributedTransformerPipeline:
             # Backpropagate the loss
             record_time(node.devices[-1].cuda_id, 'start', 'backward', timing_info, verbose=self.verbose)
             batch_loss.backward()
-            torch.nn.utils.clip_grad_norm_(nn.Sequential(*stages).parameters(), 0.5)
+            # torch.nn.utils.clip_grad_norm_(nn.Sequential(*stages).parameters(), 0.5)
             optimizer.step()
             record_time(node.devices[-1].cuda_id, 'end', 'backward', timing_info, verbose=self.verbose)
             self.task_completed += 1
@@ -413,7 +413,7 @@ if __name__ == "__main__":
     parser.add_argument('--coroutine', action='store_true', help='coroutine inference')
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--n_samples', type=int, default=-1, help='number of samples to profile')
-    parser.add_argument('--lr', type=float, default=5.0, help='learning rate')
+    parser.add_argument('--lr', type=float, default=0.5, help='learning rate')
     parser.add_argument('--verbose', action='store_true', help='verbose')
     args = parser.parse_args()
     
