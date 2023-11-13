@@ -130,6 +130,7 @@ class DistributedTransformerPipeline:
         self.rate_lambda = args.rate_lambda
         lr = args.lr
         self.verbose = args.verbose
+        self.workload = args.workload
         
         # Reproducibility
         random.seed(seed)
@@ -251,7 +252,12 @@ class DistributedTransformerPipeline:
         # Produce using the dataset
         for i, batch in tqdm(enumerate(self.dataloader), total=len(self.dataloader)):
             # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
-            await asyncio.sleep(random.expovariate(self.rate_lambda))
+            if self.workload == 'poisson':
+                await asyncio.sleep(random.expovariate(self.rate_lambda))
+            elif self.workload == 'all':
+                await asyncio.sleep(0)
+            else:
+                raise ValueError(f"Invalid workload type: {self.workload}")
             # 10% of the time, produce a task with feedback
             if random.random() < 0.1:
                 task = Task(query=batch[0], timestamp=time.time(), feedback=batch[1])
@@ -370,7 +376,7 @@ class DistributedTransformerPipeline:
             for gpu_id in gpus:
                 timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
                 timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            stats_f = f'{self.output_dir}/timing_info_{execution}_{self.setting}_node{idx}.json'
+            stats_f = f'{self.output_dir}/timing_info_{execution}_{self.setting}_{self.workload}_node{idx}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
     
@@ -395,6 +401,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_samples', type=int, default=-1, help='number of samples to profile')
     parser.add_argument('--lr', type=float, default=0.5, help='learning rate')
     parser.add_argument('--verbose', action='store_true', help='verbose')
+    parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
     args = parser.parse_args()
     
     dppl = DistributedTransformerPipeline(args)

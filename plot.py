@@ -80,10 +80,11 @@ def plot_mix(args, node: int = None):
     output_dir = args.output_dir
     coroutine = args.coroutine
     setting = args.setting
+    workload = args.workload
     
     # Load timing information
     execution = 'coroutine' if coroutine else 'sync'
-    stats_f = f'{output_dir}/timing_info_{execution}_{setting}_node{node}.json' if node is not None else f'{output_dir}/timing_info_{execution}_{setting}.json'
+    stats_f = f'{output_dir}/timing_info_{execution}_{setting}_{workload}_node{node}.json' if node is not None else f'{output_dir}/timing_info_{execution}_{setting}.json'
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
 
@@ -123,7 +124,7 @@ def plot_mix(args, node: int = None):
             latencies[start_label].append(end - start)
             min_t = min(min_t, start)
             max_t = max(max_t, end)
-        for start_label in colors.keys():
+        for start_label in latencies.keys():
             if start_label == 'backward' and gpu_id != len(gpus) - 1:
                 continue
             print(f'\t{start_label} latency statistics: mean {np.mean(latencies[start_label])}, var {np.var(latencies[start_label])}, median {np.median(latencies[start_label])}')
@@ -162,6 +163,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--coroutine', action='store_true')
     parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], default='random', help='workload setting')
+    parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
     parser.add_argument('--node', type=int, default=None, help='node id')
     args = parser.parse_args()
     
