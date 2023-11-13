@@ -105,12 +105,14 @@ def plot_mix(args, node: int = None):
 
     # Define colors for each operation
     colors = {'forward': 'b', 'forward_loss': 'g', 'backward': 'r'}
-
+    idle_dict = {}
     # Plot the timings for each GPU
     for gpu_id in range(len(gpus)):
         start_times = timing_info.get(f"{gpu_id+init_gpu}_start", [])
         end_times = timing_info.get(f"{gpu_id+init_gpu}_end", [])
-
+        idles = [start - end for (start, start_label), (end, end_label) in zip(start_times[1:], end_times[:-1])]
+        idle_dict[f'{gpu_id}'] = idles
+        print(f'GPU {gpu_id} idle time statistics: mean {np.mean(idles)}, var {np.var(idles)}, median {np.median(idles)}')
         # Plot each task for this GPU, increase the linewidth for a wider bar
         for (start, start_label), (end, end_label) in zip(start_times, end_times):
             color = colors.get(start_label, 'k')  # default color is black if label not found
