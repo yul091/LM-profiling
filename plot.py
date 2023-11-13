@@ -108,6 +108,7 @@ def plot_mix(args, node: int = None):
     colors = {'forward': 'b', 'forward_loss': 'g', 'backward': 'r'}
     idle_dict = {}
     latencies = defaultdict(list)
+    min_t, max_t = float('inf'), float('-inf')
     # Plot the timings for each GPU
     for gpu_id in range(len(gpus)):
         start_times = timing_info.get(f"{gpu_id+init_gpu}_start", [])
@@ -120,8 +121,16 @@ def plot_mix(args, node: int = None):
             color = colors.get(start_label, 'k')  # default color is black if label not found
             ax.hlines(y=gpu_id + 1, xmin=start, xmax=end, colors=color, linewidth=20, label=start_label)
             latencies[start_label].append(end - start)
+            min_t = min(min_t, start)
+            max_t = max(max_t, end)
         for start_label in colors.keys():
+            if start_label == 'backward' and gpu_id != len(gpus) - 1:
+                continue
             print(f'\t{start_label} latency statistics: mean {np.mean(latencies[start_label])}, var {np.var(latencies[start_label])}, median {np.median(latencies[start_label])}')
+    total_idles = sum(sum(idles) for idles in idle_dict.values())
+    print(f'Total latency: {max_t - min_t}')
+    print(f'Total idle time: {total_idles}')
+    print(f'Rubble rate: {total_idles / (len(gpus) * (max_t - min_t))}')
 
     # Set plot labels and grid
     ax.set_xlabel('Time (s)')
