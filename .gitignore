@@ -1,6 +1,6 @@
 prof/*
 figures/*
-scripts/*
+# scripts/*
 logging/*
 results/*
 wandb/*

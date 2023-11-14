@@ -402,6 +402,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=0.5, help='learning rate')
     parser.add_argument('--verbose', action='store_true', help='verbose')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
+    parser.add_argument('--use_preload', action='store_true', help='use preloaded data (already in the first GPU of each node)')
     args = parser.parse_args()
     
     dppl = DistributedTransformerPipeline(args)
