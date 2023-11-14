@@ -56,8 +56,9 @@ class DeviceQueue:
             output = stage(task.query)
             record_time(self.cuda_id, 'end', 'forward_loss', timing_info, verbose=verbose)
             if next_cuda_id is not None:
-                output = output.cuda(next_cuda_id)  # Move output to the next stage's device
-            task.query = output
+                task.query = output.cuda(next_cuda_id)  # Move output to the next stage's device
+            else:
+                task.query = output
         else:
             with torch.no_grad():
                 # Record the start time of the stage on this GPU
@@ -65,8 +66,9 @@ class DeviceQueue:
                 output = stage(task.query)
                 record_time(self.cuda_id, 'end', 'forward',  timing_info, verbose=verbose)
                 if next_cuda_id is not None:
-                    output = output.cuda(next_cuda_id)  # Move output to the next stage's device
-                task.query = output
+                    task.query = output.cuda(next_cuda_id)  # Move output to the next stage's device
+                else:
+                    task.query = output
         
 
 class Node:
@@ -203,7 +205,7 @@ class DistributedTransformerPipeline:
         
         # Create preloaded data
         if self.use_preload:
-            print("Using preloaded data")
+            print("Using preloaded data ...")
             self.preloaded_tasks = defaultdict(list)
             for node in self.nodes:
                 if self.setting == 'random':
@@ -318,6 +320,7 @@ class DistributedTransformerPipeline:
             else:
                 raise ValueError(f"Invalid workload type: {self.workload}")
             # 10% of the time, produce a task with feedback
+            print("Producing task {} with length {}".format(i, batch[0].size(1)))
             if self.use_preload: 
                 # Essentially, we are using preloaded data (task ID)
                 await self.task_queue.put(i)
@@ -369,9 +372,6 @@ class DistributedTransformerPipeline:
                 continue
             output_flat = task.query.contiguous().view(-1, self.ntokens) # (B*T) X C
             batch_loss = self.criterion(output_flat, task.feedback)
-            if self.verbose:
-                print(f"[node {node.id}] batch loss: {batch_loss.item()}")
-            total_loss += task.query.size(0) * batch_loss.item() 
             # print(f"query shape: {task.query.shape}, target shape: {task.feedback.shape}")
             # Backpropagate the loss
             record_time(node.devices[-1].cuda_id, 'start', 'backward', timing_info, verbose=self.verbose)
@@ -380,6 +380,9 @@ class DistributedTransformerPipeline:
             optimizer.step()
             record_time(node.devices[-1].cuda_id, 'end', 'backward', timing_info, verbose=self.verbose)
             self.task_completed += 1
+            if self.verbose:
+                print(f"[node {node.id}] batch loss: {batch_loss.item()}")
+            total_loss += task.query.size(0) * batch_loss.item() 
         
         print(f"[node {node.id}] total loss: {total_loss/len(self.dataset)}, perplexity: {math.exp(total_loss/len(self.dataset))}")
         # return total_loss / len(self.dataset)
@@ -433,6 +436,7 @@ class DistributedTransformerPipeline:
                     task.cancel()
                 # Rethrow the exception
                 raise task.exception()
+        
         
     def save_profiling(self):
         os.makedirs(self.output_dir, exist_ok=True)
