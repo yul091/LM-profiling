@@ -46,8 +46,6 @@ class DeviceQueue:
         """
         Task can be either a Task object or an integer (task ID).
         """
-        # if task is not None:
-        #     task.query = task.query.cuda(self.cuda_id) # put query on the device
         await self.queue.put(task)
 
     async def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None, verbose: bool = False):
@@ -58,8 +56,7 @@ class DeviceQueue:
             output = stage(task.query)
             record_time(self.cuda_id, 'end', 'forward_loss', timing_info, verbose=verbose)
             if next_cuda_id is not None:
-                output = output.cuda(next_cuda_id)  # Move output to the next stage's device
-            task.query = output
+                output = output.cuda(next_cuda_id, non_blocking=True)  # Move output to the next stage's device
         else:
             with torch.no_grad():
                 # Record the start time of the stage on this GPU
@@ -67,9 +64,8 @@ class DeviceQueue:
                 output = stage(task.query)
                 record_time(self.cuda_id, 'end', 'forward',  timing_info, verbose=verbose)
                 if next_cuda_id is not None:
-                    output = output.cuda(next_cuda_id)  # Move output to the next stage's device
-                task.query = output
-        
+                    output = output.cuda(next_cuda_id, non_blocking=True)  # Move output to the next stage's device
+        task.query = output
         
 
 class Node:
@@ -197,6 +193,7 @@ class DistributedTransformerPipeline:
             self.dataset, 
             batch_size=bptt, 
             collate_fn=collate_batch,
+            # num_workers=4,
         )
         self.total_tasks = len(self.dataloader)
         self.task_completed = 0
@@ -284,19 +281,26 @@ class DistributedTransformerPipeline:
     
     async def produce(self):
         # Produce using the dataset
-        for i, batch in tqdm(enumerate(self.dataloader), total=len(self.dataloader)):
-            # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
-            if self.workload == 'poisson':
-                await asyncio.sleep(random.expovariate(self.rate_lambda))
-            elif self.workload == 'all':
-                await asyncio.sleep(0)
-            else:
-                raise ValueError(f"Invalid workload type: {self.workload}")
-            # 10% of the time, produce a task with feedback
-            if self.use_preload: 
-                # Essentially, we are using preloaded data (task ID)
+        if self.use_preload:
+            for i in tqdm(range(self.total_tasks)):
+                # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
+                if self.workload == 'poisson':
+                    await asyncio.sleep(random.expovariate(self.rate_lambda))
+                elif self.workload == 'all':
+                    await asyncio.sleep(0)
+                else:
+                    raise ValueError(f"Invalid workload type: {self.workload}")
                 await self.task_queue.put(i)
-            else:  
+        else:
+            for i, batch in tqdm(enumerate(self.dataloader), total=len(self.dataloader)):
+                # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
+                if self.workload == 'poisson':
+                    await asyncio.sleep(random.expovariate(self.rate_lambda))
+                elif self.workload == 'all':
+                    await asyncio.sleep(0)
+                else:
+                    raise ValueError(f"Invalid workload type: {self.workload}")
+                # 10% of the time, produce a task with feedback
                 if random.random() < self.retraining_rate:
                     task = Task(query=batch[0], timestamp=time.time(), feedback=batch[1])
                 else:
