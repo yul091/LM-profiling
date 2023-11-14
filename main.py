@@ -8,7 +8,7 @@ import random
 import argparse
 import asyncio
 from tqdm import tqdm
-from typing import List
+from typing import List, Union
 from collections import defaultdict
 
 import torch 
@@ -43,8 +43,11 @@ class DeviceQueue:
         self.cuda_id = cuda_id
 
     async def add_task(self, task: Task):
-        if task is not None:
-            task.query = task.query.cuda(self.cuda_id) # put query on the device
+        """
+        Task can be either a Task object or an integer (task ID).
+        """
+        # if task is not None:
+        #     task.query = task.query.cuda(self.cuda_id) # put query on the device
         await self.queue.put(task)
 
     def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None, verbose: bool = False):
@@ -73,14 +76,23 @@ class Node:
     """
     Suppose each node (server) has 2 GPUs, each having a queue.
     """
-    def __init__(self, id: int, cuda_devices: List[int], criterion: nn.CrossEntropyLoss, verbose: bool = False):
+    def __init__(
+        self, 
+        id: int, 
+        cuda_devices: List[int], 
+        criterion: nn.CrossEntropyLoss, 
+        verbose: bool = False,
+    ):
         self.id = id
         self.devices = [DeviceQueue(cuda_id) for cuda_id in cuda_devices]
         self.criterion = criterion
         self.verbose = verbose
         
-    async def add_task(self, task):
-        await self.devices[0].add_task(task) # always add input data on the first device
+    async def add_task(self, task: Union[Task, int], preloaded_tasks: List[Task] = None):
+        if task is None or preloaded_tasks is None:
+            await self.devices[0].add_task(task) # always add input data on the first device
+        else:
+            await self.devices[0].add_task(preloaded_tasks[task]) # always add input data on the first device
         
     async def coroutine_inference_stage(
         self,
@@ -131,6 +143,8 @@ class DistributedTransformerPipeline:
         lr = args.lr
         self.verbose = args.verbose
         self.workload = args.workload
+        self.use_preload = args.use_preload
+        self.retraining_rate = args.retraining_rate
         
         # Reproducibility
         random.seed(seed)
@@ -186,7 +200,27 @@ class DistributedTransformerPipeline:
         )
         self.total_tasks = len(self.dataloader)
         self.task_completed = 0
-
+        
+        # Create preloaded data
+        if self.use_preload:
+            print("Using preloaded data")
+            self.preloaded_tasks = defaultdict(list)
+            for node in self.nodes:
+                for batch in self.dataloader:
+                    # 10% of the time, produce a task with feedback
+                    if random.random() < self.retraining_rate:
+                        task = Task(
+                            query=batch[0].cuda(node.devices[0].cuda_id), 
+                            timestamp=time.time(), 
+                            feedback=batch[1].cuda(node.devices[-1].cuda_id), 
+                        )
+                    else:
+                        task = Task(
+                            query=batch[0].cuda(node.devices[0].cuda_id),
+                            timestamp=time.time(),
+                        )
+                    self.preloaded_tasks[node.id].append(task)
+                    
         # Create pipelines for model parallel
         self.timing_infos = []
         self.distributed_stages = []
@@ -259,12 +293,16 @@ class DistributedTransformerPipeline:
             else:
                 raise ValueError(f"Invalid workload type: {self.workload}")
             # 10% of the time, produce a task with feedback
-            if random.random() < 0.1:
-                task = Task(query=batch[0], timestamp=time.time(), feedback=batch[1])
-            else:
-                task = Task(query=batch[0], timestamp=time.time())
-            await self.task_queue.put(task)
-            # await asyncio.sleep(0)
+            if self.use_preload: 
+                # Essentially, we are using preloaded data (task ID)
+                await self.task_queue.put(i)
+            else:  
+                if random.random() < self.retraining_rate:
+                    task = Task(query=batch[0], timestamp=time.time(), feedback=batch[1])
+                else:
+                    task = Task(query=batch[0], timestamp=time.time())
+                await self.task_queue.put(task)
+            
         await self.task_queue.put(None)  # Signal the end of the dataset
         print("Producer finished producing tasks")
     
@@ -279,7 +317,10 @@ class DistributedTransformerPipeline:
                     await node.add_task(None)
                 break
             node = random.choice(self.nodes)
-            await node.add_task(task)
+            if self.use_preload:
+                await node.add_task(task, self.preloaded_tasks[node.id])
+            else:
+                await node.add_task(task)
             # print(f"Task scheduled to node {node.id} at time {time.time()}")
             # print(f"Task queue size: {self.task_queue.qsize()}")
             
@@ -302,7 +343,7 @@ class DistributedTransformerPipeline:
                 self.task_completed += 1
                 continue
             output_flat = task.query.contiguous().view(-1, self.ntokens) # (B*T) X C
-            batch_loss = self.criterion(output_flat, task.feedback.to(task.query.device))
+            batch_loss = self.criterion(output_flat, task.feedback)
             if self.verbose:
                 print(f"[node {node.id}] batch loss: {batch_loss.item()}")
             total_loss += task.query.size(0) * batch_loss.item() 
@@ -341,14 +382,15 @@ class DistributedTransformerPipeline:
             execution_coros.extend(stages_coros)
             
             # Start the consumer coroutine
-            consumer_coro = self.compute_loss(
-                queue=queues[-1],
-                stages=stages, 
-                optimizer=optimizer,
-                node=node,
-                timing_info=self.timing_infos[idx],
-            )
-            execution_coros.append(consumer_coro)
+            if self.retraining_rate > 0:
+                consumer_coro = self.compute_loss(
+                    queue=queues[-1],
+                    stages=stages, 
+                    optimizer=optimizer,
+                    node=node,
+                    timing_info=self.timing_infos[idx],
+                )
+                execution_coros.append(consumer_coro)
         
         # Run all tasks until complete
         producer_coro = self.produce()
@@ -403,6 +445,7 @@ if __name__ == "__main__":
     parser.add_argument('--verbose', action='store_true', help='verbose')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
     parser.add_argument('--use_preload', action='store_true', help='use preloaded data (already in the first GPU of each node)')
+    parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
     args = parser.parse_args()
     
     dppl = DistributedTransformerPipeline(args)
