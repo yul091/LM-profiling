@@ -104,7 +104,7 @@ def plot_mix(args, ax: plt.axis, node: int = None, start_time: float = None):
     idle_dict = {}
     latencies = defaultdict(list)
     # Plot the timings for each GPU
-    for gpu_id in range(len(gpus)):
+    for gpu_id in range(num_gpus):
         min_t, max_t = float('inf'), float('-inf')
         start_times = timing_info.get(f"{gpu_id+init_gpu}_start", [])
         end_times = timing_info.get(f"{gpu_id+init_gpu}_end", [])
@@ -131,10 +131,10 @@ def plot_mix(args, ax: plt.axis, node: int = None, start_time: float = None):
 
     # Set plot labels and grid
     ax.set_xlabel('Time (s)')
-    ax.set_ylabel(f'Node {node+1}', fontsize=20)
+    ax.set_ylabel(f'Node {node+1}', fontsize=7*num_gpus)
     # ax.set_title('Task Inference Profiling')
     ax.set_yticks(range(1, num_gpus + 1))
-    ax.set_yticklabels([f'P{i}' for i in range(num_gpus)], fontsize=15)
+    ax.set_yticklabels([f'P{i}' for i in range(num_gpus)], fontsize=5*num_gpus)
     ax.set_ylim(0.5, num_gpus + 0.5)
     ax.grid(True)
 
@@ -152,7 +152,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--coroutine', action='store_true')
-    parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], default='random', help='workload setting')
+    parser.add_argument('--setting', type=str, choices=['identical','random', 'variant'], default='random', help='workload setting')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
     parser.add_argument('--node', type=int, default=None, help='number of nodes for distributed systems')
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')

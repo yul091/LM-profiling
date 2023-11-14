@@ -46,10 +46,19 @@ def batchify(
         # Increment 'i' to the next starting point
         i += rand_length
     # return sentences
-    if setting == 'increasing':
+    # if setting == 'increasing':
+    #     sentences.sort(key=lambda x: x.size(0))
+    # elif setting == 'decreasing':
+    #     sentences.sort(key=lambda x: x.size(0), reverse=True)
+    if setting == 'variant':
         sentences.sort(key=lambda x: x.size(0))
-    elif setting == 'decreasing':
-        sentences.sort(key=lambda x: x.size(0), reverse=True)
+        # Split sentences into two halves
+        mid_index = len(sentences) // 2
+        short_sentences = sentences[:mid_index]
+        long_sentences = sentences[mid_index:]
+        # Rearrange sentences to alternate between short and long
+        sentences = [sentence for pair in zip(short_sentences, long_sentences) for sentence in pair]
+    
     return sentences
         
 

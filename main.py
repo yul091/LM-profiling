@@ -56,7 +56,8 @@ class DeviceQueue:
             output = stage(task.query)
             record_time(self.cuda_id, 'end', 'forward_loss', timing_info, verbose=verbose)
             if next_cuda_id is not None:
-                output = output.cuda(next_cuda_id, non_blocking=True)  # Move output to the next stage's device
+                output = output.cuda(next_cuda_id)  # Move output to the next stage's device
+            task.query = output
         else:
             with torch.no_grad():
                 # Record the start time of the stage on this GPU
@@ -64,8 +65,8 @@ class DeviceQueue:
                 output = stage(task.query)
                 record_time(self.cuda_id, 'end', 'forward',  timing_info, verbose=verbose)
                 if next_cuda_id is not None:
-                    output = output.cuda(next_cuda_id, non_blocking=True)  # Move output to the next stage's device
-        task.query = output
+                    output = output.cuda(next_cuda_id)  # Move output to the next stage's device
+                task.query = output
         
 
 class Node:
@@ -193,30 +194,49 @@ class DistributedTransformerPipeline:
             self.dataset, 
             batch_size=bptt, 
             collate_fn=collate_batch,
-            # num_workers=4,
+            shuffle=False,
         )
         self.total_tasks = len(self.dataloader)
         self.task_completed = 0
+        # self.median_length = torch.median(torch.tensor([data.size(0) for data, target in self.dataset]))
+        # print(f"Median length of the dataset: {self.median_length}")
         
         # Create preloaded data
         if self.use_preload:
             print("Using preloaded data")
             self.preloaded_tasks = defaultdict(list)
             for node in self.nodes:
-                for batch in self.dataloader:
-                    # 10% of the time, produce a task with feedback
-                    if random.random() < self.retraining_rate:
-                        task = Task(
-                            query=batch[0].cuda(node.devices[0].cuda_id), 
-                            timestamp=time.time(), 
-                            feedback=batch[1].cuda(node.devices[-1].cuda_id), 
-                        )
-                    else:
-                        task = Task(
-                            query=batch[0].cuda(node.devices[0].cuda_id),
-                            timestamp=time.time(),
-                        )
-                    self.preloaded_tasks[node.id].append(task)
+                if self.setting == 'random':
+                    for i, batch in enumerate(self.dataloader):
+                        # 10% of the time, produce a task with feedback
+                        if random.random() < self.retraining_rate:
+                            task = Task(
+                                query=batch[0].cuda(node.devices[0].cuda_id), 
+                                timestamp=time.time(), 
+                                feedback=batch[1].cuda(node.devices[-1].cuda_id), 
+                            )
+                        else:
+                            task = Task(
+                                query=batch[0].cuda(node.devices[0].cuda_id),
+                                timestamp=time.time(),
+                            )
+                        self.preloaded_tasks[node.id].append(task)
+                        
+                elif self.setting == 'variant':
+                    for i, batch in enumerate(self.dataloader):
+                        # Odd batches are short, better utilize the bubble for retraining
+                        if i % 2 == 0 and random.random() < 2 * self.retraining_rate:
+                            task = Task(
+                                query=batch[0].cuda(node.devices[0].cuda_id), 
+                                timestamp=time.time(), 
+                                feedback=batch[1].cuda(node.devices[-1].cuda_id), 
+                            )
+                        else:
+                            task = Task(
+                                query=batch[0].cuda(node.devices[0].cuda_id),
+                                timestamp=time.time(),
+                            )
+                        self.preloaded_tasks[node.id].append(task)
                     
         # Create pipelines for model parallel
         self.timing_infos = []
@@ -259,48 +279,49 @@ class DistributedTransformerPipeline:
         partition_len: int, 
         init_gpu_id: int = 0,
     ) -> List[PipelineStage]:
-        stages = []
-        tmp_list = [Encoder(ntokens, emsize, dropout)]
-        # Add all the necessary transformer blocks
-        for i in range(nlayers):
-            transformer_block = TransformerEncoderLayer(emsize, nhead, nhid, dropout)
-            if i != 0 and i % (partition_len) == 0:
-                # Create a new pipeline stage
-                stage_device = i // (partition_len) - 1 + init_gpu_id
-                print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device))
-                stages.append(PipelineStage(tmp_list, stage_device))
-                tmp_list = []
-                
-            tmp_list.append(transformer_block)
-        # Add decoder in the end
-        tmp_list.append(Decoder(ntokens, emsize))
-        stages.append(PipelineStage(tmp_list, stage_device + 1))
-        print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device + 1))
+        if partition_len == nlayers:
+            stages = [nn.Sequential(
+                Encoder(ntokens, emsize, dropout),
+                *[TransformerEncoderLayer(emsize, nhead, nhid, dropout) for _ in range(nlayers)],
+                Decoder(ntokens, emsize),
+            ).to(init_gpu_id)]
+            print("Put stage {} on device {}".format([stages[0].__class__.__name__], init_gpu_id))
+        else:
+            stages = []
+            tmp_list = [Encoder(ntokens, emsize, dropout)]
+            # Add all the necessary transformer blocks
+            for i in range(nlayers):
+                transformer_block = TransformerEncoderLayer(emsize, nhead, nhid, dropout)
+                if i != 0 and i % (partition_len) == 0:
+                    # Create a new pipeline stage
+                    stage_device = i // (partition_len) - 1 + init_gpu_id
+                    print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device))
+                    stages.append(PipelineStage(tmp_list, stage_device))
+                    tmp_list = []
+                    
+                tmp_list.append(transformer_block)
+            # Add decoder in the end
+            tmp_list.append(Decoder(ntokens, emsize))
+            stages.append(PipelineStage(tmp_list, stage_device + 1))
+            print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device + 1))
         print('Total parameters in model: {:,}'.format(get_total_params(nn.Sequential(*stages))))
         return stages
     
     async def produce(self):
         # Produce using the dataset
-        if self.use_preload:
-            for i in tqdm(range(self.total_tasks)):
-                # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
-                if self.workload == 'poisson':
-                    await asyncio.sleep(random.expovariate(self.rate_lambda))
-                elif self.workload == 'all':
-                    await asyncio.sleep(0)
-                else:
-                    raise ValueError(f"Invalid workload type: {self.workload}")
+        for i, batch in tqdm(enumerate(self.dataloader), total=len(self.dataloader)):
+            # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
+            if self.workload == 'poisson':
+                await asyncio.sleep(random.expovariate(self.rate_lambda))
+            elif self.workload == 'all':
+                await asyncio.sleep(0)
+            else:
+                raise ValueError(f"Invalid workload type: {self.workload}")
+            # 10% of the time, produce a task with feedback
+            if self.use_preload: 
+                # Essentially, we are using preloaded data (task ID)
                 await self.task_queue.put(i)
-        else:
-            for i, batch in tqdm(enumerate(self.dataloader), total=len(self.dataloader)):
-                # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
-                if self.workload == 'poisson':
-                    await asyncio.sleep(random.expovariate(self.rate_lambda))
-                elif self.workload == 'all':
-                    await asyncio.sleep(0)
-                else:
-                    raise ValueError(f"Invalid workload type: {self.workload}")
-                # 10% of the time, produce a task with feedback
+            else:  
                 if random.random() < self.retraining_rate:
                     task = Task(query=batch[0], timestamp=time.time(), feedback=batch[1])
                 else:
@@ -432,7 +453,7 @@ if __name__ == "__main__":
     # Test the producer
     parser = argparse.ArgumentParser()
     parser.add_argument('--rate_lambda', type=float, default=60, help='Average number of tasks produced per minute')
-    parser.add_argument('--setting', type=str, choices=['identical','random', 'increasing', 'decreasing'], 
+    parser.add_argument('--setting', type=str, choices=['identical','random', 'variant'], 
                         default='random', help='workload setting')
     parser.add_argument('--output_dir', type=str, default='prof', help='output directory')
     parser.add_argument('--bptt', type=int, default=10, help='batch size')
@@ -451,6 +472,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_preload', action='store_true', help='use preloaded data (already in the first GPU of each node)')
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
     args = parser.parse_args()
+    
+    torch.autograd.set_detect_anomaly(True)
     
     dppl = DistributedTransformerPipeline(args)
     asyncio.run(dppl.main())
