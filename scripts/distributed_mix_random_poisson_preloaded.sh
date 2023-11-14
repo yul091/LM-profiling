@@ -3,6 +3,7 @@ SETTING=random
 WORKLOAD=poisson
 BATCH_SIZE=10
 N_SAMPLES=$((BATCH_SIZE * 30))
+RETRAIN=0.1
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 python main.py \
     --n_samples $N_SAMPLES \
@@ -12,11 +13,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 python main.py \
     --nlayers 24 \
     --setting $SETTING \
     --workload $WORKLOAD \
-    --use_preload
+    --use_preload \
+    --retraining_rate $RETRAIN
 
 
 python plot.py \
     --node 2 \
     --coroutine \
     --setting $SETTING \
-    --workload $WORKLOAD
+    --workload $WORKLOAD \
+    --retraining_rate $RETRAIN

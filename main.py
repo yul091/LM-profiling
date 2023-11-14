@@ -50,7 +50,7 @@ class DeviceQueue:
         #     task.query = task.query.cuda(self.cuda_id) # put query on the device
         await self.queue.put(task)
 
-    def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None, verbose: bool = False):
+    async def process_task(self, task: Task, timing_info: dict, stage: nn.Module, next_cuda_id: int = None, verbose: bool = False):
         # Inference
         if task.feedback is not None:
             # Record the start time of the stage on this GPU
@@ -113,7 +113,7 @@ class Node:
                 print("[node {}] Device {} all task finished !".format(self.id, device_id))
                 await device_queue_out.put(None)
                 break
-            self.devices[device_id].process_task(
+            await self.devices[device_id].process_task(
                 task=task, 
                 timing_info=timing_info, 
                 stage=stage, 
@@ -418,7 +418,7 @@ class DistributedTransformerPipeline:
             for gpu_id in gpus:
                 timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
                 timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            stats_f = f'{self.output_dir}/timing_info_{execution}_{self.setting}_{self.workload}_node{idx}.json'
+            stats_f = f'{self.output_dir}/timing_info_{execution}_{self.setting}_{self.workload}_{self.retraining_rate}_node{idx}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
     
