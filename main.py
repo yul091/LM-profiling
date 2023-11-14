@@ -152,7 +152,10 @@ class DistributedTransformerPipeline:
         
         # Initialize async components
         self.task_queue = asyncio.Queue()
-        train_data, val_data, test_data, self.vocab = get_data(setting=args.setting)
+        train_data, val_data, test_data, self.vocab = get_data(
+            setting=args.setting,
+            bptt=bptt,
+        )
         self.ntokens = len(self.vocab)
         self.criterion = nn.CrossEntropyLoss(ignore_index=self.vocab['<pad>'])
         num_gpus = torch.cuda.device_count()
@@ -186,11 +189,15 @@ class DistributedTransformerPipeline:
             padded_target = padded[len(batch_data):]
             return padded_data, padded_target.view(-1)
         
-        self.dataset = SentencePairDataset(test_data)
+        self.dataset = SentencePairDataset(test_data, setting=self.setting)
         if n_samples > 0:
+            if self.setting == 'random':
+                indices = random.sample(range(len(self.dataset)), n_samples)
+            elif self.setting == 'variant':
+                indices = list(range(n_samples))
             self.dataset = Subset(
                 self.dataset, 
-                random.sample(range(len(self.dataset)), n_samples),
+                indices,
             )
         self.dataloader = DataLoader(
             self.dataset, 

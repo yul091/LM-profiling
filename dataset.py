@@ -1,4 +1,5 @@
 import random
+from typing import List
 import torch
 from torch import nn, Tensor
 from torchtext.datasets import WikiText2
@@ -19,6 +20,7 @@ def batchify(
     setting: str, 
     min_len: int = 10, 
     max_len: int = 256,
+    bptt: int = 10, 
 ):
     # # Divide the dataset into ``bsz`` parts.
     # nbatch = data.size(0) // bsz
@@ -45,19 +47,19 @@ def batchify(
         sentences.append(sentence)
         # Increment 'i' to the next starting point
         i += rand_length
-    # return sentences
-    # if setting == 'increasing':
-    #     sentences.sort(key=lambda x: x.size(0))
-    # elif setting == 'decreasing':
-    #     sentences.sort(key=lambda x: x.size(0), reverse=True)
+
     if setting == 'variant':
         sentences.sort(key=lambda x: x.size(0))
         # Split sentences into two halves
         mid_index = len(sentences) // 2
         short_sentences = sentences[:mid_index]
         long_sentences = sentences[mid_index:]
-        # Rearrange sentences to alternate between short and long
-        sentences = [sentence for pair in zip(short_sentences, long_sentences) for sentence in pair]
+        # Rearrange sentences in groups of bptt
+        sentences = []
+        for i in range(0, max(len(short_sentences), len(long_sentences)), bptt):
+            sentences.extend(short_sentences[i:i+bptt])
+            sentences.extend(long_sentences[i:i+bptt])
+        # print(f"Sent lengths: {[len(s) for s in sentences]}")
     
     return sentences
         
@@ -68,6 +70,7 @@ def get_data(
     setting: str = 'identical', 
     min_len: int = 10, 
     max_len: int = 128,
+    bptt: int = 10,
 ):
     train_iter = WikiText2(split='train')
     tokenizer = get_tokenizer('basic_english')
@@ -79,28 +82,31 @@ def get_data(
     val_data = data_process(vocab, tokenizer, val_iter) # tensor(#val_tokens)
     test_data = data_process(vocab, tokenizer, test_iter) # tensor(#test_tokens)
 
-    train_data = batchify(train_data, batch_size, setting, min_len, max_len)
-    val_data = batchify(val_data, eval_batch_size, setting, min_len, max_len)
-    test_data = batchify(test_data, eval_batch_size, setting, min_len, max_len)
+    train_data = batchify(train_data, batch_size, setting, min_len, max_len, bptt)
+    val_data = batchify(val_data, eval_batch_size, setting, min_len, max_len, bptt)
+    test_data = batchify(test_data, eval_batch_size, setting, min_len, max_len, bptt)
     
     return train_data, val_data, test_data, vocab
 
 
 class SentencePairDataset(Dataset):
-    def __init__(self, data_list):
+    def __init__(self, data_list: List[Tensor], setting: str):
         """
         Args:
             data_list (list of Tensors): A list where each element is a tensor corresponding to a sentence.
         """
         self.data_list = data_list
+        self.setting = setting
 
     def __len__(self):
         # We return the length minus one because we are creating pairs of sentences
         return len(self.data_list) - 1
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         # Return the current sentence and the next sentence as the data and target, respectively.
         data = self.data_list[idx]
         target = self.data_list[idx + 1]
+        if self.setting == 'variant':
+            return data, target[:data.size(0)]
         return data, target
     
