@@ -1,6 +1,6 @@
 
 SETTING=variant
-WORKLOAD=all
+WORKLOAD=poisson
 BATCH_SIZE=10
 N_SAMPLES=$((BATCH_SIZE * 30))
 RETRAIN=0.1
@@ -14,7 +14,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,5,6,7 python main.py \
     --setting $SETTING \
     --workload $WORKLOAD \
     --use_preload \
-    --seed 40 \
+    --seed 0 \
     --retraining_rate $RETRAIN
 
 

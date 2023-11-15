@@ -1,10 +1,14 @@
 
 SETTING=variant
-WORKLOAD=all
+WORKLOAD=poisson
 BATCH_SIZE=10
 N_SAMPLES=$((BATCH_SIZE * 30))
-RETRAIN=0.1
+RETRAIN=0
 
+# CUDA_VISIBLE_DEVICES=0,1,2,5,6,7 /usr/lib/nsight-systems/bin/nsys profile \
+#     -f true \
+#     -c cudaProfilerApi \
+#     -o prof/nsys_variant_poisson \
 CUDA_VISIBLE_DEVICES=0,1,2,5,6,7 python main.py \
     --n_samples $N_SAMPLES \
     --coroutine \
@@ -14,7 +18,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,5,6,7 python main.py \
     --setting $SETTING \
     --workload $WORKLOAD \
     --use_preload \
-    --seed 40 \
     --retraining_rate $RETRAIN
 
 
