@@ -3,77 +3,7 @@ import json
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
-from itertools import cycle
 import argparse
-
-def plot(args, node: int = None):
-    output_dir = args.output_dir
-    coroutine = args.coroutine
-    setting = args.setting
-    
-    # Load timing information
-    execution = 'coroutine' if coroutine else 'sync'
-    stats_f = f'{output_dir}/timing_info_{execution}_{setting}_node{node}.json' if node is not None else f'{output_dir}/timing_info_{execution}_{setting}.json'
-    with open(stats_f, 'r') as f:
-        timing_info = json.load(f)
-
-    # Normalize the times by the smallest timestamp
-    min_time = min(min(times) for times in timing_info.values())
-    timing_info = {k: [t - min_time for t in v] for k, v in timing_info.items()}
-
-    # Extract the number of GPUs based on the keys
-    gpus = list(set(int(key.split('_')[0]) for key in timing_info))  # GPUs are 0-indexed
-    init_gpu, last_gpu = min(gpus), max(gpus)
-    num_gpus = len(gpus)
-    # Create a figure and axis to plot on
-    fig, ax = plt.subplots(figsize=(20, num_gpus))
-
-    colors = cycle('bgrcmk')  # Cycle through a list of colors for the plot
-    idle_dict = {}
-    # Plot the timings for each GPU
-    for gpu_id in range(len(gpus)):
-        start_times = timing_info.get(f"{gpu_id+init_gpu}_start", [])
-        end_times = timing_info.get(f"{gpu_id+init_gpu}_end", [])
-        idles = [start - end for start, end in zip(start_times[1:], end_times[:-1])]
-        idle_dict[f'{gpu_id}'] = idles
-        # idle_dict[f'{gpu_id}_stats'] = {
-        #     'mean': np.mean(idles),
-        #     'var': np.var(idles),
-        #     'median': np.median(idles),
-        # }
-        print(f'GPU {gpu_id} idle time statistics: mean {np.mean(idles)}, var {np.var(idles)}, median {np.median(idles)}')
-        color = next(colors)
-        
-        # Plot each task for this GPU, increase the linewidth for a wider bar
-        for start, end in zip(start_times, end_times):
-            ax.hlines(y=gpu_id + 1, xmin=start, xmax=end, colors=color, linewidth=20, label=f'GPU {gpu_id}' if start == start_times[0] else "")
-
-    # Set plot labels and grid
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel('GPU')
-    ax.set_title('Task Inference Profiling')
-    ax.set_yticks(range(1, len(gpus) + 1))
-    ax.set_yticklabels([f'GPU {i}' for i in range(len(gpus))])
-    ax.grid(True)
-
-    # Reverse the y-axis so that GPU 0 is at the top
-    ax.invert_yaxis()
-
-    # Create a custom legend
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys())
-
-    # Show the plot
-    plt.tight_layout()
-    plt.savefig(f'{stats_f.split(".")[0]}.png')
-    # Show the plot
-    plt.show()
-    
-    # Save idle time statistics
-    idle_f = f'{output_dir}/idle_time_{execution}_{setting}_node{node}.json' if node is not None else f'{output_dir}/idle_time_{execution}_{setting}.json'
-    with open(idle_f, 'w') as f:
-        json.dump(idle_dict, f)
         
         
 
@@ -131,7 +61,10 @@ def plot_mix(args, ax: plt.axis, node: int = None, start_time: float = None):
 
     # Set plot labels and grid
     ax.set_xlabel('Time (s)')
-    ax.set_ylabel(f'Node {node+1}', fontsize=7*num_gpus)
+    if node is None:
+        ax.set_ylabel('GPU', fontsize=7*num_gpus)
+    else:
+        ax.set_ylabel(f'Node {node+1}', fontsize=7*num_gpus)
     # ax.set_title('Task Inference Profiling')
     ax.set_yticks(range(1, num_gpus + 1))
     ax.set_yticklabels([f'P{i}' for i in range(num_gpus)], fontsize=5*num_gpus)
@@ -158,20 +91,37 @@ if __name__ == '__main__':
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
     args = parser.parse_args()
     
+    start_time = None
+    output_dir = args.output_dir
+    coroutine = args.coroutine
+    setting = args.setting
+    workload = args.workload
+    retraining_rate = args.retraining_rate
+    execution = 'coroutine' if coroutine else 'sync'
+    
     if not args.node:
-        # plot(args)
-        plot_mix(args)
-    else:
-        start_time = None
-        output_dir = args.output_dir
-        coroutine = args.coroutine
-        setting = args.setting
-        workload = args.workload
-        retraining_rate = args.retraining_rate
+        # Load timing information
+        stats_f = f'{output_dir}/timing_info_{execution}_{setting}.json'
+        with open(stats_f, 'r') as f:
+            timing_info = json.load(f)
             
+        for times_list in timing_info.values():
+            for times in times_list:
+                if start_time is None or times[0] < start_time:
+                    start_time = times[0]
+                    
+        gpus = list(set(int(key.split('_')[0]) for key in timing_info))  # GPUs are 0-indexed
+        fig, ax = plt.subplots(1, 1, figsize=(20, len(gpus)/1.3), sharex=True)
+        plot_mix(args, ax, None, start_time)
+        
+        # Show the plot
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/timing_info_{execution}_{setting}.png")
+        plt.show()
+        
+    else:
         for node in range(args.node):
             # Load timing information
-            execution = 'coroutine' if coroutine else 'sync'
             stats_f = f'{output_dir}/timing_info_{execution}_{setting}_{workload}_{retraining_rate}_node{node}.json' if node is not None else f'{output_dir}/timing_info_{execution}_{setting}.json'
             with open(stats_f, 'r') as f:
                 timing_info = json.load(f)

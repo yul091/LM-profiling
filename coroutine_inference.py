@@ -10,7 +10,7 @@ import argparse
 from tqdm import tqdm
 import asyncio
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 from torch import nn, Tensor
@@ -63,12 +63,17 @@ def main():
     #     # Need batch dimension first for pipeline parallelism.
     #     return data.t(), target
     
-    test_dataset = SentencePairDataset(test_data)
+    test_dataset = SentencePairDataset(test_data, setting='identical')
     if n_samples > 0:
         test_dataset = Subset(test_dataset, random.sample(range(len(test_dataset)), n_samples))
     ntokens = len(vocab) # the size of vocabulary
-    test_loader = DataLoader(test_dataset, batch_size=bptt, collate_fn=collate_batch)
-
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=bptt, 
+        collate_fn=collate_batch,
+        shuffle=False,
+    )
+    
     num_gpus = torch.cuda.device_count()
     partition_len = ((nlayers - 1) // num_gpus) + 1
     print("partition (block) size: {}".format(partition_len))
@@ -88,6 +93,12 @@ def main():
             tmp_list = []
             
         tmp_list.append(transformer_block)
+        
+    # Preload dataset to GPU memory
+    preloaded_tasks = []
+    for i, (data, targets) in enumerate(test_loader):
+        # 10% of the time, produce a task with feedback
+        preloaded_tasks.append((data.cuda(0), targets.cuda(num_gpus - 1)))
 
     # Add decoder in the end.
     tmp_list.append(Decoder(ntokens, emsize))
@@ -100,10 +111,10 @@ def main():
     # Dictionary to hold all timing information
     timing_info = defaultdict(list)
     
-    async def producer(queue: asyncio.Queue, data_source: DataLoader):
+    async def producer(queue: asyncio.Queue, data_source: List[Tuple[Tensor, Tensor]]):
         for i, (data, targets) in tqdm(enumerate(data_source), total=len(data_source)):
             # data, targets = get_batch(data_source, i)
-            await queue.put((data.cuda(0), targets))
+            await queue.put((data, targets))
             await asyncio.sleep(0)  # Simulates a long-running task
         await queue.put((None, None))  # Signal the end of the dataset
     
@@ -115,9 +126,9 @@ def main():
                 break
             with torch.no_grad():
                 # Record the start time of the stage on this GPU
-                record_time(device, 'start', timing_info)
+                record_time(device, 'start', 'forward', timing_info)
                 output = stage(data)
-                record_time(device, 'end', timing_info)
+                record_time(device, 'end', 'forward', timing_info)
                 if next_device:
                     output = output.to(next_device)  # Move output to the next stage's device.
             await queue_out.put((output, targets))
@@ -129,7 +140,7 @@ def main():
             if output is None:
                 break
             output_flat = output.contiguous().view(-1, ntokens) # (B*T) X C
-            total_loss += output.size(0) * criterion(output_flat, targets.to(output.device)).item() 
+            total_loss += output.size(0) * criterion(output_flat, targets).item() 
         return total_loss / (len(test_data) - 1)
     
     async def coroutine_evaluate(stages, data_source):
@@ -184,11 +195,11 @@ def main():
                 data = data.cuda(0)
                 output = data 
                 for j, stage in enumerate(stages):
-                    record_time(j, 'start', timing_info)
+                    record_time(j, 'start', 'forward', timing_info)
                     stage.eval()
                     output = output.cuda(j)
                     output = stage(output) # (B X T X C)
-                    record_time(j, 'end', timing_info)
+                    record_time(j, 'end', 'forward', timing_info)
 
                 output_flat = output.contiguous().view(-1, ntokens) # (B*T) X C
                 # Need to move targets to the device where the output of the pipeline resides.
@@ -228,7 +239,8 @@ def main():
     if coroutine:
         print("  Running coroutine inference ...")
         # asyncio.run(coroutine_evaluate(stages, test_data))
-        asyncio.run(coroutine_evaluate(stages, test_loader))
+        # asyncio.run(coroutine_evaluate(stages, test_loader))
+        asyncio.run(coroutine_evaluate(stages, preloaded_tasks))
     else:
         print("  Running synchronous inference ...")
         # test_loss = evaluate(stages, test_data)

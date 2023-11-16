@@ -18,4 +18,9 @@ nlayers=64
 # done
     
 
-CUDA_VISIBLE_DEVICES=4,5,6,7 python -u coroutine_inference.py --nlayers $nlayers --setting random --coroutine --n_samples 50
+CUDA_VISIBLE_DEVICES=4,5,6,7 python -u coroutine_inference.py \
+    --nlayers $nlayers \
+    --setting random \
+    --coroutine \
+    --n_samples 50
+    
