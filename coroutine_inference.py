@@ -2,7 +2,6 @@ import os
 import sys
 sys.dont_write_bytecode = True
 import math
-import time
 import json
 import wandb
 import random
@@ -14,11 +13,10 @@ from typing import Dict, List, Tuple
 
 import torch
 from torch import nn, Tensor
-import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Subset
 
-from torch.nn import TransformerEncoderLayer, TransformerDecoderLayer
+from torch.nn import TransformerEncoderLayer
 from dataset import get_data, SentencePairDataset
 from models import Encoder, Decoder, PipelineStage
 from utils import record_time, get_total_params
@@ -54,14 +52,6 @@ def main():
         padded_data = padded[:len(batch_data)]
         padded_target = padded[len(batch_data):]
         return padded_data, padded_target.view(-1)
-    
-    # def get_batch(source, i):
-    #     # Source (N X T) where T is the chunk size
-    #     seq_len = min(bptt, len(source) - 1 - i)
-    #     data = source[i:i+seq_len] # (B X T) where B is the batch size
-    #     target = source[i+1:i+1+seq_len].view(-1) # (B*T) the corresponding next sentences
-    #     # Need batch dimension first for pipeline parallelism.
-    #     return data.t(), target
     
     test_dataset = SentencePairDataset(test_data, setting='identical')
     if n_samples > 0:
@@ -183,7 +173,6 @@ def main():
         else:
             loss = None  # or handle accordingly
         print(f"Test Loss: {loss}, perplexity: {math.exp(loss)}")
-        # wandb.log({"test_loss": loss, "test_ppl": math.exp(loss)})
         
     def evaluate(stages: List[nn.Sequential], data_source: DataLoader):
         total_loss = 0.
@@ -204,7 +193,6 @@ def main():
                 output_flat = output.contiguous().view(-1, ntokens) # (B*T) X C
                 # Need to move targets to the device where the output of the pipeline resides.
                 batch_loss = criterion(output_flat, targets.to(output.device)).item()
-                # print(f"Batch {i} loss: {batch_loss}")
                 total_loss += len(data) * batch_loss
                 
         return total_loss / (len(test_data) - 1)
@@ -238,15 +226,12 @@ def main():
     
     if coroutine:
         print("  Running coroutine inference ...")
-        # asyncio.run(coroutine_evaluate(stages, test_data))
-        # asyncio.run(coroutine_evaluate(stages, test_loader))
         asyncio.run(coroutine_evaluate(stages, preloaded_tasks))
     else:
         print("  Running synchronous inference ...")
         # test_loss = evaluate(stages, test_data)
         test_loss = evaluate(stages, test_loader)
         print('test loss {:5.2f} | test ppl {:8.2f}'.format(test_loss, math.exp(test_loss)))
-        # wandb.log({"test_loss": test_loss, "test_ppl": math.exp(test_loss)})
         
     # After all batches are processed, save the timing information to a file
     # Remove the first start and end time for each GPU
