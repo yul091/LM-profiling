@@ -14,9 +14,15 @@ def plot_mix(args, ax: plt.axis, node: int = None, start_time: float = None):
     workload = args.workload
     retraining_rate = args.retraining_rate
     
+    
     # Load timing information
     execution = 'coroutine' if coroutine else 'sync'
-    stats_f = f'{output_dir}/timing_info_{execution}_{setting}_{workload}_{retraining_rate}_node{node}.json' if node is not None else f'{output_dir}/timing_info_{execution}_{setting}.json'
+    if args.test_asyncio:
+        stats_f = f'{output_dir}/test_asyncio.json'
+    elif node is None:
+        stats_f = f'{output_dir}/timing_info_{execution}_{setting}.json'
+    else:
+        stats_f = f'{output_dir}/timing_info_{execution}_{setting}_{workload}_{retraining_rate}_node{node}.json'
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
 
@@ -89,6 +95,7 @@ if __name__ == '__main__':
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
     parser.add_argument('--node', type=int, default=None, help='number of nodes for distributed systems')
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
+    parser.add_argument('--test_asyncio', action='store_true')
     args = parser.parse_args()
     
     start_time = None
@@ -101,7 +108,7 @@ if __name__ == '__main__':
     
     if not args.node:
         # Load timing information
-        stats_f = f'{output_dir}/timing_info_{execution}_{setting}.json'
+        stats_f = f'{output_dir}/test_asyncio.json' if args.test_asyncio else f'{output_dir}/timing_info_{execution}_{setting}.json'
         with open(stats_f, 'r') as f:
             timing_info = json.load(f)
             
@@ -116,7 +123,7 @@ if __name__ == '__main__':
         
         # Show the plot
         plt.tight_layout()
-        plt.savefig(f"{output_dir}/timing_info_{execution}_{setting}.png")
+        plt.savefig(f"{stats_f.split('.')[0]}.png")
         plt.show()
         
     else:

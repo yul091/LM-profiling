@@ -88,7 +88,11 @@ def main():
     preloaded_tasks = []
     for i, (data, targets) in enumerate(test_loader):
         # 10% of the time, produce a task with feedback
-        preloaded_tasks.append((data.cuda(0), targets.cuda(num_gpus - 1)))
+        preloaded_tasks.append((
+            data.cuda(0, non_blocking=True), 
+            targets.cuda(num_gpus - 1, non_blocking=True),
+            # Non-blocking transfers allow computation and data transfer to overlap
+        ))
 
     # Add decoder in the end.
     tmp_list.append(Decoder(ntokens, emsize))
@@ -107,21 +111,30 @@ def main():
             await queue.put((data, targets))
             await asyncio.sleep(0)  # Simulates a long-running task
         await queue.put((None, None))  # Signal the end of the dataset
+        
     
-    async def coroutine_evaluate_stage(stage, queue_in, queue_out, device, next_device=None):
+    async def coroutine_evaluate_stage(
+        stage: PipelineStage, 
+        queue_in: asyncio.Queue, 
+        queue_out: asyncio.Queue, 
+        device: int, 
+        next_device: int = None,
+    ):
         while True:
             data, targets = await queue_in.get()
             if data is None:  # None is sent as a signal to shut down.
-                await queue_out.put((None, None))
+                queue_out.put_nowait((None, None))
                 break
             with torch.no_grad():
                 # Record the start time of the stage on this GPU
                 record_time(device, 'start', 'forward', timing_info)
                 output = stage(data)
+                # torch.cuda.current_stream(device).synchronize()  # Wait for the operations to finish
                 record_time(device, 'end', 'forward', timing_info)
                 if next_device:
-                    output = output.to(next_device)  # Move output to the next stage's device.
-            await queue_out.put((output, targets))
+                    output = output.cuda(next_device, non_blocking=True)  # Move output to the next stage's device.
+            queue_out.put_nowait((output, targets))
+            
             
     async def consumer(queue, ntokens):
         total_loss = 0.
@@ -131,7 +144,8 @@ def main():
                 break
             output_flat = output.contiguous().view(-1, ntokens) # (B*T) X C
             total_loss += output.size(0) * criterion(output_flat, targets).item() 
-        return total_loss / (len(test_data) - 1)
+        loss = total_loss / (len(test_data) - 1)
+        print(f"Test Loss: {loss}, perplexity: {math.exp(loss)}")
     
     async def coroutine_evaluate(stages, data_source):
         queues = [asyncio.Queue() for _ in range(len(stages) + 1)]
@@ -152,27 +166,14 @@ def main():
         consumer_coro = consumer(queues[-1], len(vocab))
 
         # Run the coroutines
-        coros = [producer_coro] + stages_coros + [consumer_coro]
-        tasks = [asyncio.create_task(coro) for coro in coros]
-        completed, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-
-        # Handle exceptions if any
-        for task in completed:
-            if task.exception():
-                print("Exception:", task.exception())
-                # Cancel pending tasks
-                for task in pending:
-                    task.cancel()
-                # Rethrow the exception
-                raise task.exception()
+        tasks = [producer_coro] + stages_coros + [consumer_coro]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Instead of awaiting the consumer coroutine again, get the result from the Task object
-        consumer_task = tasks[-1]  # This assumes that the consumer task is the last in the list
-        if consumer_task.done():
-            loss = consumer_task.result()
-        else:
-            loss = None  # or handle accordingly
-        print(f"Test Loss: {loss}, perplexity: {math.exp(loss)}")
+        for result in results:
+            if isinstance(result, Exception):
+                print("Exception:", result)
+                raise result
+        
         
     def evaluate(stages: List[nn.Sequential], data_source: DataLoader):
         total_loss = 0.
@@ -192,7 +193,7 @@ def main():
 
                 output_flat = output.contiguous().view(-1, ntokens) # (B*T) X C
                 # Need to move targets to the device where the output of the pipeline resides.
-                batch_loss = criterion(output_flat, targets.to(output.device)).item()
+                batch_loss = criterion(output_flat, targets.cuda(output.device)).item()
                 total_loss += len(data) * batch_loss
                 
         return total_loss / (len(test_data) - 1)
