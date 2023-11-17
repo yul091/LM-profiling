@@ -21,7 +21,7 @@ N_SAMPLES=$(( 10 * $BATCH ))
 # done
     
 
-CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 python -u coroutine_inference.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 python -u coroutine_inference.py \
     --nlayers $nlayers \
     --setting $SETTING \
     --coroutine \

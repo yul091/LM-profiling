@@ -15,8 +15,9 @@ import torch
 from torch import nn, Tensor
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Subset
-
 from torch.nn import TransformerEncoderLayer
+
+from concurrent.futures import ThreadPoolExecutor
 from dataset import get_data, SentencePairDataset
 from models import Encoder, Decoder, PipelineStage
 from utils import record_time, get_total_params
@@ -90,7 +91,7 @@ def main():
         # 10% of the time, produce a task with feedback
         preloaded_tasks.append((
             data.cuda(0, non_blocking=True), 
-            targets.cuda(num_gpus - 1, non_blocking=True),
+            targets.cuda(num_gpus-1, non_blocking=True),
             # Non-blocking transfers allow computation and data transfer to overlap
         ))
 
@@ -112,6 +113,16 @@ def main():
             await asyncio.sleep(0)  # Simulates a long-running task
         await queue.put((None, None))  # Signal the end of the dataset
         
+        
+    def stage_processing(stage: PipelineStage, data: Tensor, device: int):
+        torch.cuda.set_device(device)
+        with torch.no_grad():
+            # Record the start time of the stage on this GPU
+            record_time(device, 'start', 'forward', timing_info)
+            output = stage(data)
+            record_time(device, 'end', 'forward', timing_info)
+        return output
+        
     
     async def coroutine_evaluate_stage(
         stage: PipelineStage, 
@@ -119,21 +130,21 @@ def main():
         queue_out: asyncio.Queue, 
         device: int, 
         next_device: int = None,
+        executor: ThreadPoolExecutor = None,
     ):
+        # torch.cuda.set_device(device)  # Set the current device to the stage's GPU
         while True:
             data, targets = await queue_in.get()
             if data is None:  # None is sent as a signal to shut down.
-                queue_out.put_nowait((None, None))
+                await queue_out.put((None, None))
                 break
-            with torch.no_grad():
-                # Record the start time of the stage on this GPU
-                record_time(device, 'start', 'forward', timing_info)
-                output = stage(data)
-                # torch.cuda.current_stream(device).synchronize()  # Wait for the operations to finish
-                record_time(device, 'end', 'forward', timing_info)
-                if next_device:
-                    output = output.cuda(next_device, non_blocking=True)  # Move output to the next stage's device.
-            queue_out.put_nowait((output, targets))
+            
+            # Submit stage processing to the ThreadPoolExecutor    
+            future = executor.submit(stage_processing, stage, data, device)
+            output = await asyncio.wrap_future(future)  # Wait for the processing to complete
+            if next_device:
+                output = output.cuda(next_device, non_blocking=True)  # Move output to the next stage's device.
+            await queue_out.put((output, targets))
             
             
     async def consumer(queue, ntokens):
@@ -146,33 +157,62 @@ def main():
             total_loss += output.size(0) * criterion(output_flat, targets).item() 
         loss = total_loss / (len(test_data) - 1)
         print(f"Test Loss: {loss}, perplexity: {math.exp(loss)}")
+        
     
-    async def coroutine_evaluate(stages, data_source):
-        queues = [asyncio.Queue() for _ in range(len(stages) + 1)]
+    async def coroutine_evaluate(
+        stages: List[PipelineStage], 
+        data_source: List[Tuple[Tensor, Tensor]],
+    ):
+        # queues = [asyncio.Queue() for _ in range(len(stages) + 1)]
         
-        # Start the producer coroutine
-        producer_coro = producer(queues[0], data_source)
+        # # Start the producer coroutine
+        # producer_task = asyncio.create_task(producer(queues[0], data_source))
 
-        # Start stage coroutines
-        stages_coros = [coroutine_evaluate_stage(
-            stages[i], 
-            queues[i],  # input queue (of data) for stage i
-            queues[i + 1],  # output queue (of data) for stage i+1
-            device=i, 
-            next_device=i+1 if i < len(stages) - 1 else None,
-        ) for i in range(len(stages))]
+        # # Start stage coroutines
+        # stages_tasks = [asyncio.create_task(coroutine_evaluate_stage(
+        #     stages[i], 
+        #     queues[i],  # input queue (of data) for stage i
+        #     queues[i+1],  # output queue (of data) for stage i+1
+        #     device=i, 
+        #     next_device=i+1 if i < len(stages) - 1 else None,
+        # )) for i in range(len(stages))]
 
-        # Start the consumer coroutine
-        consumer_coro = consumer(queues[-1], len(vocab))
+        # # Start the consumer coroutine
+        # consumer_task = asyncio.create_task(consumer(queues[-1], len(vocab)))
 
-        # Run the coroutines
-        tasks = [producer_coro] + stages_coros + [consumer_coro]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # # Run the coroutines
+        # tasks = [producer_task] + stages_tasks + [consumer_task]
+        # results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        for result in results:
-            if isinstance(result, Exception):
-                print("Exception:", result)
-                raise result
+        # for result in results:
+        #     if isinstance(result, Exception):
+        #         print("Exception:", result)
+        #         raise result
+        
+        # Set up one executor per stage
+        with ThreadPoolExecutor(max_workers=len(stages)) as executor:
+            queues = [asyncio.Queue() for _ in range(len(stages) + 1)]
+
+            # Set up the producer coroutine
+            producer_coro = producer(queues[0], data_source)
+
+            # Set up stage coroutines
+            stage_coros = [coroutine_evaluate_stage(
+                stages[i], 
+                queues[i], 
+                queues[i+1], 
+                device=i,
+                next_device=i+1 if i < len(stages) - 1 else None,
+                executor=executor,
+            ) for i in range(len(stages))]
+
+            # Set up the consumer coroutine
+            consumer_coro = consumer(queues[-1], len(vocab))
+
+            # Run all coroutines concurrently
+            await asyncio.gather(producer_coro, *stage_coros, consumer_coro)
+
+        
         
         
     def evaluate(stages: List[nn.Sequential], data_source: DataLoader):
