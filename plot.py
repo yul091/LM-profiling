@@ -7,7 +7,7 @@ import argparse
         
         
 
-def plot_mix(args, ax: plt.axis, node: int = None, start_time: float = None):
+def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     output_dir = args.output_dir
     coroutine = args.coroutine
     setting = args.setting
@@ -37,7 +37,13 @@ def plot_mix(args, ax: plt.axis, node: int = None, start_time: float = None):
     print("GPUs: ", gpus)
 
     # Define colors for each operation
-    colors = {'forward': 'b', 'forward_loss': 'g', 'backward': 'r'}
+    # base_colors = {'forward': 'b', 'forward_loss': 'g', 'backward': 'r'}
+    base_colors = {
+        'forward': np.array([0, 0, 1]),  # Blue
+        'forward_loss': np.array([0, 1, 0]),  # Green
+        'backward': np.array([1, 0, 0])  # Red
+    }
+    lighten_factor = 0.5
     idle_dict = {}
     latencies = defaultdict(list)
     # Plot the timings for each GPU
@@ -49,13 +55,18 @@ def plot_mix(args, ax: plt.axis, node: int = None, start_time: float = None):
             idles = [0]
         else:
             idles = [start - end for (start, start_label), (end, end_label) in zip(start_times[1:], end_times[:-1])]
-        # print("idles: ", idles)
         idle_dict[f'{gpu_id}'] = idles
         print(f'GPU {gpu_id} idle time statistics: mean {np.mean(idles)}, var {np.var(idles)}, median {np.median(idles)}')
+        # Get the tasks for this GPU
+        tasks = list(zip(start_times, end_times))
+        num_tasks = len(tasks)
         # Plot each task for this GPU, increase the linewidth for a wider bar
-        for (start, start_label), (end, end_label) in zip(start_times, end_times):
-            color = colors.get(start_label, 'k')  # default color is black if label not found
-            ax.hlines(y=gpu_id + 1, xmin=start, xmax=end, colors=color, linewidth=20, label=start_label)
+        for i, ((start, start_label), (end, end_label)) in enumerate(tasks):
+            base_color = base_colors.get(start_label, np.array([0, 0, 0]))  # default color is black if label not found
+            # This will darken the color for each subsequent task
+            color = base_color + (np.array([1, 1, 1]) - base_color) * (i / num_tasks) * lighten_factor
+            color = np.clip(color, 0, 1)
+            ax.hlines(y=gpu_id + 1, xmin=start, xmax=end, linewidth=20, colors=color, label=start_label)
             latencies[start_label].append(end - start)
             min_t = min(min_t, start)
             max_t = max(max_t, end)
@@ -68,7 +79,6 @@ def plot_mix(args, ax: plt.axis, node: int = None, start_time: float = None):
         print(f'\tTotal latency: {max_t - min_t}')
         print(f'\tTotal idle time: {total_idles}')
         print(f'\tRubble rate: {total_idles / (max_t - min_t)}')
-    
 
     # Set plot labels and grid
     ax.set_xlabel('Time (s)')
