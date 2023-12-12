@@ -125,6 +125,7 @@ timing_info = defaultdict(list)
 # Run the stages concurrently
 run_stages_concurrently(data_for_stage1, data_for_stage2, stage1, stage2, timing_info, device1=0, device2=num_gpus)
 output_dir = 'prof'
+print("Timing info: ", timing_info)
 
 os.makedirs(output_dir, exist_ok=True)
 stats_f = f'{output_dir}/test_asyncio.json'

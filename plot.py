@@ -34,6 +34,7 @@ def plot_mix(args, ax: plt.axis, node: int = None, start_time: float = None):
     gpus = list(set(int(key.split('_')[0]) for key in timing_info))  # GPUs are 0-indexed
     init_gpu, last_gpu = min(gpus, default=0), max(gpus, default=0)
     num_gpus = len(gpus)
+    print("GPUs: ", gpus)
 
     # Define colors for each operation
     colors = {'forward': 'b', 'forward_loss': 'g', 'backward': 'r'}
@@ -44,7 +45,11 @@ def plot_mix(args, ax: plt.axis, node: int = None, start_time: float = None):
         min_t, max_t = float('inf'), float('-inf')
         start_times = timing_info.get(f"{gpu_id+init_gpu}_start", [])
         end_times = timing_info.get(f"{gpu_id+init_gpu}_end", [])
-        idles = [start - end for (start, start_label), (end, end_label) in zip(start_times[1:], end_times[:-1])]
+        if len(start_times) == 1:
+            idles = [0]
+        else:
+            idles = [start - end for (start, start_label), (end, end_label) in zip(start_times[1:], end_times[:-1])]
+        # print("idles: ", idles)
         idle_dict[f'{gpu_id}'] = idles
         print(f'GPU {gpu_id} idle time statistics: mean {np.mean(idles)}, var {np.var(idles)}, median {np.median(idles)}')
         # Plot each task for this GPU, increase the linewidth for a wider bar
