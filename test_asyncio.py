@@ -16,10 +16,10 @@ from utils import record_time, get_total_params
 from collections import defaultdict
 
 
-def stage_inference(
+def node_inference(
+        data: torch.Tensor,
         stages: List[PipelineStage], 
         device: int, 
-        data: torch.Tensor,
         timing_info: dict,
     ):
         # torch.cuda.set_device(device)  # Set the current device to the stage's GPU
@@ -28,32 +28,17 @@ def stage_inference(
             record_time(device+i, 'start', 'forward', timing_info)
             hidden = stage(hidden)
             record_time(device+i, 'end', 'forward', timing_info)
-            hidden = hidden.cuda(device+i+1, non_blocking=True) 
+            if i != len(stages) - 1:
+                # Need to send the output to the next stage, except for the last stage
+                hidden = hidden.cuda(device+i+1, non_blocking=True) 
+        return hidden
 
-
-# Dummy stage functions for illustration purposes
-def stage1_inference(data, stages, timing_info, device):
-    torch.cuda.set_device(device)
-    # Your inference code for stage 1 on GPU 0 goes here
-    print(f"Running stage 1 on GPU {torch.cuda.current_device()}")
-    # Simulate some work
-    stage_inference(stages, device, data, timing_info)
-    return 'output 1'
-
-def stage2_inference(data, stages, timing_info, device):
-    torch.cuda.set_device(device)
-    # Your inference code for stage 2 on GPU 1 goes here
-    print(f"Running stage 2 on GPU {torch.cuda.current_device()}")
-    # Simulate some work
-    # torch.cuda._sleep(5000000000)
-    stage_inference(stages, device, data, timing_info)
-    return 'output 2'
 
 # Main function to run both stages concurrently
 def run_stages_concurrently(data1, data2, stages1, stages2, timing_info, device1=0, device2=1):
     with ThreadPoolExecutor(max_workers=2) as executor:
-        future1 = executor.submit(stage1_inference, data1, stages1, timing_info, device1)
-        future2 = executor.submit(stage2_inference, data2, stages2, timing_info, device2)
+        future1 = executor.submit(node_inference, data1, stages1, device1, timing_info)
+        future2 = executor.submit(node_inference, data2, stages2, device2, timing_info)
         
         # Wait for both stages to complete
         result1 = future1.result()
@@ -81,11 +66,12 @@ test_loader = DataLoader(
     shuffle=False,
 )
 nlayers = 24
-num_gpus = 3
+num_gpus = torch.cuda.device_count() // 2
 emsize = 4096
 nhead = 8
 nhid = 4096
 dropout = 0.2
+initial_device = 0
 
 def get_stages(nlayers, num_gpus, emsize, nhead, nhid, dropout, init_device=0):
     # Create pipeline stages
@@ -114,16 +100,24 @@ def get_stages(nlayers, num_gpus, emsize, nhead, nhid, dropout, init_device=0):
     return stages
 
 
-stage1 = get_stages(nlayers, num_gpus, emsize, nhead, nhid, dropout, init_device=0)
-stage2 = get_stages(nlayers, num_gpus, emsize, nhead, nhid, dropout, init_device=num_gpus)
+stage1 = get_stages(nlayers, num_gpus, emsize, nhead, nhid, dropout, init_device=initial_device)
+stage2 = get_stages(nlayers, num_gpus, emsize, nhead, nhid, dropout, init_device=initial_device+num_gpus)
 
-data_for_stage1 = next(iter(test_loader))[0].cuda(0)
-data_for_stage2 = next(iter(test_loader))[0].cuda(num_gpus)
+data_for_stage1 = next(iter(test_loader))[0].cuda(initial_device)
+data_for_stage2 = next(iter(test_loader))[0].cuda(initial_device+num_gpus)
 
 timing_info = defaultdict(list)
 
 # Run the stages concurrently
-run_stages_concurrently(data_for_stage1, data_for_stage2, stage1, stage2, timing_info, device1=0, device2=num_gpus)
+run_stages_concurrently(
+    data_for_stage1, 
+    data_for_stage2, 
+    stage1, 
+    stage2, 
+    timing_info, 
+    device1=initial_device, 
+    device2=initial_device+num_gpus,
+)
 output_dir = 'prof'
 print("Timing info: ", timing_info)
 
