@@ -17,6 +17,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Subset
 from torch.nn.utils.rnn import pad_sequence
 from torch.nn import TransformerEncoderLayer
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from utils import get_total_params, record_time
 from dataset import get_data, SentencePairDataset
@@ -52,9 +53,11 @@ class DeviceQueue:
         # Inference
         if task.feedback is not None:
             # Record the start time of the stage on this GPU
-            record_time(self.cuda_id, 'start', 'forward_loss', timing_info, verbose=verbose)
-            output = stage(task.query)
-            record_time(self.cuda_id, 'end', 'forward_loss', timing_info, verbose=verbose)
+            # record_time(self.cuda_id, 'start', 'forward_loss', timing_info, verbose=verbose)
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+                with record_function("model_inference"):
+                    output = stage(task.query)
+            # record_time(self.cuda_id, 'end', 'forward_loss', timing_info, verbose=verbose)
             if next_cuda_id is not None:
                 task.query = output.cuda(next_cuda_id)  # Move output to the next stage's device
             else:
@@ -62,13 +65,16 @@ class DeviceQueue:
         else:
             with torch.no_grad():
                 # Record the start time of the stage on this GPU
-                record_time(self.cuda_id, 'start', 'forward', timing_info, verbose=verbose)
-                output = stage(task.query)
-                record_time(self.cuda_id, 'end', 'forward',  timing_info, verbose=verbose)
+                # record_time(self.cuda_id, 'start', 'forward', timing_info, verbose=verbose)
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+                    with record_function("model_inference_grad"):
+                        output = stage(task.query)
+                # record_time(self.cuda_id, 'end', 'forward',  timing_info, verbose=verbose)
                 if next_cuda_id is not None:
                     task.query = output.cuda(next_cuda_id)  # Move output to the next stage's device
                 else:
                     task.query = output
+        prof.export_chrome_trace(f'prof_new/trace.json')
         
 
 class Node:
@@ -207,8 +213,6 @@ class DistributedTransformerPipeline:
         )
         self.total_tasks = len(self.dataloader)
         self.task_completed = 0
-        # self.median_length = torch.median(torch.tensor([data.size(0) for data, target in self.dataset]))
-        # print(f"Median length of the dataset: {self.median_length}")
         
         # Create preloaded data
         if self.use_preload:
@@ -381,15 +385,19 @@ class DistributedTransformerPipeline:
             batch_loss = self.criterion(output_flat, task.feedback)
             # print(f"query shape: {task.query.shape}, target shape: {task.feedback.shape}")
             # Backpropagate the loss
-            record_time(node.devices[-1].cuda_id, 'start', 'backward', timing_info, verbose=self.verbose)
-            batch_loss.backward()
+            # record_time(node.devices[-1].cuda_id, 'start', 'backward', timing_info, verbose=self.verbose)
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+                with record_function("model_backward"):
+                    batch_loss.backward()
             # torch.nn.utils.clip_grad_norm_(nn.Sequential(*stages).parameters(), 0.5)
             optimizer.step()
-            record_time(node.devices[-1].cuda_id, 'end', 'backward', timing_info, verbose=self.verbose)
+            # record_time(node.devices[-1].cuda_id, 'end', 'backward', timing_info, verbose=self.verbose)
             self.task_completed += 1
             if self.verbose:
                 print(f"[node {node.id}] batch loss: {batch_loss.item()}")
             total_loss += task.query.size(0) * batch_loss.item() 
+            
+            prof.export_chrome_trace(f'prof_new/trace.json')
         
         print(f"[node {node.id}] total loss: {total_loss/len(self.dataset)}, perplexity: {math.exp(total_loss/len(self.dataset))}")
         # return total_loss / len(self.dataset)
@@ -488,5 +496,7 @@ if __name__ == "__main__":
     
     dppl = DistributedTransformerPipeline(args)
     asyncio.run(dppl.main())
-    dppl.save_profiling()
+    # dppl.save_profiling()
+    # Print the profiler output
+    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     

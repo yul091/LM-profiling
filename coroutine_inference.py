@@ -141,7 +141,8 @@ def main():
             
             # Submit stage processing to the ThreadPoolExecutor    
             future = executor.submit(stage_processing, stage, data, device)
-            output = await asyncio.wrap_future(future)  # Wait for the processing to complete
+            # output = await asyncio.wrap_future(future)  # Wait for the processing to complete
+            output = future.result()
             if next_device:
                 output = output.cuda(next_device, non_blocking=True)  # Move output to the next stage's device.
             await queue_out.put((output, targets))
