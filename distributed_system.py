@@ -71,13 +71,18 @@ class Node:
         self.node_id = node_id
         self.num_devices = num_devices
         self.devices = [Device(node_id * num_devices + device) for device in range(num_devices)]
-        self.queue = queue.Queue()
+        # self.queue = queue.Queue()
         
     def get_device_from_job(self, job: Job) -> Device:
         return self.devices[job.cuda_id % self.num_devices]
     
     def get_next_device_from_job(self, job: Job) -> Device:
         return self.devices[(job.cuda_id + 1) % self.num_devices]
+    
+    def put_in_device_queue(self, task: int):
+        # Put task in each device queue
+        for device in self.devices:
+            device.queue.put(task)
         
         
 # Define the Pipeline class
@@ -102,6 +107,9 @@ class DistributedLLM:
         self.num_nodes = args.num_nodes
         self.num_devices_per_node = num_gpus // self.num_nodes
         self.nodes = [Node(id, self.num_devices_per_node) for id in range(self.num_nodes)]
+        print("Nodes info: ", [vars(device) for node in self.nodes for device in node.devices])
+        self.timing_infos = [defaultdict(list) for _ in range(self.num_nodes)]
+        self.job_batches = [defaultdict(list) for _ in range(self.num_nodes)]
         
         # Dataset arguments
         self.verbose = args.verbose
@@ -118,7 +126,7 @@ class DistributedLLM:
         self.criterion = nn.CrossEntropyLoss(ignore_index=self.vocab['<pad>'])
         self.preloaded_tasks = self.get_preloaded_dataset()
         self.completed_tasks = 0
-        self.task_completion_lock = Lock()
+        # self.task_completion_lock = Lock()
         
         # Model arguments
         self.distributed_stages = []
@@ -280,11 +288,13 @@ class DistributedLLM:
             if task is None:
                 print("Scheduler finished scheduling tasks")
                 for node in nodes:
-                    node.queue.put(None)
+                    # node.queue.put(None)
+                    node.put_in_device_queue(None)
                 break
             node_id = random.randint(0, self.num_nodes - 1)
             # Each node queue store task IDs
-            nodes[node_id].queue.put(task)
+            # nodes[node_id].queue.put(task)
+            nodes[node_id].put_in_device_queue(task)
             print("Global scheduler scheduled task {} to node {}".format(task, node_id))
             
             
@@ -292,6 +302,7 @@ class DistributedLLM:
         # Device scheduler
         while True:
             for i, device in enumerate(node.devices):
+                print("device {} queue: {}".format(i, device.queue.queue))
                 task: int = device.queue.get() # ID
                 if task is None:
                     print(f"Device scheduler finished scheduling tasks for node {node.node_id}")
@@ -300,7 +311,7 @@ class DistributedLLM:
                 job = self.preloaded_tasks[node.node_id][task].get_job(i) # Job
                 job.cuda_id = device.cuda_id
                 job.isLast = i == len(node.devices) - 1
-                print(f"task ID: {task}, job: {job}")
+                print(f"[device_id={i}] task ID: {task}, job: {vars(job)}")
                 # Put the job into the job batch for execution
                 if device.isGPUavailable and job.in_degree == 0:
                     job_batch[device.cuda_id].append(job)
@@ -314,19 +325,22 @@ class DistributedLLM:
             
     def job_inference(self, node: Node, job_batch: Dict[int, List[Job]], stage: PipelineStage, timing_info: dict):
         while True: 
+            # print("Job execution batch: {}".format(job_batch))
             # print("Node {} - completed {} tasks".format(node.node_id, self.completed_tasks))
             if not job_batch[stage.device]: # empty execution batch
                 continue
-            job = job_batch[stage.device].pop(0)
-            # print(f"Job: {job}")
+            job = job_batch[stage.device].pop(0) # FIFO
+            print(f"Job: {vars(job)}, completed tasks: {self.completed_tasks}, total tasks: {self.total_tasks}")
             input = job.val.cuda(job.cuda_id, non_blocking=True)
             
             device = node.get_device_from_job(job)
+            # print(f"Device {device.cuda_id} is executing job {job.task_id} on stage {stage.device} ...")
             record_time(job.cuda_id, 'start', 'forward', timing_info)
             device.isGPUavailable = False # disable GPU availability
             output = stage(input)
             device.isGPUavailable = True # enable GPU availability
             record_time(job.cuda_id, 'end', 'forward', timing_info)
+            # print(f"Device {device.cuda_id} finished executing job {job.task_id} on stage {stage.device}")
             
             if job.isLast:
                 # with self.task_completion_lock:
@@ -336,48 +350,46 @@ class DistributedLLM:
             else:
                 # Update the task: the in-degree of the next job is 0, the val is the output
                 task = self.preloaded_tasks[node.node_id][job.task_id]
-                # next_job = task.get_job(job.cuda_id + 1)
-                # next_job.in_degree, next_job.val = 0, output
-                task.jobs[(job.cuda_id + 1) % self.num_devices_per_node].val = output
-                task.jobs[(job.cuda_id + 1) % self.num_devices_per_node].in_degree = 0
+                next_job = task.get_job(job.cuda_id + 1)
+                next_job.in_degree, next_job.val = 0, output
+                # task.jobs[(job.cuda_id + 1) % self.num_devices_per_node].val = output
+                # task.jobs[(job.cuda_id + 1) % self.num_devices_per_node].in_degree = 0
+                # print(f"[after modification] the next job: {vars(next_job)}")
             
             
     def consumer(self, node: Node, stages: List[PipelineStage], job_batch: Dict[int, List[Task]], timing_info: dict):
-        task = node.queue.get() # ID
-        # Put the task ID into each device queue
-        for i, device in enumerate(node.devices):
-            device.queue.put(task)
+        # task = node.queue.get() # ID
+        # # Put the task ID into each device queue
+        # for i, device in enumerate(node.devices):
+        #     device.queue.put(task)
         
         with ThreadPoolExecutor(max_workers=len(stages)+1) as executor:
-            while True: 
-                future1 = executor.submit(
-                    self.deviceScheduler,
+            future1 = executor.submit(
+                self.deviceScheduler,
+                node, 
+                job_batch,
+            )
+            for stage in stages:
+                future = executor.submit(
+                    self.job_inference,
                     node, 
                     job_batch,
+                    stage,
+                    timing_info,
                 )
-                for stage in stages:
-                    future = executor.submit(
-                        self.job_inference,
-                        node, 
-                        job_batch,
-                        stage,
-                        timing_info,
-                    )
                 
-                # # Wait for all jobs to finish
-                # for future in future2:
-                #     future.result()
-                # # Wait for the device scheduler to finish
-                # future1.result()
-                
-                # Check if the task is finished
-                if self.completed_tasks >= self.total_tasks:
-                    break
+            # # Wait for all jobs to finish
+            # for future in future2:
+            #     future.result()
+            # # Wait for the device scheduler to finish
+            # future1.result()
+            
+            # # Check if the task is finished
+            # if self.completed_tasks >= self.total_tasks:
+            #     break
         
             
     def main(self):
-        self.timing_infos = [defaultdict(list) for _ in range(self.num_nodes)]
-        self.job_batches = [defaultdict(list) for _ in range(self.num_nodes)]
         taskQueue = queue.Queue()
         
         with ThreadPoolExecutor(max_workers=self.num_nodes+2) as executor:
