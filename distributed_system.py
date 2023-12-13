@@ -11,6 +11,7 @@ from typing import List, Dict, Union
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from threading import Lock
 import torch
 from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
@@ -117,6 +118,7 @@ class DistributedLLM:
         self.criterion = nn.CrossEntropyLoss(ignore_index=self.vocab['<pad>'])
         self.preloaded_tasks = self.get_preloaded_dataset()
         self.completed_tasks = 0
+        self.task_completion_lock = Lock()
         
         # Model arguments
         self.distributed_stages = []
@@ -298,6 +300,7 @@ class DistributedLLM:
                 job = self.preloaded_tasks[node.node_id][task].get_job(i) # Job
                 job.cuda_id = device.cuda_id
                 job.isLast = i == len(node.devices) - 1
+                print(f"task ID: {task}, job: {job}")
                 # Put the job into the job batch for execution
                 if device.isGPUavailable and job.in_degree == 0:
                     job_batch[device.cuda_id].append(job)
@@ -310,11 +313,12 @@ class DistributedLLM:
             
             
     def job_inference(self, node: Node, job_batch: Dict[int, List[Job]], stage: PipelineStage, timing_info: dict):
-        while self.completed_tasks < self.total_tasks: 
-            print("Node {} - completed {} tasks".format(node.node_id, self.completed_tasks))
+        while True: 
+            # print("Node {} - completed {} tasks".format(node.node_id, self.completed_tasks))
             if not job_batch[stage.device]: # empty execution batch
                 continue
             job = job_batch[stage.device].pop(0)
+            # print(f"Job: {job}")
             input = job.val.cuda(job.cuda_id, non_blocking=True)
             
             device = node.get_device_from_job(job)
@@ -325,7 +329,10 @@ class DistributedLLM:
             record_time(job.cuda_id, 'end', 'forward', timing_info)
             
             if job.isLast:
+                # with self.task_completion_lock:
                 self.completed_tasks += 1
+                if self.completed_tasks >= self.total_tasks:
+                    break
             else:
                 # Update the task: the in-degree of the next job is 0, the val is the output
                 task = self.preloaded_tasks[node.node_id][job.task_id]
@@ -341,7 +348,7 @@ class DistributedLLM:
         for i, device in enumerate(node.devices):
             device.queue.put(task)
         
-        with ThreadPoolExecutor(max_workers=16) as executor:
+        with ThreadPoolExecutor(max_workers=len(stages)+1) as executor:
             while True: 
                 future1 = executor.submit(
                     self.deviceScheduler,
@@ -364,17 +371,17 @@ class DistributedLLM:
                 # future1.result()
                 
                 # Check if the task is finished
-                if self.completed_tasks == self.total_tasks:
+                if self.completed_tasks >= self.total_tasks:
                     break
         
             
     def main(self):
         self.timing_infos = [defaultdict(list) for _ in range(self.num_nodes)]
         self.job_batches = [defaultdict(list) for _ in range(self.num_nodes)]
+        taskQueue = queue.Queue()
         
         with ThreadPoolExecutor(max_workers=self.num_nodes+2) as executor:
             # Create the producer thread
-            taskQueue = queue.Queue()
             # producerThread = threading.Thread(target=self.producer, args=(taskQueue,))
             # producerThread.start()
             future1 = executor.submit(self.producer, taskQueue)
