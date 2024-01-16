@@ -64,9 +64,8 @@ def batchify(
     return sentences
         
 
-def get_data(
-    batch_size: int = 20, 
-    eval_batch_size: int = 20, 
+def get_data( 
+    block_size: int = 128, 
     setting: str = 'identical', 
     min_len: int = 10, 
     max_len: int = 128,
@@ -82,9 +81,9 @@ def get_data(
     val_data = data_process(vocab, tokenizer, val_iter) # tensor(#val_tokens)
     test_data = data_process(vocab, tokenizer, test_iter) # tensor(#test_tokens)
 
-    train_data = batchify(train_data, batch_size, setting, min_len, max_len, bptt)
-    val_data = batchify(val_data, eval_batch_size, setting, min_len, max_len, bptt)
-    test_data = batchify(test_data, eval_batch_size, setting, min_len, max_len, bptt)
+    train_data = batchify(train_data, block_size, setting, min_len, max_len, bptt)
+    val_data = batchify(val_data, block_size, setting, min_len, max_len, bptt)
+    test_data = batchify(test_data, block_size, setting, min_len, max_len, bptt)
     
     return train_data, val_data, test_data, vocab
 
