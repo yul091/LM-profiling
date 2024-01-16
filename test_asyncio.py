@@ -30,9 +30,10 @@ class Node:
         
         
 class Task:
-    def __init__(self, task_id: int, query: Tensor, feedback: Tensor = None, node_id: int = 0):
+    def __init__(self, task_id: int, query: Tensor, feedback: Tensor = None, node_id: int = 0, num_gpus_per_node: int = 1):
         self.task_id = task_id
         self.query = query
+        self.hiddens = [query] + [None for _ in range(num_gpus_per_node - 1)]
         self.feedback = feedback
         self.node_id = node_id
         
@@ -50,12 +51,14 @@ def get_preloaded_dataset(distributed_nodes: List[Node], setting: str, dataloade
                         query=batch[0].cuda(node.init_device), 
                         feedback=batch[1].cuda(node.last_device), 
                         node_id=nodeID,
+                        num_gpus_per_node=node.num_gpus_per_node,
                     )
                 else:
                     task = Task(
                         task_id=i,
                         query=batch[0].cuda(node.init_device), 
                         node_id=nodeID,
+                        num_gpus_per_node=node.num_gpus_per_node,
                     )
                 preloaded_tasks[node.node_id].append(task)
                 
@@ -68,12 +71,14 @@ def get_preloaded_dataset(distributed_nodes: List[Node], setting: str, dataloade
                         query=batch[0].cuda(node.init_device), 
                         feedback=batch[1].cuda(node.last_device), 
                         node_id=nodeID, 
+                        num_gpus_per_node=node.num_gpus_per_node,
                     )
                 else:
                     task = Task(
                         task_id=i,
                         query=batch[0].cuda(node.init_device), 
                         node_id=nodeID,
+                        num_gpus_per_node=node.num_gpus_per_node,
                     )
                 preloaded_tasks[node.node_id].append(task)
     return preloaded_tasks
@@ -138,48 +143,59 @@ def get_stages(ntokens, nlayers, num_gpus, emsize, nhead, nhid, dropout, init_de
     return stages
 
 
-def task_inference(
-    task: Task,
-    stages: List[PipelineStage], 
-    node: Node, 
-    timing_info: dict,
+def device_inference(
+    stage: PipelineStage, 
+    stageID: int,
+    timing_info: dict, 
+    preloaded_tasks: List[Task], 
+    deviceQueue: queue.Queue,
+    nextdeviceQueue: queue.Queue = None,
 ):
-    # torch.cuda.set_device(device) # Set the current device to the stage's GPU
-    hidden, feedback = task.query.clone(), task.feedback
-    device = node.init_device
-    for i, stage in enumerate(stages):
-        record_time(device+i, 'start', 'forward', timing_info)
-        hidden = stage(hidden)
-        record_time(device+i, 'end', 'forward', timing_info)
-        if i != len(stages) - 1:
+    device = stage.device
+    while True:
+        taskID: int = deviceQueue.get()
+        if taskID is None:
+            print("Stage {} finished inference".format(stage.device))
+            if nextdeviceQueue is not None:
+                nextdeviceQueue.put(None)
+            break
+        
+        task = preloaded_tasks[taskID]
+        assert task.task_id == taskID
+        hidden = task.hiddens[stageID]
+        if hidden is None:
+            print("Stage {} waiting for task {}".format(stage.device, taskID))
+            continue
+            
+        record_time(device, 'start', 'forward', timing_info)
+        output = stage(hidden)
+        record_time(device, 'end', 'forward', timing_info)
+        if nextdeviceQueue is not None:
             # Need to send the output to the next stage, except for the last stage
-            hidden = hidden.cuda(device+i+1, non_blocking=True) 
-    return hidden
+            task.hiddens[stageID+1] = output.cuda(device+1, non_blocking=True)
+            nextdeviceQueue.put(taskID)
 
 
 def node_inference(
     node: Node,
-    tasks: List[Task],
+    preloaded_tasks: List[Task],
     stages: List[PipelineStage], 
     timing_info: dict,
 ):
     # We use 16 workers to simulateously get task from the queue and inference
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        while True:
-            taskID: int = node.device_queues[0].get()
-            if taskID is None:
-                print("Node {} finished inference".format(node.node_id))
-                break
-            task = tasks[taskID]
-            assert task.task_id == taskID
+    with ThreadPoolExecutor(max_workers=len(stages)) as executor:
+        for stageID, stage in enumerate(stages):
             future = executor.submit(
-                task_inference, 
-                task, 
-                stages, 
-                node, 
-                timing_info,
+                device_inference, 
+                stage, 
+                stageID,
+                timing_info, 
+                preloaded_tasks,
+                node.device_queues[stageID],
+                node.device_queues[stageID+1] if stageID != len(stages) - 1 else None,
             )
-        print("Node {} finished inference".format(node.node_id))
+            
+    print("Node {} finished inference".format(node.node_id))
 
 
 def run_stages_concurrently(preloaded_tasks, distributed_stages, timing_info, distributed_nodes):
