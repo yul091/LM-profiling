@@ -139,13 +139,14 @@ def get_stages(ntokens, nlayers, num_gpus, emsize, nhead, nhid, dropout, init_de
 
 
 def task_inference(
-    data: torch.Tensor,
+    task: Task,
     stages: List[PipelineStage], 
-    device: int, 
+    node: Node, 
     timing_info: dict,
 ):
-    # torch.cuda.set_device(device)  # Set the current device to the stage's GPU
-    hidden = data.clone()
+    # torch.cuda.set_device(device) # Set the current device to the stage's GPU
+    hidden, feedback = task.query.clone(), task.feedback
+    device = node.init_device
     for i, stage in enumerate(stages):
         record_time(device+i, 'start', 'forward', timing_info)
         hidden = stage(hidden)
@@ -162,23 +163,25 @@ def node_inference(
     stages: List[PipelineStage], 
     timing_info: dict,
 ):
-    # qsize = node.device_queues[0].qsize() # get node device queue[0] size
-    # with ThreadPoolExecutor(max_workers=16) as executor:
-    # for task in tqdm(tasks):
-    #         future = executor.submit(task_inference, task, stages, node.init_device, timing_info) 
-    while True:
-        taskID: int = node.device_queues[0].get()
-        if taskID is None:
-            print("Node {} finished inference".format(node.node_id))
-            break
-        task = tasks[taskID]
-        assert task.task_id == taskID
-        task_inference(task.query, stages, node.init_device, timing_info)
-        
-    return "Node {} finished inference".format(node.node_id)
+    # We use 16 workers to simulateously get task from the queue and inference
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        while True:
+            taskID: int = node.device_queues[0].get()
+            if taskID is None:
+                print("Node {} finished inference".format(node.node_id))
+                break
+            task = tasks[taskID]
+            assert task.task_id == taskID
+            future = executor.submit(
+                task_inference, 
+                task, 
+                stages, 
+                node, 
+                timing_info,
+            )
+        print("Node {} finished inference".format(node.node_id))
 
 
-# Main function to run both stages concurrently
 def run_stages_concurrently(preloaded_tasks, distributed_stages, timing_info, distributed_nodes):
     with ThreadPoolExecutor(max_workers=len(distributed_nodes)) as executor:
         for nodeID, node in enumerate(distributed_nodes):
