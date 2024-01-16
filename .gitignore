@@ -1,6 +1,7 @@
-prof/*
-figures/*
-# scripts/*
-logging/*
-results/*
-wandb/*
+prof
+prof_async
+figures
+# scripts
+logging
+results
+wandb

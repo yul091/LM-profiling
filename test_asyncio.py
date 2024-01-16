@@ -38,7 +38,12 @@ class Task:
         self.node_id = node_id
         
         
-def get_preloaded_dataset(distributed_nodes: List[Node], setting: str, dataloader: DataLoader, retraining_rate: float = 0.1) -> Dict[int, List[Task]]:
+def get_preloaded_dataset(
+    distributed_nodes: List[Node], 
+    setting: str, 
+    dataloader: DataLoader, 
+    retraining_rate: float = 0.1,
+) -> Dict[int, List[Task]]:
     print("Using preloaded data ...")
     preloaded_tasks = defaultdict(list)
     for nodeID, node in enumerate(distributed_nodes):
@@ -118,7 +123,16 @@ def globalScheduler(taskQueue: queue.Queue, distributed_nodes: List[Node]):
         print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
 
 
-def get_stages(ntokens, nlayers, num_gpus, emsize, nhead, nhid, dropout, init_device=0):
+def get_stages(
+    ntokens: int, 
+    nlayers: int, 
+    num_gpus: int, 
+    emsize: int, 
+    nhead: int, 
+    nhid: int, 
+    dropout: float, 
+    init_device: int = 0,
+):
     # Create pipeline stages
     partition_len = ((nlayers - 1) // num_gpus) + 1
     # Add encoder in the beginning.
@@ -198,7 +212,12 @@ def node_inference(
     print("Node {} finished inference".format(node.node_id))
 
 
-def run_stages_concurrently(preloaded_tasks, distributed_stages, timing_info, distributed_nodes):
+def run_stages_concurrently(
+    preloaded_tasks: Dict[int, List[Task]],
+    distributed_stages: List[List[PipelineStage]], 
+    timing_infos: List[dict], 
+    distributed_nodes: List[Node],
+):
     with ThreadPoolExecutor(max_workers=len(distributed_nodes)) as executor:
         for nodeID, node in enumerate(distributed_nodes):
             future = executor.submit(
@@ -206,7 +225,7 @@ def run_stages_concurrently(preloaded_tasks, distributed_stages, timing_info, di
                 node, 
                 preloaded_tasks[nodeID], 
                 distributed_stages[nodeID], 
-                timing_info,
+                timing_infos[nodeID],
             )
         
         
@@ -285,7 +304,7 @@ def main():
     ]
 
     # Run the stages concurrently
-    timing_info = defaultdict(list)
+    timing_infos = [defaultdict(list) for _ in range(num_nodes)]
     task_queue = queue.Queue()
     
     with ThreadPoolExecutor(max_workers=3) as executor:
@@ -301,21 +320,25 @@ def main():
             task_queue,
             distributed_nodes,
         )
-            
         future3 = executor.submit(
             run_stages_concurrently,  
             preloaded_tasks, 
             distributed_stages,
-            timing_info,
+            timing_infos,
             distributed_nodes,
         )
 
     os.makedirs(output_dir, exist_ok=True)
-    stats_f = f'{output_dir}/test_asyncio.json'
-    with open(stats_f, 'w') as f:
-        json.dump(timing_info, f, indent=4)
-    
-        
+    for nodeID, timing_info in enumerate(timing_infos):
+        # Remove the first start and end time for each GPU
+        gpus = list(set(int(key.split('_')[0]) for key in timing_info))
+        for gpu_id in gpus:
+            timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
+            timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
+        stats_f = f'{output_dir}/timing_info_coroutine_{setting}_{workload}_{retraining_rate}_node{nodeID}.json'
+        # stats_f = f'{output_dir}/test_asyncio.json'
+        with open(stats_f, 'w') as f:
+            json.dump(timing_info, f, indent=4)
     
         
 if __name__ == '__main__':
