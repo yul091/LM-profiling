@@ -70,7 +70,7 @@ class PipelineStage(nn.Module):
         super(PipelineStage, self).__init__()
         self.layers = nn.Sequential(*layers).cuda(device)
         self.device = device
-        self.register_backward_hook(partial(self.backward_hook, timing_info=timing_info))
+        self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
 
     def forward(self, x):
         return self.layers(x)
@@ -83,8 +83,10 @@ class PipelineStage(nn.Module):
         grad_output: Tuple[torch.Tensor], 
         timing_info: dict = None,
     ):
-        print(f"Backward pass started for {module}")
+        # print(f"Backward pass started for {module}")
         start_time = time.time()
+        if f"{self.device+1}_start" in timing_info:
+            timing_info[f"{self.device+1}_end"].append((start_time, "backward"))
         timing_info[f"{self.device}_start"].append((start_time, "backward"))
         
     
@@ -167,6 +169,7 @@ if __name__ == '__main__':
     
     # Backward pass (integration test)
     loss.backward()
+    timing_info['0_end'].append((time.time(), 'backward'))
     print(loss)
     print(stages[-1].layers[-1].decoder.weight.grad)
     print(stages[0].layers[0].encoder.weight.grad)
