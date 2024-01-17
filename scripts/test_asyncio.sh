@@ -1,10 +1,10 @@
 NUM_NODES=2
-NUM_SAMPLES=200
-WORKLOAD=all
+NUM_SAMPLES=2000
+WORKLOAD=poisson
 SETTING=random
 OUTPUT_DIR=prof_async
 
-CUDA_VISIBLE_DEVICES=0,1,4,5 python test_asyncio.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python test_asyncio.py \
     --num_nodes $NUM_NODES \
     --n_samples $NUM_SAMPLES \
     --workload $WORKLOAD \

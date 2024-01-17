@@ -182,7 +182,12 @@ def device_inference(
             continue
             
         record_time(device, 'start', 'forward', timing_info)
-        output = stage(hidden)
+        if task.feedback is not None:
+            # This is a retraining task
+            output = stage(hidden)
+        else:
+            with torch.no_grad():
+                output = stage(hidden)
         record_time(device, 'end', 'forward', timing_info)
         if nextdeviceQueue is not None:
             # Need to send the output to the next stage, except for the last stage
