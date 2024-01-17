@@ -1,6 +1,6 @@
 NUM_NODES=2
 NUM_SAMPLES=2000
-WORKLOAD=poisson
+WORKLOAD=all
 SETTING=random
 OUTPUT_DIR=prof_async
 

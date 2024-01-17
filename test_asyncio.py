@@ -180,15 +180,17 @@ def device_inference(
         if hidden is None:
             print("Stage {} waiting for task {}".format(stage.device, taskID))
             continue
-            
-        record_time(device, 'start', 'forward', timing_info)
+        
         if task.feedback is not None:
             # This is a retraining task
+            record_time(device, 'start', 'forward_loss', timing_info)
             output = stage(hidden)
+            record_time(device, 'end', 'forward_loss', timing_info)
         else:
+            record_time(device, 'start', 'forward', timing_info)
             with torch.no_grad():
                 output = stage(hidden)
-        record_time(device, 'end', 'forward', timing_info)
+            record_time(device, 'end', 'forward', timing_info)
         if nextdeviceQueue is not None:
             # Need to send the output to the next stage, except for the last stage
             task.hiddens[stageID+1] = output.cuda(device+1, non_blocking=True)
@@ -254,6 +256,7 @@ def main():
         Node(i, num_gpus_per_node, i * num_gpus_per_node) 
         for i in range(num_nodes)
     ]
+    timing_infos = [defaultdict(list) for _ in range(num_nodes)]
     
     # Example data for each stage
     _, _, test_data, vocab = get_data(block_size=block_size, setting=setting)
@@ -309,7 +312,6 @@ def main():
     ]
 
     # Run the stages concurrently
-    timing_infos = [defaultdict(list) for _ in range(num_nodes)]
     task_queue = queue.Queue()
     
     with ThreadPoolExecutor(max_workers=3) as executor:
