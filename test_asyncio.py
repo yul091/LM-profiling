@@ -6,17 +6,17 @@ import json
 import queue
 import random
 import torch
+import torch.nn as nn
 from torch import Tensor
 # import asyncio
 from tqdm import tqdm
 from typing import List, Dict
-from torch.nn import TransformerEncoderLayer
 from torch.nn.utils.rnn import pad_sequence
 from dataset import get_data, SentencePairDataset
-from models import Encoder, Decoder, PipelineStage
+from models import PipelineStage, get_stages
 from concurrent.futures import ThreadPoolExecutor
 from torch.utils.data import DataLoader, Subset
-from utils import record_time, get_total_params
+from utils import record_time
 from collections import defaultdict
 
 
@@ -123,40 +123,6 @@ def globalScheduler(taskQueue: queue.Queue, distributed_nodes: List[Node]):
         print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
 
 
-def get_stages(
-    ntokens: int, 
-    nlayers: int, 
-    num_gpus: int, 
-    emsize: int, 
-    nhead: int, 
-    nhid: int, 
-    dropout: float, 
-    init_device: int = 0,
-):
-    # Create pipeline stages
-    partition_len = ((nlayers - 1) // num_gpus) + 1
-    # Add encoder in the beginning.
-    tmp_list = [Encoder(ntokens, emsize, dropout)]
-    stages = []
-    # Add all the necessary transformer blocks
-    for i in range(nlayers):
-        transformer_block = TransformerEncoderLayer(emsize, nhead, nhid, dropout)
-        if i != 0 and i % (partition_len) == 0:
-            # Create a new pipeline stage
-            stage_device = i // (partition_len) - 1 + init_device
-            print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device))
-            stages.append(PipelineStage(tmp_list, stage_device))
-            tmp_list = []
-        tmp_list.append(transformer_block)
-        
-    # Add decoder in the end.
-    tmp_list.append(Decoder(ntokens, emsize))
-    stages.append(PipelineStage(tmp_list, stage_device + 1))
-    print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device + 1))
-    print ('Total parameters in model: {:,}'.format(get_total_params(torch.nn.Sequential(*stages))))
-    return stages
-
-
 def device_inference(
     stage: PipelineStage, 
     stageID: int,
@@ -164,6 +130,8 @@ def device_inference(
     preloaded_tasks: List[Task], 
     deviceQueue: queue.Queue,
     nextdeviceQueue: queue.Queue = None,
+    criterion: nn.CrossEntropyLoss = nn.CrossEntropyLoss(),
+    init_device: int = 0,
 ):
     device = stage.device
     while True:
@@ -186,6 +154,16 @@ def device_inference(
             record_time(device, 'start', 'forward_loss', timing_info)
             output = stage(hidden)
             record_time(device, 'end', 'forward_loss', timing_info)
+            if nextdeviceQueue is None:
+                # Backprop on the last stage
+                # print("Stage {} start backward propagation for task {}".format(stage.device, taskID))
+                output_flat = output.contiguous().view(-1, output.size(-1)) # (B * T, C)
+                # print("output_flat shape: {}, feedback shape: {}".format(output_flat.shape, task.feedback.shape))
+                loss = criterion(output_flat, task.feedback)
+                # print("loss: {}, start loss backward ...".format(loss))
+                loss.backward()
+                record_time(init_device, 'end', 'backward', timing_info)
+                # print("Stage {} finish backward propagation for task {} !".format(stage.device, taskID))
         else:
             record_time(device, 'start', 'forward', timing_info)
             with torch.no_grad():
@@ -214,6 +192,8 @@ def node_inference(
                 preloaded_tasks,
                 node.device_queues[stageID],
                 node.device_queues[stageID+1] if stageID != len(stages) - 1 else None,
+                criterion=nn.CrossEntropyLoss(),
+                init_device=node.init_device,
             )
             
     print("Node {} finished inference".format(node.node_id))
@@ -272,6 +252,7 @@ def main():
     }
 
     if n_samples > 0:
+        n_samples = min(n_samples, len(dataset))
         if setting == 'random':
             indices = random.sample(range(len(dataset)), n_samples)
         elif setting == 'variant':
@@ -306,6 +287,7 @@ def main():
         get_stages(
             num_gpus=num_gpus_per_node,
             init_device=distributed_nodes[nodeID].init_device,
+            timing_info=timing_infos[nodeID],
             **model_kwargs,
         )
         for nodeID in range(num_nodes)
@@ -337,13 +319,12 @@ def main():
 
     os.makedirs(output_dir, exist_ok=True)
     for nodeID, timing_info in enumerate(timing_infos):
-        # Remove the first start and end time for each GPU
-        gpus = list(set(int(key.split('_')[0]) for key in timing_info))
-        for gpu_id in gpus:
-            timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
-            timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
+        # # Remove the first start and end time for each GPU
+        # gpus = list(set(int(key.split('_')[0]) for key in timing_info))
+        # for gpu_id in gpus:
+        #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
+        #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
         stats_f = f'{output_dir}/timing_info_coroutine_{setting}_{workload}_{retraining_rate}_node{nodeID}.json'
-        # stats_f = f'{output_dir}/test_asyncio.json'
         with open(stats_f, 'w') as f:
             json.dump(timing_info, f, indent=4)
     
@@ -356,9 +337,9 @@ if __name__ == '__main__':
     parser.add_argument('--n_samples', type=int, default=200)
     parser.add_argument('--setting', type=str, default='random', choices=['identical','random', 'variant'], help='workload setting')
     parser.add_argument('--nlayers', type=int, default=24)
-    parser.add_argument('--emsize', type=int, default=4096)
+    parser.add_argument('--emsize', type=int, default=2048)
     parser.add_argument('--nhead', type=int, default=8)
-    parser.add_argument('--nhid', type=int, default=4096)
+    parser.add_argument('--nhid', type=int, default=2048)
     parser.add_argument('--dropout', type=float, default=0.2)
     parser.add_argument('--batch_size', type=int, default=25)
     parser.add_argument('--block_size', type=int, default=128)

@@ -89,7 +89,13 @@ class PipelineStage(nn.Module):
             timing_info[f"{self.device+1}_end"].append((start_time, "backward"))
         timing_info[f"{self.device}_start"].append((start_time, "backward"))
         
-    
+        
+def get_total_params(module: torch.nn.Module):
+    total_params = 0
+    for param in module.parameters():
+        total_params += param.numel()
+    return total_params
+
     
 def get_stages(
     ntokens: int, 
@@ -122,7 +128,7 @@ def get_stages(
     tmp_list.append(Decoder(ntokens, emsize))
     stages.append(PipelineStage(tmp_list, stage_device + 1, timing_info))
     print("Put stage {} on device {}".format([layer.__class__.__name__ for layer in tmp_list], stage_device + 1))
-    # print ('Total parameters in model: {:,}'.format(get_total_params(torch.nn.Sequential(*stages))))
+    print ('Total parameters in model: {:,}'.format(get_total_params(torch.nn.Sequential(*stages))))
     return stages
 
 
