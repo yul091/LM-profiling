@@ -215,11 +215,9 @@ def stages_forward(
     stages: List[LlamaStartingStage], 
     inputs: Dict[str, Union[Tensor, Any]],
 ):
-    # Forward pass
     # Copy the inputs to avoid modifying the original inputs
     inputs = copy.deepcopy(inputs)
     for i, stage in enumerate(stages):
-        # record_time(device, 'start', 'forward', timing_info)
         # Prepare inputs
         inputs = {k: v.to(stage.device) if isinstance(v, Tensor) else v for k, v in inputs.items()}
         if i == 0:
@@ -228,7 +226,6 @@ def stages_forward(
             hidden = hidden.to(stage.device)
         # Only change the input_ids/hidden_states, keep the rest the same as in the original inputs
         hidden = stage(hidden, **inputs)
-        # record_time(device, 'end', 'forward', timing_info)
         
     return hidden
         

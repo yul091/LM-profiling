@@ -1,12 +1,12 @@
 NUM_NODES=2
 NUM_SAMPLES=2000
 LAYERS=12
-WORKLOAD=all
+WORKLOAD=poisson
 SETTING=random
 OUTPUT_DIR=prof_async
 RETRAIN_RATE=0.2
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python test_asyncio.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_llm.py \
     --num_nodes $NUM_NODES \
     --n_samples $NUM_SAMPLES \
     --nlayers $LAYERS \
