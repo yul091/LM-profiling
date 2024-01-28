@@ -100,7 +100,7 @@ def get_total_params(module: torch.nn.Module):
 def get_stages(
     ntokens: int, 
     nlayers: int, 
-    num_gpus: int, 
+    num_stages: int, 
     emsize: int, 
     nhead: int, 
     nhid: int, 
@@ -109,7 +109,7 @@ def get_stages(
     timing_info: dict = None,
 ) -> List[PipelineStage]:
     # Create pipeline stages
-    partition_len = ((nlayers - 1) // num_gpus) + 1
+    partition_len = ((nlayers - 1) // num_stages) + 1
     # Add encoder in the beginning.
     tmp_list = [Encoder(ntokens, emsize, dropout)]
     stages = []

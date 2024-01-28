@@ -8,16 +8,17 @@ import random
 import torch
 import torch.nn as nn
 from torch import Tensor
-# import asyncio
 from tqdm import tqdm
 from typing import List, Dict
-from torch.nn.utils.rnn import pad_sequence
-from dataset import get_data, SentencePairDataset
-from models import PipelineStage, get_stages
-from concurrent.futures import ThreadPoolExecutor
-from torch.utils.data import DataLoader, Subset
-from utils import record_time
 from collections import defaultdict
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, Subset
+from concurrent.futures import ThreadPoolExecutor
+
+from utils import record_time
+from models import PipelineStage, get_stages
+from dataset import get_data, SentencePairDataset
+
 
 
 class Node:
@@ -285,7 +286,7 @@ def main():
     # Instantiate stages and put them on the correct devices
     distributed_stages = [
         get_stages(
-            num_gpus=num_gpus_per_node,
+            num_stages=num_gpus_per_node,
             init_device=distributed_nodes[nodeID].init_device,
             timing_info=timing_infos[nodeID],
             **model_kwargs,
