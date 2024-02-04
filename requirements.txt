@@ -8,3 +8,4 @@ wandb
 portalocker
 torchdata
 torchtext
+fschat[model_worker,webui]
