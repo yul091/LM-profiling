@@ -36,6 +36,8 @@ BeamSearchOutput = Union[
 
 def get_stages(
     config: LlamaConfig,
+    token: str,
+    model_name_or_path: str,
     num_stages: int,
     hidden_layers_assignments: List[int] = None,
     init_device: int = 0,
@@ -61,31 +63,55 @@ def get_stages(
             hidden_layers_assignments[-((i + 2) % num_stages)] += 1
     assert len(hidden_layers_assignments) == num_stages
     
+    pretrained_model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path, 
+        config=config, 
+        token=token,
+    )
+    
     pipeline_stages = []
     totoal_params = 0
-    prev_layers = 0
+    
     for stage_id in range(num_stages):
         # Overwrite num_hidden_layers with the number for this stage
         config = copy.deepcopy(config)
         config.pad_token_id = config.eos_token_id
         config.num_hidden_layers = hidden_layers_assignments[stage_id]
         device = init_device + stage_id
+        layer_ids = list(range(stage_id * config.num_hidden_layers, (stage_id + 1) * config.num_hidden_layers))
         if stage_id == 0:
             # Starting stage
-            stage = LlamaStartingStage(config, device, timing_info=timing_info, prev_layers=prev_layers)
+            stage = LlamaStartingStage(
+                config=config,
+                device=device, 
+                layer_ids=layer_ids,
+                pretrained_model=pretrained_model,
+                timing_info=timing_info,
+            )
         elif stage_id == num_stages - 1:
             # Ending stage
-            stage = LlamaEndingStage(config, device, timing_info=timing_info, prev_layers=prev_layers)
+            stage = LlamaEndingStage(
+                config=config,
+                device=device, 
+                layer_ids=layer_ids,
+                pretrained_model=pretrained_model,
+                timing_info=timing_info,
+            )
             # Set pad_token_id to eos_token_id because GPT/Llama does not have a PAD token
             stage.generation_config.pad_token_id = stage.generation_config.eos_token_id
         else:
             # Intermediate stage
-            stage = LlamaIntermediateStage(config, device, timing_info=timing_info, prev_layers=prev_layers)
+            stage = LlamaIntermediateStage(
+                config=config,
+                device=device, 
+                layer_ids=layer_ids,
+                pretrained_model=pretrained_model,
+                timing_info=timing_info,
+            )
             
         print(f"Put stage {stage.__class__.__name__} ({stage.num_parameters()} parameters) on device {device}")
         totoal_params += stage.num_parameters()
         pipeline_stages.append(stage)
-        prev_layers += config.num_hidden_layers
             
     return pipeline_stages
 
@@ -471,6 +497,7 @@ def beam_search(
 
 if __name__ == '__main__':
     import time
+    import pdb
     from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
     from fastchat.model import get_conversation_template
     
@@ -509,31 +536,38 @@ if __name__ == '__main__':
         config=config, 
         token=access_token,
         device_map='auto',
-        torch_dtype="auto"
+        # torch_dtype="auto"
     )
-    generate_ids = model.generate(**inputs, do_sample=False)
-    if model.config.is_encoder_decoder:
-        output_ids = generate_ids
-    else:
-        output_ids = []
-        for i in range(generate_ids.shape[0]):
-            output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
-        output_ids = torch.stack(output_ids, dim=0)
-    responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    print(responses)
+    print(model.model.embed_tokens.weight)
+    # generate_ids = model.generate(**inputs, do_sample=False)
+    # if model.config.is_encoder_decoder:
+    #     output_ids = generate_ids
+    # else:
+    #     output_ids = []
+    #     for i in range(generate_ids.shape[0]):
+    #         output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
+    #     output_ids = torch.stack(output_ids, dim=0)
+    # responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    # print(responses)
+    outputs = model(**inputs)
+    loss = outputs.loss
+    logits = outputs.logits
+    print(f'loss: {loss}, logits: {logits}')
     
-    
-    
-    
-    
-    
-    # num_stages = 8
-    # timing_info = defaultdict(list)
-    # stages = get_stages(config, num_stages, timing_info=timing_info)
-    
-    # outputs = stages_forward(stages, inputs)
-    # loss = outputs[0]
-    # print(loss)
+    num_stages = 4
+    timing_info = defaultdict(list)
+    stages = get_stages(
+        config, 
+        access_token,
+        model_name_or_path,
+        num_stages, 
+        timing_info=timing_info,
+    )
+    print(stages[0].embed_tokens.weight)
+    outputs = stages_forward(stages, inputs)
+    loss = outputs[0]
+    logits = outputs[1]
+    print(f'loss: {loss}, logits: {logits}')
     # loss.backward()
     # timing_info['0_end'].append((time.time(), 'backward'))
     # print(timing_info)

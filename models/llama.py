@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import Tensor, LongTensor, FloatTensor
 from transformers import (
     LlamaConfig, 
+    LlamaForCausalLM,
     LlamaPreTrainedModel,
 )
 from transformers.models.llama.modeling_llama import (
@@ -44,29 +45,27 @@ class LlamaStartingStage(LlamaPreTrainedModel):
         self, 
         config: LlamaConfig, 
         device: int, 
+        layer_ids: List[int], 
+        pretrained_model: LlamaForCausalLM,
         timing_info: dict = None,
-        prev_layers: int = 0,
     ):
         # Explicitly initialize LlamaModel with its expected arguments
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = pretrained_model.get_input_embeddings()
         
-        self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx + prev_layers) for layer_idx in range(config.num_hidden_layers)]
-        )
+        self.layers = nn.ModuleList([
+            pretrained_model.get_decoder().layers[layer_id] for layer_id in layer_ids
+        ])
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-
         self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
-        self.post_init()
         
         self._device = device
         self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
-        # Put the model on the device
+        
         self.to(device)
 
     def get_input_embeddings(self):
@@ -165,6 +164,7 @@ class LlamaStartingStage(LlamaPreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        next_decoder_cache = None
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -215,26 +215,24 @@ class LlamaIntermediateStage(LlamaPreTrainedModel):
         self, 
         config: LlamaConfig, 
         device: int, 
+        layer_ids: List[int], 
+        pretrained_model: LlamaForCausalLM,
         timing_info: dict = None,
-        prev_layers: int = 0,
     ):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         
-        self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx + prev_layers) for layer_idx in range(config.num_hidden_layers)]
-        )
+        self.layers = nn.ModuleList([
+            pretrained_model.get_decoder().layers[layer_id] for layer_id in layer_ids
+        ])
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
 
         self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
-        self.post_init()
         
         self._device = device
         self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
-        # Put the model on the device
         self.to(device)
 
     # Add a method to profile the backward pass
@@ -265,6 +263,7 @@ class LlamaIntermediateStage(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
     ) -> CustomizedOut:
         
+        next_decoder_cache = None
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -316,26 +315,24 @@ class LlamaEndingStage(LlamaPreTrainedModel):
         self, 
         config: LlamaConfig, 
         device: int, 
+        layer_ids: List[int], 
+        pretrained_model: LlamaForCausalLM,
         timing_info: dict = None,
-        prev_layers: int = 0,
     ):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx + prev_layers) for layer_idx in range(config.num_hidden_layers)]
-        )
+        self.layers = nn.ModuleList([
+            pretrained_model.get_decoder().layers[layer_id] for layer_id in layer_ids
+        ])
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.norm = pretrained_model.get_decoder().norm
+        self.lm_head = pretrained_model.get_output_embeddings()
         self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
-        self.post_init()
         
         self._device = device
         self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
-        # Put the model on the device
         self.to(device)
         
     def get_output_embeddings(self):
