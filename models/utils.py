@@ -277,7 +277,6 @@ def beam_search(
     beam_scorer: BeamScorer,
     logits_processor: Optional[LogitsProcessorList] = None,
     stopping_criteria: Optional[StoppingCriteriaList] = None,
-    min_length: Optional[int] = None,
     max_length: Optional[int] = None,
     pad_token_id: Optional[int] = None,
     eos_token_id: Optional[Union[int, List[int]]] = None,
@@ -289,14 +288,10 @@ def beam_search(
     **model_kwargs,
 ) -> Union[BeamSearchOutput, torch.LongTensor]:
     # instantiate logits processors
-    min_length = min_length if min_length is not None else 0
     logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList([
-        MinLengthLogitsProcessor(min_length, eos_token_id=stages[-1].generation_config.eos_token_id),
+        MinLengthLogitsProcessor(5, eos_token_id=stages[-1].config.eos_token_id),
     ])
-    max_length = max_length if max_length is not None else 128
-    stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList([
-        MaxLengthCriteria(max_length=max_length)
-    ])
+    stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
     if len(stopping_criteria) == 0:
         warnings.warn("You don't have defined any stopping_criteria, this will likely loop forever", UserWarning)
     pad_token_id = pad_token_id if pad_token_id is not None else stages[-1].generation_config.pad_token_id
@@ -382,8 +377,11 @@ def beam_search(
         )  # (batch_size * num_beams, vocab_size)
         input_ids = input_ids.to(next_token_logits.device) # put on the output device
         beam_scores = beam_scores.to(next_token_logits.device)  # put on the output device
+        
         next_token_scores_processed = logits_processor(input_ids, next_token_scores)
-        next_token_scores = next_token_scores_processed + beam_scores[:, None].expand_as(next_token_scores_processed)
+        next_token_scores = next_token_scores_processed + beam_scores[:, None].expand_as(
+            next_token_scores_processed
+        )
 
         # Store scores, attentions and hidden_states when required
         if return_dict_in_generate:
@@ -463,6 +461,7 @@ def beam_search(
         eos_token_id=eos_token_id,
         max_length=stopping_criteria.max_length,
         beam_indices=beam_indices,
+        decoder_prompt_len=decoder_prompt_len,
     )
 
     if return_dict_in_generate:
@@ -480,6 +479,7 @@ def beam_search(
                 decoder_attentions=decoder_attentions,
                 cross_attentions=cross_attentions,
                 decoder_hidden_states=decoder_hidden_states,
+                past_key_values=model_kwargs.get("past_key_values"),
             )
         else:
             return BeamSearchDecoderOnlyOutput(
@@ -489,6 +489,7 @@ def beam_search(
                 beam_indices=sequence_outputs["beam_indices"],
                 attentions=decoder_attentions,
                 hidden_states=decoder_hidden_states,
+                past_key_values=model_kwargs.get("past_key_values"),
             )
     else:
         return sequence_outputs["sequences"]
@@ -498,6 +499,7 @@ def beam_search(
 if __name__ == '__main__':
     import time
     import pdb
+    import inspect
     from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
     from fastchat.model import get_conversation_template
     
@@ -514,6 +516,8 @@ if __name__ == '__main__':
         "I recently bought a new car. It is a Tesla, and it is very fast."
     ]
     print("Queries: ", texts)
+    # prompts = [process(text, model_name_or_path) for text in texts]
+    # print("Prompts: ", prompts)
     
     access_token = "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"
     model_name_or_path = "meta-llama/Llama-2-7b-chat-hf"
@@ -521,9 +525,6 @@ if __name__ == '__main__':
     # config.use_cache = False # try not using cache
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, token=access_token)
     tokenizer.pad_token = tokenizer.eos_token
-    
-    # prompts = [process(text, model_name_or_path) for text in texts]
-    # print("Prompts: ", prompts)
     
     # Test Causal Language Modeling
     inputs = tokenizer(texts, return_tensors="pt", padding=True)
@@ -538,23 +539,24 @@ if __name__ == '__main__':
         device_map='auto',
         # torch_dtype="auto"
     )
-    print(model.model.embed_tokens.weight)
-    # generate_ids = model.generate(**inputs, do_sample=False)
-    # if model.config.is_encoder_decoder:
-    #     output_ids = generate_ids
-    # else:
-    #     output_ids = []
-    #     for i in range(generate_ids.shape[0]):
-    #         output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
-    #     output_ids = torch.stack(output_ids, dim=0)
-    # responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    # print(responses)
-    outputs = model(**inputs)
-    loss = outputs.loss
-    logits = outputs.logits
-    print(f'loss: {loss}, logits: {logits}')
+    # outputs = model(**inputs)
+    # loss = outputs.loss
+    # logits = outputs.logits
+    # print(f'loss: {loss}, logits: {logits}')
+    start = time.time()
+    generate_ids = model.generate(**inputs, do_sample=False)
+    end = time.time()
+    if model.config.is_encoder_decoder:
+        output_ids = generate_ids
+    else:
+        output_ids = []
+        for i in range(generate_ids.shape[0]):
+            output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
+        output_ids = torch.stack(output_ids, dim=0)
+    responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    print(f'generation overhead {end - start}: \n{responses}')
     
-    num_stages = 4
+    num_stages = 8
     timing_info = defaultdict(list)
     stages = get_stages(
         config, 
@@ -563,11 +565,10 @@ if __name__ == '__main__':
         num_stages, 
         timing_info=timing_info,
     )
-    print(stages[0].embed_tokens.weight)
-    outputs = stages_forward(stages, inputs)
-    loss = outputs[0]
-    logits = outputs[1]
-    print(f'loss: {loss}, logits: {logits}')
+    # outputs = stages_forward(stages, inputs)
+    # loss = outputs[0]
+    # logits = outputs[1]
+    # print(f'loss: {loss}, logits: {logits}')
     # loss.backward()
     # timing_info['0_end'].append((time.time(), 'backward'))
     # print(timing_info)
@@ -587,45 +588,118 @@ if __name__ == '__main__':
     # # responses = tokenizer.batch_decode(outputs, skip_special_tokens=True)
     # # print(responses)
     
-    # # Instantiate beam scorer
-    # input_ids = inputs.pop('input_ids')
-    # generation_config = copy.deepcopy(stages[-1].generation_config)
-    # generation_config.num_beams = 3
-    # model_kwargs = generation_config.update(**inputs)
-    # beam_scorer = BeamSearchScorer(
-    #     batch_size=input_ids.shape[0],
-    #     num_beams=generation_config.num_beams,
-    #     device=stages[-1].device,
-    #     length_penalty=generation_config.length_penalty,
-    #     do_early_stopping=generation_config.early_stopping,
-    #     num_beam_hyps_to_keep=generation_config.num_return_sequences,
-    #     max_length=generation_config.max_length,
-    # )
-    # # Interleave input_ids with `num_beams` additional sequences per batch
-    # input_ids, model_kwargs = stages[-1]._expand_inputs_for_generation(
-    #     input_ids=input_ids,
-    #     expand_size=generation_config.num_beams,
-    #     is_encoder_decoder=stages[-1].config.is_encoder_decoder,
-    #     **model_kwargs,
-    # )
-    # # Run beam search
-    # outputs = beam_search(
-    #     stages, 
-    #     input_ids,
-    #     beam_scorer,
-    #     pad_token_id=generation_config.pad_token_id,
-    #     eos_token_id=generation_config.eos_token_id,
-    #     output_scores=generation_config.output_scores,
-    #     return_dict_in_generate=generation_config.return_dict_in_generate,
-    #     **model_kwargs,
-    # )
-    # # if stages[-1].config.is_encoder_decoder:
-    # #     output_ids = outputs
-    # # else:
-    # #     output_ids = []
-    # #     for i in range(input_ids.shape[0]):
-    # #         output_ids.append(outputs[i][len(encoder_input_ids[i]):])
-    # #     output_ids = torch.cat(output_ids, dim=0)
+    # Instantiate beam scorer
+    input_ids = inputs.pop('input_ids')
+    generation_config = copy.deepcopy(stages[-1].generation_config)
+    generation_config.num_beams = 3
+    generation_config.max_length = 128
+    model_kwargs = generation_config.update(**inputs)
+    generation_config.validate()
+    stages[-1]._validate_model_kwargs(model_kwargs.copy())
+    synced_gpus = False
+    
+    # Set generation parameters if not already defined
+    logits_processor = LogitsProcessorList()
+    stopping_criteria = StoppingCriteriaList()
+    if generation_config.pad_token_id is None and generation_config.eos_token_id is not None:
+        eos_token_id = generation_config.eos_token_id
+        if isinstance(eos_token_id, list):
+            eos_token_id = eos_token_id[0]
+        generation_config.pad_token_id = eos_token_id
+    
+    # Define model inputs
+    inputs_tensor, model_input_name, model_kwargs = stages[-1]._prepare_model_inputs(
+        input_ids, generation_config.bos_token_id, model_kwargs
+    )
+    batch_size = inputs_tensor.shape[0]
+    
+    # Define other model kwargs
+    model_kwargs["output_attentions"] = generation_config.output_attentions
+    model_kwargs["output_hidden_states"] = generation_config.output_hidden_states
+    # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
+    # generating the first new token or not, and we only want to use the embeddings for the first new token)
+    if not stages[-1].config.is_encoder_decoder and model_input_name == "inputs_embeds":
+        model_kwargs["use_cache"] = True
+    else:
+        model_kwargs["use_cache"] = generation_config.use_cache
         
-    # responses = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    # print(responses)
+    accepts_attention_mask = "attention_mask" in set(inspect.signature(stages[-1].forward).parameters.keys())
+    requires_attention_mask = "encoder_outputs" not in model_kwargs
+    if model_kwargs.get("attention_mask", None) is None and requires_attention_mask and accepts_attention_mask:
+        model_kwargs["attention_mask"] = stages[-1]._prepare_attention_mask_for_generation(
+            inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
+        )
+    
+    # Prepare 'input_ids' which will be used for auto-regressive generation
+    input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+
+    # Prepare `max_length` depending on other stopping criteria
+    input_ids_length = input_ids.shape[-1]
+    has_default_max_length = generation_config.max_length is not None
+    if generation_config.max_new_tokens is not None:
+        generation_config.max_length = generation_config.max_new_tokens + input_ids_length
+    stages[-1]._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+    
+    # 8. prepare distribution pre_processing samplers
+    logits_processor = stages[-1]._get_logits_processor(
+        generation_config=generation_config,
+        input_ids_seq_length=input_ids_length,
+        encoder_input_ids=inputs_tensor,
+        prefix_allowed_tokens_fn=None,
+        logits_processor=logits_processor,
+        model_kwargs=model_kwargs,
+        negative_prompt_ids=None,
+        negative_prompt_attention_mask=None,
+    )
+    
+    # 9. prepare stopping criteria
+    stopping_criteria = stages[-1]._get_stopping_criteria(
+        generation_config=generation_config, stopping_criteria=stopping_criteria
+    )
+    
+    # 10. prepare beam search scorer
+    beam_scorer = BeamSearchScorer(
+        batch_size=input_ids.shape[0],
+        num_beams=generation_config.num_beams,
+        device=stages[-1].device,
+        length_penalty=generation_config.length_penalty,
+        do_early_stopping=generation_config.early_stopping,
+        num_beam_hyps_to_keep=generation_config.num_return_sequences,
+        max_length=generation_config.max_length,
+    )
+    # 11. interleave input_ids with `num_beams` additional sequences per batch
+    input_ids, model_kwargs = stages[-1]._expand_inputs_for_generation(
+        input_ids=input_ids,
+        expand_size=generation_config.num_beams,
+        is_encoder_decoder=stages[-1].config.is_encoder_decoder,
+        **model_kwargs,
+    )
+    stopping_criteria = StoppingCriteriaList()
+    stopping_criteria = stages[-1]._get_stopping_criteria(
+        generation_config=generation_config, stopping_criteria=stopping_criteria
+    )
+    # 12. run beam search
+    start = time.time()
+    generate_ids = beam_search(
+        stages, 
+        input_ids,
+        beam_scorer,
+        logits_processor=logits_processor,
+        stopping_criteria=stopping_criteria,
+        pad_token_id=generation_config.pad_token_id,
+        eos_token_id=generation_config.eos_token_id,
+        output_scores=generation_config.output_scores,
+        return_dict_in_generate=generation_config.return_dict_in_generate,
+        synced_gpus=synced_gpus,
+        **model_kwargs,
+    )
+    end = time.time()
+    if model.config.is_encoder_decoder:
+        output_ids = generate_ids
+    else:
+        output_ids = []
+        for i in range(generate_ids.shape[0]):
+            output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
+        output_ids = torch.stack(output_ids, dim=0)
+    responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    print(f'generation overhead {end - start}: \n{responses}')
