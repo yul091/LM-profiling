@@ -63,6 +63,7 @@ def get_stages(
     
     pipeline_stages = []
     totoal_params = 0
+    prev_layers = 0
     for stage_id in range(num_stages):
         # Overwrite num_hidden_layers with the number for this stage
         config = copy.deepcopy(config)
@@ -71,19 +72,20 @@ def get_stages(
         device = init_device + stage_id
         if stage_id == 0:
             # Starting stage
-            stage = LlamaStartingStage(config, device, timing_info=timing_info)
+            stage = LlamaStartingStage(config, device, timing_info=timing_info, prev_layers=prev_layers)
         elif stage_id == num_stages - 1:
             # Ending stage
-            stage = LlamaEndingStage(config, device, timing_info=timing_info)
+            stage = LlamaEndingStage(config, device, timing_info=timing_info, prev_layers=prev_layers)
             # Set pad_token_id to eos_token_id because GPT/Llama does not have a PAD token
             stage.generation_config.pad_token_id = stage.generation_config.eos_token_id
         else:
             # Intermediate stage
-            stage = LlamaIntermediateStage(config, device, timing_info=timing_info)
+            stage = LlamaIntermediateStage(config, device, timing_info=timing_info, prev_layers=prev_layers)
             
         print(f"Put stage {stage.__class__.__name__} ({stage.num_parameters()} parameters) on device {device}")
         totoal_params += stage.num_parameters()
         pipeline_stages.append(stage)
+        prev_layers += config.num_hidden_layers
             
     return pipeline_stages
 
@@ -114,7 +116,7 @@ def stages_forward(
             )
             
         # Only change the input_ids/hidden_states, keep the rest the same as in the original inputs
-        print(f"Forward pass for stage {i} on device {stage.device}")
+        # print(f"Forward pass for stage {i} on device {stage.device}")
         # for k, v in batch_inputs.items():
         #     if isinstance(v, torch.Tensor):
         #         print(f"{k}: {v.device}")
@@ -162,7 +164,7 @@ def _prepare_inputs(
         )
     return new_inputs
 
-
+@ torch.no_grad()
 def greedy_search(
     stages: List[LlamaEndingStage], 
     input_ids: torch.LongTensor,
@@ -242,7 +244,7 @@ def greedy_search(
             break
     return input_ids
 
-
+@ torch.no_grad()
 def beam_search(
     stages: List[LlamaEndingStage],
     input_ids: torch.LongTensor,
@@ -466,27 +468,18 @@ def beam_search(
         return sequence_outputs["sequences"]
 
 
-# Example usage:
-# Assuming you have defined your stages and config
-# starting_stage, intermediate_stages, ending_stage = get_stages(config, num_stages, hidden_layers_assignments, init_device, timing_info)
-# input_ids = torch.tensor([[your_initial_token_id]])  # Replace 'your_initial_token_id' with your actual initial token ID
-# generated_sequence = generate(starting_stage, intermediate_stages, ending_stage, input_ids)
-# print("Generated sequence:", generated_sequence)
-
-
-
 
 if __name__ == '__main__':
     import time
-    from transformers import AutoTokenizer, AutoConfig
+    from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
     from fastchat.model import get_conversation_template
     
-    def process(msg: str, model_path: str):
-        conv = get_conversation_template(model_path)
-        conv.append_message(conv.roles[0], msg)
-        conv.append_message(conv.roles[1], None)
-        prompt = conv.get_prompt()
-        return prompt
+    # def process(msg: str, model_path: str):
+    #     conv = get_conversation_template(model_path)
+    #     conv.append_message(conv.roles[0], msg)
+    #     conv.append_message(conv.roles[1], None)
+    #     prompt = conv.get_prompt()
+    #     return prompt
     
     texts = [
         "Hello, my dog is cute",
@@ -502,80 +495,103 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, token=access_token)
     tokenizer.pad_token = tokenizer.eos_token
     
-    prompts = [process(text, model_name_or_path) for text in texts]
-    print("Prompts: ", prompts)
+    # prompts = [process(text, model_name_or_path) for text in texts]
+    # print("Prompts: ", prompts)
     
     # Test Causal Language Modeling
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+    inputs = tokenizer(texts, return_tensors="pt", padding=True)
     inputs['labels'] = inputs['input_ids'].clone()
     encoder_input_ids = inputs["input_ids"].clone()
     # print(encoder_inputs)
     
-    num_stages = 8
-    timing_info = defaultdict(list)
-    stages = get_stages(config, num_stages, timing_info=timing_info)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path, 
+        config=config, 
+        token=access_token,
+        device_map='auto',
+        torch_dtype="auto"
+    )
+    generate_ids = model.generate(**inputs, do_sample=False)
+    if model.config.is_encoder_decoder:
+        output_ids = generate_ids
+    else:
+        output_ids = []
+        for i in range(generate_ids.shape[0]):
+            output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
+        output_ids = torch.stack(output_ids, dim=0)
+    responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    print(responses)
     
-    outputs = stages_forward(stages, inputs)
-    loss = outputs[0]
-    print(loss)
-    loss.backward()
-    timing_info['0_end'].append((time.time(), 'backward'))
-    print(timing_info)
     
-    # Test Greedy Search
+    
+    
+    
+    
+    # num_stages = 8
+    # timing_info = defaultdict(list)
+    # stages = get_stages(config, num_stages, timing_info=timing_info)
+    
+    # outputs = stages_forward(stages, inputs)
+    # loss = outputs[0]
+    # print(loss)
+    # loss.backward()
+    # timing_info['0_end'].append((time.time(), 'backward'))
+    # print(timing_info)
+    
+    # # Test Greedy Search
+    # # input_ids = inputs.pop('input_ids')
+    # # outputs = greedy_search(
+    # #     stages, 
+    # #     input_ids,
+    # #     logits_processor=None,
+    # #     stopping_criteria=None,
+    # #     pad_token_id=None,
+    # #     eos_token_id=None,
+    # #     synced_gpus=False,
+    # #     **inputs,
+    # # )
+    # # responses = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    # # print(responses)
+    
+    # # Instantiate beam scorer
     # input_ids = inputs.pop('input_ids')
-    # outputs = greedy_search(
+    # generation_config = copy.deepcopy(stages[-1].generation_config)
+    # generation_config.num_beams = 3
+    # model_kwargs = generation_config.update(**inputs)
+    # beam_scorer = BeamSearchScorer(
+    #     batch_size=input_ids.shape[0],
+    #     num_beams=generation_config.num_beams,
+    #     device=stages[-1].device,
+    #     length_penalty=generation_config.length_penalty,
+    #     do_early_stopping=generation_config.early_stopping,
+    #     num_beam_hyps_to_keep=generation_config.num_return_sequences,
+    #     max_length=generation_config.max_length,
+    # )
+    # # Interleave input_ids with `num_beams` additional sequences per batch
+    # input_ids, model_kwargs = stages[-1]._expand_inputs_for_generation(
+    #     input_ids=input_ids,
+    #     expand_size=generation_config.num_beams,
+    #     is_encoder_decoder=stages[-1].config.is_encoder_decoder,
+    #     **model_kwargs,
+    # )
+    # # Run beam search
+    # outputs = beam_search(
     #     stages, 
     #     input_ids,
-    #     logits_processor=None,
-    #     stopping_criteria=None,
-    #     pad_token_id=None,
-    #     eos_token_id=None,
-    #     synced_gpus=False,
-    #     **inputs,
+    #     beam_scorer,
+    #     pad_token_id=generation_config.pad_token_id,
+    #     eos_token_id=generation_config.eos_token_id,
+    #     output_scores=generation_config.output_scores,
+    #     return_dict_in_generate=generation_config.return_dict_in_generate,
+    #     **model_kwargs,
     # )
+    # # if stages[-1].config.is_encoder_decoder:
+    # #     output_ids = outputs
+    # # else:
+    # #     output_ids = []
+    # #     for i in range(input_ids.shape[0]):
+    # #         output_ids.append(outputs[i][len(encoder_input_ids[i]):])
+    # #     output_ids = torch.cat(output_ids, dim=0)
+        
     # responses = tokenizer.batch_decode(outputs, skip_special_tokens=True)
     # print(responses)
-    
-    # Instantiate beam scorer
-    input_ids = inputs.pop('input_ids')
-    generation_config = copy.deepcopy(stages[-1].generation_config)
-    generation_config.num_beams = 4
-    model_kwargs = generation_config.update(**inputs)
-    beam_scorer = BeamSearchScorer(
-        batch_size=input_ids.shape[0],
-        num_beams=generation_config.num_beams,
-        device=stages[-1].device,
-        length_penalty=generation_config.length_penalty,
-        do_early_stopping=generation_config.early_stopping,
-        num_beam_hyps_to_keep=generation_config.num_return_sequences,
-        max_length=generation_config.max_length,
-    )
-    # Interleave input_ids with `num_beams` additional sequences per batch
-    input_ids, model_kwargs = stages[-1]._expand_inputs_for_generation(
-        input_ids=input_ids,
-        expand_size=generation_config.num_beams,
-        is_encoder_decoder=stages[-1].config.is_encoder_decoder,
-        **model_kwargs,
-    )
-    # Run beam search
-    outputs = beam_search(
-        stages, 
-        input_ids,
-        beam_scorer,
-        pad_token_id=generation_config.pad_token_id,
-        eos_token_id=generation_config.eos_token_id,
-        output_scores=generation_config.output_scores,
-        return_dict_in_generate=generation_config.return_dict_in_generate,
-        **model_kwargs,
-    )
-    # if stages[-1].config.is_encoder_decoder:
-    #     output_ids = outputs
-    # else:
-    #     output_ids = []
-    #     for i in range(input_ids.shape[0]):
-    #         output_ids.append(outputs[i][len(encoder_input_ids[i]):])
-    #     output_ids = torch.cat(output_ids, dim=0)
-        
-    responses = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    print(responses)

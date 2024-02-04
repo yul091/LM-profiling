@@ -11,8 +11,11 @@ import torch.nn.functional as F
 from torch import Tensor, LongTensor, FloatTensor
 from transformers import (
     LlamaConfig, 
-    LlamaModel, 
-    LlamaForCausalLM,
+    LlamaPreTrainedModel,
+)
+from transformers.models.llama.modeling_llama import (
+    LlamaDecoderLayer,
+    LlamaRMSNorm,
 )
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import ModelOutput, CausalLMOutputWithPast
@@ -20,7 +23,7 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
-from transformers.utils import logging 
+from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
@@ -33,16 +36,44 @@ class CustomizedOut(ModelOutput):
     all_self_attns: Optional[Tuple[torch.FloatTensor]] = None
     position_ids: Optional[torch.LongTensor] = None
     attention_mask: Optional[torch.Tensor] = None
+    
 
 
-class LlamaStartingStage(LlamaModel):
-    def __init__(self, config: LlamaConfig, device: int, timing_info: dict = None):
+class LlamaStartingStage(LlamaPreTrainedModel):
+    def __init__(
+        self, 
+        config: LlamaConfig, 
+        device: int, 
+        timing_info: dict = None,
+        prev_layers: int = 0,
+    ):
         # Explicitly initialize LlamaModel with its expected arguments
         super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayer(config, layer_idx + prev_layers) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self._use_sdpa = config._attn_implementation == "sdpa"
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
+        
         self._device = device
         self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
         # Put the model on the device
         self.to(device)
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
     
     # Add a method to profile the backward pass
     def backward_hook(
@@ -130,10 +161,6 @@ class LlamaStartingStage(LlamaModel):
 
         # embed positions
         hidden_states = inputs_embeds
-        
-        print("hidden_states {}, attention_mask {}, position_ids {}".format(
-            hidden_states.shape, attention_mask.shape, position_ids.shape
-        ))
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -183,14 +210,33 @@ class LlamaStartingStage(LlamaModel):
         
     
     
-class LlamaIntermediateStage(LlamaModel):
-    def __init__(self, config: LlamaConfig, device: int, timing_info: dict = None):
+class LlamaIntermediateStage(LlamaPreTrainedModel):
+    def __init__(
+        self, 
+        config: LlamaConfig, 
+        device: int, 
+        timing_info: dict = None,
+        prev_layers: int = 0,
+    ):
         super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayer(config, layer_idx + prev_layers) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self._use_sdpa = config._attn_implementation == "sdpa"
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
+        
         self._device = device
         self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
         # Put the model on the device
         self.to(device)
-    
+
     # Add a method to profile the backward pass
     def backward_hook(
         self, 
@@ -218,9 +264,6 @@ class LlamaIntermediateStage(LlamaModel):
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
     ) -> CustomizedOut:
-        print("hidden_states {}, attention_mask {}, position_ids {}".format(
-            hidden_states.shape, attention_mask.shape, position_ids.shape
-        ))
         
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -266,14 +309,40 @@ class LlamaIntermediateStage(LlamaModel):
         
     
 
-class LlamaEndingStage(LlamaForCausalLM):
+class LlamaEndingStage(LlamaPreTrainedModel):
+    _tied_weights_keys = ["lm_head.weight"]
     
-    def __init__(self, config: LlamaConfig, device: int, timing_info: dict = None):
+    def __init__(
+        self, 
+        config: LlamaConfig, 
+        device: int, 
+        timing_info: dict = None,
+        prev_layers: int = 0,
+    ):
         super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayer(config, layer_idx + prev_layers) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self._use_sdpa = config._attn_implementation == "sdpa"
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
+        
         self._device = device
         self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
         # Put the model on the device
         self.to(device)
+        
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
     
     # Add a method to profile the backward pass
     def backward_hook(
@@ -288,6 +357,76 @@ class LlamaEndingStage(LlamaForCausalLM):
         if f"{self._device+1}_start" in timing_info:
             timing_info[f"{self._device+1}_end"].append((start_time, "backward"))
         timing_info[f"{self._device}_start"].append((start_time, "backward"))
+        
+    def prepare_inputs_for_generation(
+        self, 
+        input_ids, 
+        past_key_values=None, 
+        attention_mask=None, 
+        inputs_embeds=None, 
+        **kwargs,
+    ):
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = past_key_values.seen_tokens
+                max_cache_length = past_key_values.get_max_length()
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            # Keep only the unprocessed tokens:
+            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+            # some of the inputs are exclusivelly passed as part of the cache (e.g. when passing input_embeds as
+            # input)
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+            # input_ids based on the past_length.
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+
+            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
         
     def forward(
         self,
@@ -304,12 +443,12 @@ class LlamaEndingStage(LlamaForCausalLM):
     ) -> CausalLMOutputWithPast:
         next_decoder_cache = None
         
-        for decoder_layer in self.model.layers:
+        for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.model.gradient_checkpointing and self.model.training:
-                layer_outputs = self.model._gradient_checkpointing_func(
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
                     attention_mask,
@@ -336,7 +475,7 @@ class LlamaEndingStage(LlamaForCausalLM):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
                 
-        hidden_states = self.model.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
