@@ -26,6 +26,7 @@ from transformers.cache_utils import DynamicCache
 from transformers.generation import (
     BeamSearchDecoderOnlyOutput, 
     BeamSearchEncoderDecoderOutput,
+    validate_stopping_criteria,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 BeamSearchOutput = Union[
@@ -116,8 +117,6 @@ def get_stages(
     return pipeline_stages
 
 
-
-
 def stages_forward(
     stages: List[LlamaStartingStage], 
     inputs: Dict[str, Union[torch.Tensor, Any]],
@@ -190,57 +189,77 @@ def _prepare_inputs(
         )
     return new_inputs
 
-@ torch.no_grad()
+# @torch.no_grad()
+@profile
 def greedy_search(
     stages: List[LlamaEndingStage], 
     input_ids: torch.LongTensor,
     logits_processor: Optional[LogitsProcessorList] = None,
     stopping_criteria: Optional[StoppingCriteriaList] = None,
+    max_length: Optional[int] = None,
     pad_token_id: Optional[int] = None,
     eos_token_id: Optional[Union[int, List[int]]] = None,
     synced_gpus: bool = False,
-    min_length: Optional[int] = None,
-    max_length: Optional[int] = None,
     **model_kwargs,
 ):
-    # Instantiate logits processors
-    min_length = min_length if min_length is not None else 0
-    logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList([
-        MinLengthLogitsProcessor(min_length, eos_token_id=stages[-1].generation_config.eos_token_id),
-    ])
-    max_length = max_length if max_length is not None else 128
-    stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList([
-        MaxLengthCriteria(max_length=max_length)
-    ])
+    # instantiate logits processors
+    logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+    stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+    if max_length is not None:
+        warnings.warn(
+            "`max_length` is deprecated in this function, use"
+            " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
+            UserWarning,
+        )
+        stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
     pad_token_id = pad_token_id if pad_token_id is not None else stages[-1].generation_config.pad_token_id
     eos_token_id = eos_token_id if eos_token_id is not None else stages[-1].generation_config.eos_token_id
     if isinstance(eos_token_id, int):
         eos_token_id = [eos_token_id]
-    eos_token_id_tensor = torch.tensor(eos_token_id) if eos_token_id is not None else None
-    # Init attention / hidden states / scores tuples
+    eos_token_id_tensor = torch.tensor(eos_token_id, device=stages[-1].device) if eos_token_id is not None else None
+    # init attention / hidden states / scores tuples
     scores = None
     
-    # Keep track of which sequences are already finished
-    unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long)
+    # keep track of which sequences are already finished
+    input_ids = input_ids.to(stages[-1].device)
+    unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=stages[-1].device)
     this_peer_finished = False  # used by synced_gpus only
-  
+    step = 0
     while True:
-        # Prepare inputs
+        if synced_gpus:
+            # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
+            # The following logic allows an early break if all peers finished generating their sequence
+            this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+            # send 0.0 if we finished, 1.0 otherwise
+            dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
+            # did all peers finish? the reduced sum will be 0.0 then
+            if this_peer_finished_flag.item() == 0.0:
+                break
+        
+        # prepare model inputs
         model_inputs = stages[-1].prepare_inputs_for_generation(input_ids, **model_kwargs)
-        # Forward pass
-        outputs = stages_forward(stages, model_inputs)
+        
+        # forward pass to get next token
+        tuple_outputs = stages_forward(stages, model_inputs)
+        outputs = CausalLMOutputWithPast(
+            loss=tuple_outputs[0],
+            logits=tuple_outputs[1],
+            past_key_values=tuple_outputs[2],
+            hidden_states=tuple_outputs[3],
+            attentions=tuple_outputs[4],
+        )
+        
         if synced_gpus and this_peer_finished:
             continue  # don't waste resources running the code we don't need
-        # Get logits
+        
         next_token_logits = outputs.logits[:, -1, :]
-        input_ids = input_ids.to(next_token_logits.device) 
+        
         # pre-process distribution
         next_tokens_scores = logits_processor(input_ids, next_token_logits)
+        
         # argmax
         next_tokens = torch.argmax(next_tokens_scores, dim=-1)
-        # Put on the output device
-        unfinished_sequences = unfinished_sequences.to(next_tokens.device)
-        eos_token_id_tensor = eos_token_id_tensor.to(next_tokens.device) if eos_token_id_tensor is not None else None
+        
         # finished sentences should have their next token be a padding token
         if eos_token_id is not None:
             if pad_token_id is None:
@@ -252,12 +271,16 @@ def greedy_search(
         model_kwargs = stages[-1]._update_model_kwargs_for_generation(
             outputs, model_kwargs, is_encoder_decoder=stages[-1].config.is_encoder_decoder
         )
+        step += 1
+        print(f"[step {step}] next_tokens: {next_tokens} ({next_tokens.device}), eos_token_id_tensor: {eos_token_id_tensor} ({eos_token_id_tensor.device})")
+        print(f"\tunfinished_sequences: {unfinished_sequences} ({unfinished_sequences.device})")
         
         # if eos_token was found in one sentence, set sentence to finished
         if eos_token_id_tensor is not None:
             unfinished_sequences = unfinished_sequences.mul(
                 next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
             )
+            # print(f"\tunfinished_sequences (before max): {unfinished_sequences} ({unfinished_sequences.device})")
             # stop when each sentence is finished
             if unfinished_sequences.max() == 0:
                 this_peer_finished = True
@@ -268,9 +291,11 @@ def greedy_search(
 
         if this_peer_finished and not synced_gpus:
             break
+        
     return input_ids
 
-@ torch.no_grad()
+
+@torch.no_grad()
 def beam_search(
     stages: List[LlamaEndingStage],
     input_ids: torch.LongTensor,
@@ -288,10 +313,15 @@ def beam_search(
     **model_kwargs,
 ) -> Union[BeamSearchOutput, torch.LongTensor]:
     # instantiate logits processors
-    logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList([
-        MinLengthLogitsProcessor(5, eos_token_id=stages[-1].config.eos_token_id),
-    ])
+    logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
     stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+    if max_length is not None:
+        warnings.warn(
+            "`max_length` is deprecated in this function, use"
+            " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
+            UserWarning,
+        )
+        stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
     if len(stopping_criteria) == 0:
         warnings.warn("You don't have defined any stopping_criteria, this will likely loop forever", UserWarning)
     pad_token_id = pad_token_id if pad_token_id is not None else stages[-1].generation_config.pad_token_id
@@ -493,7 +523,132 @@ def beam_search(
             )
     else:
         return sequence_outputs["sequences"]
+    
+@torch.no_grad()
+def generate(
+    stages: List[LlamaEndingStage],
+    inputs: Dict[str, Union[torch.Tensor, Any]],
+):
+    if is_deepspeed_zero3_enabled() and dist.get_world_size() > 1:
+        synced_gpus = True
+    else:
+        synced_gpus = False
+        
+    input_ids = inputs.pop('input_ids')
+    
+    # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
+    stages[-1]._validate_model_class()
+    generation_config = copy.deepcopy(stages[-1].generation_config)
+    generation_config.num_beams = 3
+    generation_config.max_length = 1024
+    generation_config.max_new_tokens = 1024
+    model_kwargs = generation_config.update(**inputs)
+    generation_config.validate()
+    stages[-1]._validate_model_kwargs(model_kwargs.copy())
+    
+    # 2. Set generation parameters if not already defined
+    logits_processor = LogitsProcessorList()
+    stopping_criteria = StoppingCriteriaList()
+    if generation_config.pad_token_id is None and generation_config.eos_token_id is not None:
+        eos_token_id = generation_config.eos_token_id
+        if isinstance(eos_token_id, list):
+            eos_token_id = eos_token_id[0]
+        generation_config.pad_token_id = eos_token_id
+    
+    # 3. Define model inputs
+    inputs_tensor, model_input_name, model_kwargs = stages[-1]._prepare_model_inputs(
+        input_ids, generation_config.bos_token_id, model_kwargs
+    )
+    
+    # 4. Define other model kwargs
+    model_kwargs["output_attentions"] = generation_config.output_attentions
+    model_kwargs["output_hidden_states"] = generation_config.output_hidden_states
+    # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
+    # generating the first new token or not, and we only want to use the embeddings for the first new token)
+    if not stages[-1].config.is_encoder_decoder and model_input_name == "inputs_embeds":
+        model_kwargs["use_cache"] = True
+    else:
+        model_kwargs["use_cache"] = generation_config.use_cache
+        
+    accepts_attention_mask = "attention_mask" in set(inspect.signature(stages[-1].forward).parameters.keys())
+    requires_attention_mask = "encoder_outputs" not in model_kwargs
+    if model_kwargs.get("attention_mask", None) is None and requires_attention_mask and accepts_attention_mask:
+        model_kwargs["attention_mask"] = stages[-1]._prepare_attention_mask_for_generation(
+            inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
+        )
+    
+    # 5. Prepare 'input_ids' which will be used for auto-regressive generation
+    input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
 
+    # 6. Prepare `max_length` depending on other stopping criteria
+    input_ids_length = input_ids.shape[-1]
+    has_default_max_length = generation_config.max_length is not None
+    if generation_config.max_new_tokens is not None:
+        generation_config.max_length = generation_config.max_new_tokens + input_ids_length
+    stages[-1]._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+    
+    # 7. prepare distribution pre_processing samplers
+    logits_processor = stages[-1]._get_logits_processor(
+        generation_config=generation_config,
+        input_ids_seq_length=input_ids_length,
+        encoder_input_ids=inputs_tensor,
+        prefix_allowed_tokens_fn=None,
+        logits_processor=logits_processor,
+        model_kwargs=model_kwargs,
+        negative_prompt_ids=None,
+        negative_prompt_attention_mask=None,
+    )
+    
+    # 8. prepare stopping criteria
+    stopping_criteria = stages[-1]._get_stopping_criteria(
+        generation_config=generation_config, stopping_criteria=stopping_criteria
+    )
+    
+    # 9. run greedy search
+    return greedy_search(
+        stages,
+        input_ids,
+        logits_processor=logits_processor,
+        stopping_criteria=stopping_criteria,
+        pad_token_id=generation_config.pad_token_id,
+        eos_token_id=generation_config.eos_token_id,
+        synced_gpus=synced_gpus,
+        **model_kwargs,
+    )
+    
+    # # 9. prepare beam search scorer
+    # beam_scorer = BeamSearchScorer(
+    #     batch_size=input_ids.shape[0],
+    #     num_beams=generation_config.num_beams,
+    #     device=stages[-1].device,
+    #     length_penalty=generation_config.length_penalty,
+    #     do_early_stopping=generation_config.early_stopping,
+    #     num_beam_hyps_to_keep=generation_config.num_return_sequences,
+    #     max_length=generation_config.max_length,
+    # )
+    
+    # # 10. interleave input_ids with `num_beams` additional sequences per batch
+    # input_ids, model_kwargs = stages[-1]._expand_inputs_for_generation(
+    #     input_ids=input_ids,
+    #     expand_size=generation_config.num_beams,
+    #     is_encoder_decoder=stages[-1].config.is_encoder_decoder,
+    #     **model_kwargs,
+    # )
+    
+    # # 11. run beam search
+    # return beam_search(
+    #     stages, 
+    #     input_ids,
+    #     beam_scorer,
+    #     logits_processor=logits_processor,
+    #     stopping_criteria=stopping_criteria,
+    #     pad_token_id=generation_config.pad_token_id,
+    #     eos_token_id=generation_config.eos_token_id,
+    #     output_scores=generation_config.output_scores,
+    #     return_dict_in_generate=generation_config.return_dict_in_generate,
+    #     synced_gpus=synced_gpus,
+    #     **model_kwargs,
+    # )
 
 
 if __name__ == '__main__':
@@ -501,7 +656,8 @@ if __name__ == '__main__':
     import pdb
     import inspect
     from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-    from fastchat.model import get_conversation_template
+    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+    # from fastchat.model import get_conversation_template
     
     # def process(msg: str, model_path: str):
     #     conv = get_conversation_template(model_path)
@@ -522,7 +678,6 @@ if __name__ == '__main__':
     access_token = "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"
     model_name_or_path = "meta-llama/Llama-2-7b-chat-hf"
     config = AutoConfig.from_pretrained(model_name_or_path, token=access_token)
-    # config.use_cache = False # try not using cache
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, token=access_token)
     tokenizer.pad_token = tokenizer.eos_token
     
@@ -530,8 +685,8 @@ if __name__ == '__main__':
     inputs = tokenizer(texts, return_tensors="pt", padding=True)
     inputs['labels'] = inputs['input_ids'].clone()
     encoder_input_ids = inputs["input_ids"].clone()
-    # print(encoder_inputs)
     
+    test_forward, test_generation = True, False
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path, 
         config=config, 
@@ -539,22 +694,27 @@ if __name__ == '__main__':
         device_map='auto',
         # torch_dtype="auto"
     )
-    # outputs = model(**inputs)
-    # loss = outputs.loss
-    # logits = outputs.logits
-    # print(f'loss: {loss}, logits: {logits}')
-    start = time.time()
-    generate_ids = model.generate(**inputs, do_sample=False)
-    end = time.time()
-    if model.config.is_encoder_decoder:
-        output_ids = generate_ids
-    else:
-        output_ids = []
-        for i in range(generate_ids.shape[0]):
-            output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
-        output_ids = torch.stack(output_ids, dim=0)
-    responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    print(f'generation overhead {end - start}: \n{responses}')
+    if test_forward:
+        start = time.time()
+        outputs = model(**inputs)
+        loss = outputs.loss
+        logits = outputs.logits
+        end = time.time()
+        print(f'loss: {loss}, logits: {logits.shape}')
+        print(f'forward overhead {end - start}')
+    if test_generation:
+        start = time.time()
+        generate_ids = model.generate(**inputs, do_sample=False)
+        end = time.time()
+        if model.config.is_encoder_decoder:
+            output_ids = generate_ids
+        else:
+            output_ids = []
+            for i in range(generate_ids.shape[0]):
+                output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
+            output_ids = torch.stack(output_ids, dim=0)
+        responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        print(f'generation overhead {end - start}: \n{responses}')
     
     num_stages = 8
     timing_info = defaultdict(list)
@@ -565,141 +725,28 @@ if __name__ == '__main__':
         num_stages, 
         timing_info=timing_info,
     )
-    # outputs = stages_forward(stages, inputs)
-    # loss = outputs[0]
-    # logits = outputs[1]
-    # print(f'loss: {loss}, logits: {logits}')
-    # loss.backward()
-    # timing_info['0_end'].append((time.time(), 'backward'))
-    # print(timing_info)
+    if test_forward:
+        start = time.time()
+        outputs = stages_forward(stages, inputs)
+        loss = outputs[0]
+        logits = outputs[1]
+        end = time.time()
+        print(f'loss: {loss}, logits: {logits}')
+        print(f'forward overhead {end - start}')
+        # loss.backward()
+        # timing_info['0_end'].append((time.time(), 'backward'))
+        # print(timing_info)
+    if test_generation:
+        start = time.time()
+        generate_ids = generate(stages, inputs)
+        end = time.time()
+        if model.config.is_encoder_decoder:
+            output_ids = generate_ids
+        else:
+            output_ids = []
+            for i in range(generate_ids.shape[0]):
+                output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
+            output_ids = torch.stack(output_ids, dim=0)
+        responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        print(f'generation overhead {end - start}: \n{responses}')
     
-    # # Test Greedy Search
-    # # input_ids = inputs.pop('input_ids')
-    # # outputs = greedy_search(
-    # #     stages, 
-    # #     input_ids,
-    # #     logits_processor=None,
-    # #     stopping_criteria=None,
-    # #     pad_token_id=None,
-    # #     eos_token_id=None,
-    # #     synced_gpus=False,
-    # #     **inputs,
-    # # )
-    # # responses = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    # # print(responses)
-    
-    # Instantiate beam scorer
-    input_ids = inputs.pop('input_ids')
-    generation_config = copy.deepcopy(stages[-1].generation_config)
-    generation_config.num_beams = 3
-    generation_config.max_length = 128
-    model_kwargs = generation_config.update(**inputs)
-    generation_config.validate()
-    stages[-1]._validate_model_kwargs(model_kwargs.copy())
-    synced_gpus = False
-    
-    # Set generation parameters if not already defined
-    logits_processor = LogitsProcessorList()
-    stopping_criteria = StoppingCriteriaList()
-    if generation_config.pad_token_id is None and generation_config.eos_token_id is not None:
-        eos_token_id = generation_config.eos_token_id
-        if isinstance(eos_token_id, list):
-            eos_token_id = eos_token_id[0]
-        generation_config.pad_token_id = eos_token_id
-    
-    # Define model inputs
-    inputs_tensor, model_input_name, model_kwargs = stages[-1]._prepare_model_inputs(
-        input_ids, generation_config.bos_token_id, model_kwargs
-    )
-    batch_size = inputs_tensor.shape[0]
-    
-    # Define other model kwargs
-    model_kwargs["output_attentions"] = generation_config.output_attentions
-    model_kwargs["output_hidden_states"] = generation_config.output_hidden_states
-    # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
-    # generating the first new token or not, and we only want to use the embeddings for the first new token)
-    if not stages[-1].config.is_encoder_decoder and model_input_name == "inputs_embeds":
-        model_kwargs["use_cache"] = True
-    else:
-        model_kwargs["use_cache"] = generation_config.use_cache
-        
-    accepts_attention_mask = "attention_mask" in set(inspect.signature(stages[-1].forward).parameters.keys())
-    requires_attention_mask = "encoder_outputs" not in model_kwargs
-    if model_kwargs.get("attention_mask", None) is None and requires_attention_mask and accepts_attention_mask:
-        model_kwargs["attention_mask"] = stages[-1]._prepare_attention_mask_for_generation(
-            inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
-        )
-    
-    # Prepare 'input_ids' which will be used for auto-regressive generation
-    input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
-
-    # Prepare `max_length` depending on other stopping criteria
-    input_ids_length = input_ids.shape[-1]
-    has_default_max_length = generation_config.max_length is not None
-    if generation_config.max_new_tokens is not None:
-        generation_config.max_length = generation_config.max_new_tokens + input_ids_length
-    stages[-1]._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
-    
-    # 8. prepare distribution pre_processing samplers
-    logits_processor = stages[-1]._get_logits_processor(
-        generation_config=generation_config,
-        input_ids_seq_length=input_ids_length,
-        encoder_input_ids=inputs_tensor,
-        prefix_allowed_tokens_fn=None,
-        logits_processor=logits_processor,
-        model_kwargs=model_kwargs,
-        negative_prompt_ids=None,
-        negative_prompt_attention_mask=None,
-    )
-    
-    # 9. prepare stopping criteria
-    stopping_criteria = stages[-1]._get_stopping_criteria(
-        generation_config=generation_config, stopping_criteria=stopping_criteria
-    )
-    
-    # 10. prepare beam search scorer
-    beam_scorer = BeamSearchScorer(
-        batch_size=input_ids.shape[0],
-        num_beams=generation_config.num_beams,
-        device=stages[-1].device,
-        length_penalty=generation_config.length_penalty,
-        do_early_stopping=generation_config.early_stopping,
-        num_beam_hyps_to_keep=generation_config.num_return_sequences,
-        max_length=generation_config.max_length,
-    )
-    # 11. interleave input_ids with `num_beams` additional sequences per batch
-    input_ids, model_kwargs = stages[-1]._expand_inputs_for_generation(
-        input_ids=input_ids,
-        expand_size=generation_config.num_beams,
-        is_encoder_decoder=stages[-1].config.is_encoder_decoder,
-        **model_kwargs,
-    )
-    stopping_criteria = StoppingCriteriaList()
-    stopping_criteria = stages[-1]._get_stopping_criteria(
-        generation_config=generation_config, stopping_criteria=stopping_criteria
-    )
-    # 12. run beam search
-    start = time.time()
-    generate_ids = beam_search(
-        stages, 
-        input_ids,
-        beam_scorer,
-        logits_processor=logits_processor,
-        stopping_criteria=stopping_criteria,
-        pad_token_id=generation_config.pad_token_id,
-        eos_token_id=generation_config.eos_token_id,
-        output_scores=generation_config.output_scores,
-        return_dict_in_generate=generation_config.return_dict_in_generate,
-        synced_gpus=synced_gpus,
-        **model_kwargs,
-    )
-    end = time.time()
-    if model.config.is_encoder_decoder:
-        output_ids = generate_ids
-    else:
-        output_ids = []
-        for i in range(generate_ids.shape[0]):
-            output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
-        output_ids = torch.stack(output_ids, dim=0)
-    responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    print(f'generation overhead {end - start}: \n{responses}')
