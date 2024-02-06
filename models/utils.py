@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Dict, List, Any, Union
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from llama import (
+from .llama import (
     LlamaStartingStage,
     LlamaIntermediateStage,
     LlamaEndingStage,
@@ -21,7 +21,11 @@ from transformers import (
     MaxLengthCriteria,
     BeamScorer,
     BeamSearchScorer,
+    AutoTokenizer, 
+    AutoConfig, 
+    AutoModelForCausalLM,
 )
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.cache_utils import DynamicCache
 from transformers.generation import (
     BeamSearchDecoderOnlyOutput, 
@@ -189,8 +193,8 @@ def _prepare_inputs(
         )
     return new_inputs
 
-# @torch.no_grad()
-@profile
+# @profile
+@torch.no_grad()
 def greedy_search(
     stages: List[LlamaEndingStage], 
     input_ids: torch.LongTensor,
@@ -655,8 +659,6 @@ if __name__ == '__main__':
     import time
     import pdb
     import inspect
-    from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
     # from fastchat.model import get_conversation_template
     
     # def process(msg: str, model_path: str):

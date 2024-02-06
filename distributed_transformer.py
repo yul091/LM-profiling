@@ -40,7 +40,7 @@ class Task:
         self.node_id = node_id
         
 
-class DistributedLLM:
+class DistributedTransformer:
     
     def __init__(self, args: argparse.Namespace):
         n_samples = args.n_samples
@@ -385,5 +385,5 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     
-    distributed_llm = DistributedLLM(args)
+    distributed_llm = DistributedTransformer(args)
     distributed_llm.run()
