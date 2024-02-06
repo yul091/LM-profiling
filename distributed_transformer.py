@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, Subset
 from concurrent.futures import ThreadPoolExecutor
 
 from utils import record_time
-from models import PipelineStage, get_stages
+from models import PipelineStage, get_transformer_stages
 from dataset import get_data, SentencePairDataset
 
 
@@ -315,7 +315,7 @@ class DistributedTransformer:
 
         # Instantiate stages and put them on the correct devices
         distributed_stages = [
-            get_stages(
+            get_transformer_stages(
                 num_stages=self.num_gpus_per_node,
                 init_device=self.distributed_nodes[nodeID].init_device,
                 timing_info=self.timing_infos[nodeID],

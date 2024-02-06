@@ -6,7 +6,7 @@ SETTING=random
 OUTPUT_DIR=prof_async
 RETRAIN_RATE=0.2
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_llm.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_transformer.py \
     --num_nodes $NUM_NODES \
     --n_samples $NUM_SAMPLES \
     --nlayers $LAYERS \

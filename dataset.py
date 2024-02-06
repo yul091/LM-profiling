@@ -2,11 +2,12 @@ import random
 from typing import List
 import torch
 from torch import nn, Tensor
-# from torchtext.datasets import WikiText2
-# from torchtext.data.utils import get_tokenizer
-# from torchtext.vocab import build_vocab_from_iterator
-# from torch.utils.data import Dataset
-from datasets import load_dataset, Dataset
+from torchtext.datasets import WikiText2
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
+from torch.utils.data import Dataset
+import datasets
+from datasets import load_dataset
 from itertools import chain
 from typing import List, Optional
 from transformers import LlamaTokenizer
@@ -371,7 +372,7 @@ class DGDataset:
         return concatenated_examples
 
 
-    def group_ED(self, dataset: Dataset):
+    def group_ED(self, dataset: datasets.Dataset):
         results = {
             'conv_id': [], 
             'prompt': [],
@@ -387,20 +388,13 @@ class DGDataset:
 
             response = {'text': instance['utterance'], 'speaker_idx': instance['speaker_idx']}
             results['dialog'][-1].append(response)
-        return Dataset.from_dict(results)
+        return datasets.Dataset.from_dict(results)
 
 
-    def preprocess(self, dataset: Dataset) -> Dataset:
+    def preprocess(self, dataset: datasets.Dataset) -> datasets.Dataset:
         if self.dataset == "empathetic_dialogues":
             dataset = self.group_ED(dataset)
 
-        # dataset = dataset.map(
-        #     self.tokenize_and_align_labels,
-        #     batched=False,
-        #     num_proc=self.preprocessing_num_workers,
-        #     remove_columns=dataset.column_names,
-        #     load_from_cache_file=not self.overwrite_cache,
-        # )
         dataset = dataset.map(
             self.process_dataset,
             batched=False,
@@ -423,7 +417,6 @@ class DGDataset:
 
 if __name__ == "__main__":
     from transformers import AutoTokenizer
-    from datasets import load_dataset
     import pdb
     import os
     

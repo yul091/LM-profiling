@@ -97,7 +97,7 @@ def get_total_params(module: torch.nn.Module):
     return total_params
 
     
-def get_stages(
+def get_transformer_stages(
     ntokens: int, 
     nlayers: int, 
     num_stages: int, 
@@ -160,7 +160,7 @@ if __name__ == '__main__':
     }
     num_gpus_per_node = 4
     timing_info = defaultdict(list)
-    stages = get_stages(
+    stages = get_transformer_stages(
         num_gpus=num_gpus_per_node,
         init_device=0,
         timing_info=timing_info,
