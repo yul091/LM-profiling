@@ -11,7 +11,7 @@ import pdb
 import torch.nn as nn
 from torch import Tensor
 from tqdm import tqdm
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, Union
 from collections import defaultdict
 from torch.utils.data import DataLoader
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +24,9 @@ from models import (
     LlamaIntermediateStage,
     LlamaEndingStage, 
     _prepare_inputs,
+    compute_nll_loss,
+    CustomizedOut,
+    CausalLMOutputWithPast,
 )
 
 
@@ -46,14 +49,13 @@ class Task:
     def __init__(
         self, 
         task_id: int, 
-        query: Tensor, 
-        feedback: Tensor, 
+        query: Dict[str, Union[torch.Tensor, Any]], 
+        feedback: Dict[str, Union[torch.Tensor, Any]], 
         node_id: Optional[int] = None, 
         num_gpus_per_node: Optional[int] = None,
         require_training: Optional[bool] = None,
     ):
         self.task_id = task_id
-        self.query = query
         self.feedback = feedback
         num_gpus_per_node = num_gpus_per_node if num_gpus_per_node is not None else 1
         self.hiddens = [query] + [None for _ in range(num_gpus_per_node - 1)]
@@ -91,16 +93,6 @@ class DistributedLLM:
             token=self.access_token,
         )
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.distributed_stages = [
-            get_stages(
-                self.config,
-                token=self.access_token,
-                model_name_or_path=self.model_name_or_path,
-                num_stages=self.num_gpus_per_node,
-                init_device=self.distributed_nodes[nodeID].init_device,
-                timing_info=self.timing_infos[nodeID],
-            ) for nodeID in range(self.num_nodes)
-        ]
         
         # Load the dataset
         datasets = load_dataset('data/Anthropic')
@@ -121,14 +113,9 @@ class DistributedLLM:
             self.tokenize_and_align_labels,
             batched=True,
         )
-        # Batch: input_ids, attention_mask, labels
+        # Batch: input_ids, attention_mask, labels, labels_attention_mask
         self.train_dataloader = self.get_dataloader(dataset=self.train_dataset)
         self.test_dataloader = self.get_dataloader(dataset=self.test_dataset)
-        
-        # get a batch
-        print(next(iter(self.train_dataloader)))
-        
-        pdb.set_trace()
     
         
     def tokenize_and_align_labels(self, examples):
@@ -143,6 +130,7 @@ class DistributedLLM:
             truncation=True,
         )
         tokenized_inputs['labels'] = labels['input_ids']
+        tokenized_inputs['labels_attention_mask'] = labels['attention_mask']
         return tokenized_inputs
         
         
@@ -170,15 +158,22 @@ class DistributedLLM:
         preloaded_tasks = defaultdict(list)
         for nodeID, node in enumerate(distributed_nodes):
             for i, batch in enumerate(dataloader):
+                labels = {
+                    'input_ids': batch.pop('labels'),
+                    'attention_mask': batch.pop('labels_attention_mask'),
+                }
                 # 10% of the time, produce a task with feedback
                 if random.random() < retraining_rate:
                     require_training = True
                 else:
                     require_training = False  
+                
                 task = Task(
                     task_id=i,
-                    query=batch[0].cuda(node.init_device), 
-                    feedback=batch[1].cuda(node.last_device), 
+                    # query=batch[0].cuda(node.init_device), 
+                    query=_prepare_inputs(batch, device=node.init_device),
+                    # feedback=batch[1].cuda(node.last_device), 
+                    feedback=_prepare_inputs(labels, device=node.last_device),
                     node_id=nodeID,
                     num_gpus_per_node=node.num_gpus_per_node,
                     require_training=require_training,
@@ -240,49 +235,74 @@ class DistributedLLM:
         preloaded_tasks: List[Task], 
         deviceQueue: queue.Queue,
         nextdeviceQueue: queue.Queue = None,
-        criterion: nn.CrossEntropyLoss = nn.CrossEntropyLoss(),
         init_device: int = 0,
     ):
         device = stage.device
         while True:
             taskID: int = deviceQueue.get()
             if taskID is None:
-                print("Stage {} finished inference".format(stage.device))
+                print("Stage {} finished inference".format(device))
                 if nextdeviceQueue is not None:
                     nextdeviceQueue.put(None)
                 break
             
             task = preloaded_tasks[taskID]
             assert task.task_id == taskID
-            hidden = task.hiddens[stageID]
-            if hidden is None:
-                print("Stage {} waiting for task {}".format(stage.device, taskID))
+            inputs = task.hiddens[stageID]
+            if inputs is None:
+                print("Stage {} waiting for task {}".format(device, taskID))
                 continue
             
-            if task.require_training:
-                # This is a retraining task
-                record_time(device, 'start', 'forward_loss', timing_info)
-                output = stage(hidden)
-                record_time(device, 'end', 'forward_loss', timing_info)
-                if nextdeviceQueue is None:
-                    # Backprop on the last stage
-                    # print("Stage {} start backward propagation for task {}".format(stage.device, taskID))
-                    output_flat = output.contiguous().view(-1, output.size(-1)) # (B * T, C)
-                    # print("output_flat shape: {}, feedback shape: {}".format(output_flat.shape, task.feedback.shape))
-                    loss = criterion(output_flat, task.feedback)
-                    # print("loss: {}, start loss backward ...".format(loss))
-                    loss.backward()
-                    record_time(init_device, 'end', 'backward', timing_info)
-                    # print("Stage {} finish backward propagation for task {} !".format(stage.device, taskID))
-            else:
-                record_time(device, 'start', 'forward', timing_info)
-                with torch.no_grad():
-                    output = stage(hidden)
-                record_time(device, 'end', 'forward', timing_info)
-            if nextdeviceQueue is not None:
+            if nextdeviceQueue is not None: # intermediate stage
+                if task.require_training: # this is a retraining task
+                    record_time(device, 'start', 'forward_loss', timing_info)
+                    tuple_outputs = stage(**inputs)
+                    record_time(device, 'end', 'forward_loss', timing_info)
+                else:
+                    record_time(device, 'start', 'forward', timing_info)
+                    with torch.no_grad():
+                        tuple_outputs = stage(**inputs)
+                    record_time(device, 'end', 'forward', timing_info)
+                
+                outputs = CustomizedOut(
+                    hidden_states=tuple_outputs[0],
+                    past_key_values=tuple_outputs[1],
+                    all_hidden_states=tuple_outputs[2],
+                    all_self_attns=tuple_outputs[3],
+                    position_ids=tuple_outputs[4],
+                    attention_mask=tuple_outputs[5],
+                )
                 # Need to send the output to the next stage, except for the last stage
-                task.hiddens[stageID+1] = output.cuda(device+1, non_blocking=True)
+                task.hiddens[stageID+1] = _prepare_inputs(outputs, device+1)
                 nextdeviceQueue.put(taskID)
+                
+            else: # ending stage
+                
+                if task.require_training: # this is a retraining task
+                    record_time(device, 'start', 'forward_loss', timing_info)
+                    nll_loss = compute_nll_loss(stage, inputs, task.feedback)
+                    record_time(device, 'end', 'forward_loss', timing_info)
+                else:
+                    record_time(device, 'start', 'forward', timing_info)
+                    with torch.no_grad():
+                        nll_loss = compute_nll_loss(stage, inputs, task.feedback)
+                    record_time(device, 'end', 'forward', timing_info)
+                    
+                print("[loss={}] stage {} finished inference for task {}".format(
+                    nll_loss, device, taskID
+                ))
+                
+                if self.setting == 'active':
+                    # Backprop on the last stage
+                    # print("Stage {} start backward propagation for task {}".format(device, taskID))
+                    # print("output_flat shape: {}, feedback shape: {}".format(output_flat.shape, task.feedback.shape))
+                    # print("loss: {}, start loss backward ...".format(nll_loss))
+                    nll_loss.backward()
+                    record_time(init_device, 'end', 'backward', timing_info)
+                    # print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                else:
+                    task.hiddens.append(nll_loss)
+                    deviceQueue.put(taskID) # put it back to the queue
 
 
     def node_inference(
@@ -301,9 +321,8 @@ class DistributedLLM:
                     stageID,
                     timing_info, 
                     preloaded_tasks,
-                    node.device_queues[stageID],
-                    node.device_queues[stageID+1] if stageID != len(stages) - 1 else None,
-                    criterion=nn.CrossEntropyLoss(),
+                    deviceQueue=node.device_queues[stageID],
+                    nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(stages) - 1 else None,
                     init_device=node.init_device,
                 )
                 
@@ -336,6 +355,20 @@ class DistributedLLM:
             self.test_dataloader, 
             retraining_rate=self.retraining_rate,
         )
+        
+        distributed_stages = [
+            get_stages(
+                self.config,
+                token=self.access_token,
+                model_name_or_path=self.model_name_or_path,
+                num_stages=self.num_gpus_per_node,
+                init_device=self.distributed_nodes[nodeID].init_device,
+                timing_info=self.timing_infos[nodeID],
+            ) for nodeID in range(self.num_nodes)
+        ]
+        # # get a batch
+        # print("Node [0] preloaded task [0]: ", vars(preloaded_tasks[0][0]))
+        # pdb.set_trace()
 
         # Run the stages concurrently
         task_queue = queue.Queue()
@@ -356,7 +389,7 @@ class DistributedLLM:
             future3 = executor.submit(
                 self.run_stages_concurrently,  
                 preloaded_tasks, 
-                self.distributed_stages,
+                distributed_stages,
                 self.timing_infos,
                 self.distributed_nodes,
             )
@@ -386,11 +419,11 @@ if __name__ == '__main__':
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=200)
-    parser.add_argument('--setting', type=str, default='random', choices=['identical','random', 'variant'], help='workload setting')
+    parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'one_node'], help='training setting')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--rate_lambda', type=float, default=60, help='Average number of tasks produced per minute')
-    parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'])
+    parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     

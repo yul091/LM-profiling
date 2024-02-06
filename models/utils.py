@@ -653,29 +653,43 @@ def generate(
     #     synced_gpus=synced_gpus,
     #     **model_kwargs,
     # )
+    
+    
+    
+def compute_nll_loss(
+    model: LlamaEndingStage,
+    inputs: Dict[str, Union[torch.Tensor, Any]], 
+    labels: Dict[str, Union[torch.Tensor, Any]],
+) -> torch.Tensor:
+    # For clm, we need to mask the sentence (-100) and add to the labels
+    new_inputs = inputs.copy()
+    for k in ['input_ids', 'attention_mask']:
+        new_inputs[k] = torch.cat((inputs[k], labels[k]), dim=1)
+    new_labels = torch.cat(
+        (-100 * torch.ones_like(inputs["input_ids"]), labels["input_ids"]), 
+        dim=1,
+    )
+    outputs = model(**new_inputs, labels=new_labels)
+    
+    return outputs.loss
 
 
 if __name__ == '__main__':
     import time
     import pdb
     import inspect
-    # from fastchat.model import get_conversation_template
-    
-    # def process(msg: str, model_path: str):
-    #     conv = get_conversation_template(model_path)
-    #     conv.append_message(conv.roles[0], msg)
-    #     conv.append_message(conv.roles[1], None)
-    #     prompt = conv.get_prompt()
-    #     return prompt
     
     texts = [
         "Hello, my dog is cute",
         "What is your name?",
-        "I recently bought a new car. It is a Tesla, and it is very fast."
+        "I recently bought a new car. It is a Tesla, and it is very fast.",
+    ]
+    references = [
+        "\nI'm glad you think so! Dogs are always a joy to have around, and they can bring so much happiness and companionship to our lives. Is your dog a specific breed, or a mix of breeds? Do you have any funny or interesting stories about your dog that you'd like to share?", 
+        '\n\nMy name is Sherlock Holmes.\n\nWhat is your occupation?\n\nI am a consulting detective.\n\nWhat is your address?\n\nI do not have an address. I am a wanderer of the streets of London.\n\nWhat is your favorite food?\n\nI do not have a favorite food. I am a man of simple tastes and eat whatever is available.\n\nWhat is your favorite drink?\n\nI do not drink alcohol. I find it to be a hindrance to my work.\n\nWhat is your favorite hobby?\n\nI do not have a favorite hobby. I am too busy solving crimes to have time for hobbies.\n\nWhat is your favorite book?\n\nI do not have a favorite book. I am more interested in solving crimes than reading books.\n\nWhat is your favorite music?\n\nI do not have a favorite type of music. I am too busy solving crimes to listen to music.\n\nWhat is your favorite sport?\n\nI do not have a favorite sport. I am too busy solving crimes to have time for sports.\n\nWhat is your favorite animal?\n\nI do not have a favorite animal. I am too busy solving crimes to have time for pets.\n\nWhat is your favorite color?\n\nI do not have a favorite color. I am too busy solving crimes to have time to think about such trivial matters.\n\nWhat is your favorite place to visit?\n\nI do not have a favorite place to visit. I am too busy solving crimes to have time to travel.\n\nWhat is your favorite thing to do?\n\nI do not have a favorite thing to do. I am too busy solving crimes to have time for leisure activities.\n\nWhat is your favorite quote?\n\n"Elementary, my dear Watson."', 
+        'I can go from 0 to 60 in just 3.2 seconds. It is also very environmentally friendly, as it runs on electricity and produces zero emissions. I am very happy with my new car and I think it will be a great addition to my family.\n\nI am writing to tell you about my new car because I am very excited about it. I have always been interested in technology and innovation, and a Tesla is the perfect combination of both. The car is equipped with advanced technology, including a large touchscreen display and a sophisticated autopilot system. It also has a range of safety features, such as automatic emergency braking and lane departure warning.\n\nI am also impressed with the design of the car. It has a sleek and modern look, and it is very easy to drive. The car is also very spacious, with plenty of room for passengers and cargo. I am confident that it will be a reliable and comfortable vehicle for many years to come.\n\nOverall, I am very pleased with my new Tesla and I think it will be a great addition to my family. I am excited to take it on long road trips and to show it off to my friends and family. I am sure that it will provide many years of safe and enjoyable driving.',
     ]
     print("Queries: ", texts)
-    # prompts = [process(text, model_name_or_path) for text in texts]
-    # print("Prompts: ", prompts)
     
     access_token = "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"
     model_name_or_path = "meta-llama/Llama-2-7b-chat-hf"
@@ -683,12 +697,7 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, token=access_token)
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Test Causal Language Modeling
-    inputs = tokenizer(texts, return_tensors="pt", padding=True)
-    inputs['labels'] = inputs['input_ids'].clone()
-    encoder_input_ids = inputs["input_ids"].clone()
-    
-    test_forward, test_generation = True, False
+    test_forward, test_generation = False, True
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path, 
         config=config, 
@@ -696,59 +705,75 @@ if __name__ == '__main__':
         device_map='auto',
         # torch_dtype="auto"
     )
-    if test_forward:
-        start = time.time()
-        outputs = model(**inputs)
-        loss = outputs.loss
-        logits = outputs.logits
-        end = time.time()
-        print(f'loss: {loss}, logits: {logits.shape}')
-        print(f'forward overhead {end - start}')
-    if test_generation:
-        start = time.time()
-        generate_ids = model.generate(**inputs, do_sample=False)
-        end = time.time()
-        if model.config.is_encoder_decoder:
-            output_ids = generate_ids
-        else:
-            output_ids = []
-            for i in range(generate_ids.shape[0]):
-                output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
-            output_ids = torch.stack(output_ids, dim=0)
-        responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        print(f'generation overhead {end - start}: \n{responses}')
     
-    num_stages = 8
-    timing_info = defaultdict(list)
-    stages = get_stages(
-        config, 
-        access_token,
-        model_name_or_path,
-        num_stages, 
-        timing_info=timing_info,
-    )
-    if test_forward:
-        start = time.time()
-        outputs = stages_forward(stages, inputs)
-        loss = outputs[0]
-        logits = outputs[1]
-        end = time.time()
-        print(f'loss: {loss}, logits: {logits}')
-        print(f'forward overhead {end - start}')
-        # loss.backward()
-        # timing_info['0_end'].append((time.time(), 'backward'))
-        # print(timing_info)
-    if test_generation:
-        start = time.time()
-        generate_ids = generate(stages, inputs)
-        end = time.time()
-        if model.config.is_encoder_decoder:
-            output_ids = generate_ids
-        else:
-            output_ids = []
-            for i in range(generate_ids.shape[0]):
-                output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
-            output_ids = torch.stack(output_ids, dim=0)
-        responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        print(f'generation overhead {end - start}: \n{responses}')
+    # Test decoding nll loss
+    inputs = tokenizer(texts, return_tensors="pt", padding=True)
+    labels = tokenizer(references, return_tensors="pt", padding=True)
+    start = time.time()
+    loss = compute_nll_loss(model, inputs, labels)
+    end = time.time()
+    print(f'nll loss: {loss}, overhead: {end - start}')
+    
+    
+    # # Test Causal Language Modeling
+    # inputs = tokenizer(texts, return_tensors="pt", padding=True)
+    # inputs['labels'] = inputs['input_ids'].clone()
+    # encoder_input_ids = inputs["input_ids"].clone()
+    
+    # if test_forward:
+    #     # CLM forward pass
+    #     start = time.time()
+    #     outputs = model(**inputs)
+    #     loss = outputs.loss
+    #     logits = outputs.logits
+    #     end = time.time()
+    #     print(f'loss: {loss}, logits: {logits.shape}')
+    #     print(f'forward overhead {end - start}')
+    # if test_generation:
+    #     start = time.time()
+    #     generate_ids = model.generate(**inputs, do_sample=False)
+    #     end = time.time()
+    #     if model.config.is_encoder_decoder:
+    #         output_ids = generate_ids
+    #     else:
+    #         output_ids = []
+    #         for i in range(generate_ids.shape[0]):
+    #             output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
+    #         output_ids = torch.stack(output_ids, dim=0)
+    #     responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    #     print(f'generation overhead {end - start}: \n{responses}')
+    
+    # num_stages = 8
+    # timing_info = defaultdict(list)
+    # stages = get_stages(
+    #     config, 
+    #     access_token,
+    #     model_name_or_path,
+    #     num_stages, 
+    #     timing_info=timing_info,
+    # )
+    # if test_forward:
+    #     start = time.time()
+    #     outputs = stages_forward(stages, inputs)
+    #     loss = outputs[0]
+    #     logits = outputs[1]
+    #     end = time.time()
+    #     print(f'loss: {loss}, logits: {logits}')
+    #     print(f'forward overhead {end - start}')
+    #     # loss.backward()
+    #     # timing_info['0_end'].append((time.time(), 'backward'))
+    #     # print(timing_info)
+    # if test_generation:
+    #     start = time.time()
+    #     generate_ids = generate(stages, inputs)
+    #     end = time.time()
+    #     if model.config.is_encoder_decoder:
+    #         output_ids = generate_ids
+    #     else:
+    #         output_ids = []
+    #         for i in range(generate_ids.shape[0]):
+    #             output_ids.append(generate_ids[i][len(encoder_input_ids[i]):])
+    #         output_ids = torch.stack(output_ids, dim=0)
+    #     responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    #     print(f'generation overhead {end - start}: \n{responses}')
     
