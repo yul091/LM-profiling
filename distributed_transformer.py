@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from tqdm import tqdm
-from typing import List, Dict
+from typing import List, Dict, Optional
 from collections import defaultdict
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Subset
@@ -23,7 +23,12 @@ from dataset import get_data, SentencePairDataset
 
 
 class Node:
-    def __init__(self, node_id: int, num_gpus_per_node: int, init_device: int = 0):
+    def __init__(
+        self, 
+        node_id: int, 
+        num_gpus_per_node: int, 
+        init_device: Optional[int] = 0,
+    ):
         self.node_id = node_id
         self.num_gpus_per_node = num_gpus_per_node
         self.device_queues = [queue.Queue() for _ in range(num_gpus_per_node)]
@@ -32,12 +37,22 @@ class Node:
         
         
 class Task:
-    def __init__(self, task_id: int, query: Tensor, feedback: Tensor = None, node_id: int = 0, num_gpus_per_node: int = 1):
+    def __init__(
+        self, 
+        task_id: int, 
+        query: Tensor, 
+        feedback: Optional[Tensor] = None, 
+        node_id: Optional[int] = None, 
+        num_gpus_per_node: Optional[int] = None,
+        require_training: Optional[bool] = None,
+    ):
         self.task_id = task_id
         self.query = query
+        num_gpus_per_node = num_gpus_per_node if num_gpus_per_node is not None else 1
         self.hiddens = [query] + [None for _ in range(num_gpus_per_node - 1)]
         self.feedback = feedback
-        self.node_id = node_id
+        self.node_id = node_id if node_id is not None else 0
+        self.require_training = False if require_training is None else True
         
 
 class DistributedTransformer:
@@ -63,6 +78,7 @@ class DistributedTransformer:
             for i in range(self.num_nodes)
         ]
         self.timing_infos = [defaultdict(list) for _ in range(self.num_nodes)]
+        self.metrics = defaultdict(list)
         
         # Example data for each stage
         _, _, test_data, vocab = get_data(block_size=block_size, setting=self.setting)
@@ -125,40 +141,36 @@ class DistributedTransformer:
                 for i, batch in enumerate(dataloader):
                     # 10% of the time, produce a task with feedback
                     if random.random() < retraining_rate:
-                        task = Task(
-                            task_id=i,
-                            query=batch[0].cuda(node.init_device), 
-                            feedback=batch[1].cuda(node.last_device), 
-                            node_id=nodeID,
-                            num_gpus_per_node=node.num_gpus_per_node,
-                        )
+                        require_training = True
                     else:
-                        task = Task(
-                            task_id=i,
-                            query=batch[0].cuda(node.init_device), 
-                            node_id=nodeID,
-                            num_gpus_per_node=node.num_gpus_per_node,
-                        )
+                        require_training = False
+                        
+                    task = Task(
+                        task_id=i,
+                        query=batch[0].cuda(node.init_device), 
+                        feedback=batch[1].cuda(node.last_device), 
+                        node_id=nodeID,
+                        num_gpus_per_node=node.num_gpus_per_node,
+                        require_training=require_training,
+                    ) 
                     preloaded_tasks[node.node_id].append(task)
                     
             elif setting == 'variant':
                 for i, batch in enumerate(dataloader):
                     # Odd batches are short, better utilize the bubble for retraining
                     if i % 2 == 0 and random.random() < 2 * retraining_rate:
-                        task = Task(
-                            task_id=i,
-                            query=batch[0].cuda(node.init_device), 
-                            feedback=batch[1].cuda(node.last_device), 
-                            node_id=nodeID, 
-                            num_gpus_per_node=node.num_gpus_per_node,
-                        )
+                        require_training = True
                     else:
-                        task = Task(
-                            task_id=i,
-                            query=batch[0].cuda(node.init_device), 
-                            node_id=nodeID,
-                            num_gpus_per_node=node.num_gpus_per_node,
-                        )
+                        require_training = False
+                    
+                    task = Task(
+                        task_id=i,
+                        query=batch[0].cuda(node.init_device), 
+                        feedback=batch[1].cuda(node.last_device), 
+                        node_id=nodeID,
+                        num_gpus_per_node=node.num_gpus_per_node,
+                        require_training=require_training,
+                    )     
                     preloaded_tasks[node.node_id].append(task)
         return preloaded_tasks
 
@@ -234,27 +246,30 @@ class DistributedTransformer:
                 print("Stage {} waiting for task {}".format(stage.device, taskID))
                 continue
             
-            if task.feedback is not None:
+            if task.require_training:
                 # This is a retraining task
                 record_time(device, 'start', 'forward_loss', timing_info)
                 output = stage(hidden)
                 record_time(device, 'end', 'forward_loss', timing_info)
-                if nextdeviceQueue is None:
-                    # Backprop on the last stage
-                    # print("Stage {} start backward propagation for task {}".format(stage.device, taskID))
-                    output_flat = output.contiguous().view(-1, output.size(-1)) # (B * T, C)
-                    # print("output_flat shape: {}, feedback shape: {}".format(output_flat.shape, task.feedback.shape))
-                    loss = criterion(output_flat, task.feedback)
-                    # print("loss: {}, start loss backward ...".format(loss))
-                    loss.backward()
-                    record_time(init_device, 'end', 'backward', timing_info)
-                    # print("Stage {} finish backward propagation for task {} !".format(stage.device, taskID))
             else:
                 record_time(device, 'start', 'forward', timing_info)
                 with torch.no_grad():
                     output = stage(hidden)
                 record_time(device, 'end', 'forward', timing_info)
-            if nextdeviceQueue is not None:
+            
+            if nextdeviceQueue is None:
+                # Backprop on the last stage
+                # print("Stage {} start backward propagation for task {}".format(stage.device, taskID))
+                output_flat = output.contiguous().view(-1, output.size(-1)) # (B * T, C)
+                # print("output_flat shape: {}, feedback shape: {}".format(output_flat.shape, task.feedback.shape))
+                loss = criterion(output_flat, task.feedback)
+                self.metrics["loss"].append(loss.item())
+                # print("loss: {}, start loss backward ...".format(loss))
+                if task.require_training:
+                    loss.backward()
+                    record_time(init_device, 'end', 'backward', timing_info)
+                    # print("Stage {} finish backward propagation for task {} !".format(stage.device, taskID))    
+            else:
                 # Need to send the output to the next stage, except for the last stage
                 task.hiddens[stageID+1] = output.cuda(device+1, non_blocking=True)
                 nextdeviceQueue.put(taskID)
@@ -347,6 +362,13 @@ class DistributedTransformer:
                 self.timing_infos,
                 self.distributed_nodes,
             )
+            
+        # Save metrics
+        os.makedirs(self.output_dir, exist_ok=True)
+        stats_f = f'{self.output_dir}/metrics_{self.setting}_{self.workload}_{self.retraining_rate}.json'
+        with open(stats_f, 'w') as f:
+            json.dump(self.metrics, f, indent=4)
+        print(f"Metrics saved to {stats_f}:\n{self.metrics}")
             
         # Save timing info
         self.save_timing_info()
