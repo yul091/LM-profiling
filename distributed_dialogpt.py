@@ -19,19 +19,16 @@ from datasets import load_dataset, Dataset
 from transformers import (
     AutoConfig, 
     AutoTokenizer, 
-    # default_data_collator, 
     DataCollatorForSeq2Seq,
 )
 from utils import record_time
 from models import (
     get_stages, 
-    LlamaStartingStage,
-    LlamaIntermediateStage,
-    LlamaEndingStage, 
+    GPTEndingStage,
     _prepare_inputs,
     _prepare_decoding_inputs,
-    CustomizedOut,
-    CausalLMOutputWithPast,
+    CustomizedGPT2Out,
+    CausalLMOutputWithCrossAttentions,
 )
 
 
@@ -235,7 +232,7 @@ class DistributedLLM:
 
     def device_inference(
         self,
-        stage: LlamaEndingStage, 
+        stage: GPTEndingStage, 
         stageID: int,
         timing_info: dict, 
         preloaded_tasks: List[Task], 
@@ -274,25 +271,29 @@ class DistributedLLM:
                 record_time(device, 'end', 'forward', timing_info)
                 
             if nextdeviceQueue is not None: # intermediate stage
-                outputs = CustomizedOut(
+                outputs = CustomizedGPT2Out(
                     hidden_states=tuple_outputs[0],
-                    past_key_values=tuple_outputs[1],
-                    all_hidden_states=tuple_outputs[2],
-                    all_self_attns=tuple_outputs[3],
-                    position_ids=tuple_outputs[4],
-                    attention_mask=tuple_outputs[5],
+                    attention_mask=tuple_outputs[1],
+                    head_mask=tuple_outputs[2],
+                    encoder_hidden_states=tuple_outputs[3],
+                    encoder_attention_mask=tuple_outputs[4],
+                    all_hidden_states=tuple_outputs[5],
+                    all_self_attentions=tuple_outputs[6],
+                    all_cross_attentions=tuple_outputs[7],
+                    output_shape=tuple_outputs[8],
                 )
                 # Need to send the output to the next stage, except for the last stage
                 task.hiddens[stageID+1] = _prepare_inputs(outputs, device+1)
                 nextdeviceQueue.put(taskID)
                 
             else: # ending stage
-                outputs = CausalLMOutputWithPast(
+                outputs = CausalLMOutputWithCrossAttentions(
                     loss=tuple_outputs[0],
                     logits=tuple_outputs[1],
                     past_key_values=tuple_outputs[2],
                     hidden_states=tuple_outputs[3],
                     attentions=tuple_outputs[4],
+                    cross_attentions=tuple_outputs[5],
                 )
                 loss = outputs.loss
                 print("[loss={}] stage {} finished inference for task {}".format(
@@ -316,7 +317,7 @@ class DistributedLLM:
         self,
         node: Node,
         preloaded_tasks: List[Task],
-        stages: List[LlamaEndingStage], 
+        stages: List[GPTEndingStage], 
         timing_info: dict,
     ):
         # We use 16 workers to simulateously get task from the queue and inference
@@ -339,7 +340,7 @@ class DistributedLLM:
     def run_stages_concurrently(
         self,
         preloaded_tasks: Dict[int, List[Task]],
-        distributed_stages: List[List[LlamaEndingStage]], 
+        distributed_stages: List[List[GPTEndingStage]], 
         timing_infos: List[dict], 
         distributed_nodes: List[Node],
     ):
@@ -373,8 +374,8 @@ class DistributedLLM:
                 timing_info=self.timing_infos[nodeID],
             ) for nodeID in range(self.num_nodes)
         ]
-        # # get a batch
-        # print("Node [0] preloaded task [0]: ", vars(preloaded_tasks[0][0]))
+        # get a batch
+        print("Node [0] preloaded task [0]: ", vars(preloaded_tasks[0][0]))
         # pdb.set_trace()
 
         # Run the stages concurrently

@@ -13,7 +13,7 @@ from transformers import (
     GPT2PreTrainedModel,
 )
 from transformers.utils import logging
-from transformers.modeling_outputs import ModelOutput
+from transformers.modeling_outputs import ModelOutput, CausalLMOutputWithCrossAttentions
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 
 logger = logging.get_logger(__name__)
