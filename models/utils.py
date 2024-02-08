@@ -6,45 +6,44 @@ from collections.abc import Mapping
 from typing import Optional, Tuple, Dict, List, Any, Union
 import torch
 import torch.nn as nn
-from llama import (
+from .llama import (
     LlamaStartingStage,
     LlamaIntermediateStage,
     LlamaEndingStage,
 )
-from dialogpt import (
+from .dialogpt import (
     GPTStartingStage,
     GPTIntermediateStage,
     GPTEndingStage,
 )
 from transformers import (
     LlamaConfig, 
+    PreTrainedTokenizer,
     AutoTokenizer, 
     AutoConfig, 
     AutoModelForCausalLM,
 )
-from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.cache_utils import DynamicCache
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 def _prepare_input(
     data: Union[torch.Tensor, Any],
     device: torch.device = 'cuda',
 ) -> Union[torch.Tensor, Any]:
-        """
-        Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
-        """
-        if isinstance(data, Mapping):
-            return type(data)({k: _prepare_input(v, device) for k, v in data.items()})
-        elif isinstance(data, (tuple, list)):
-            return type(data)(_prepare_input(v, device) for v in data)
-        elif isinstance(data, DynamicCache):
-            data.key_cache = _prepare_input(data.key_cache, device)
-            data.value_cache = _prepare_input(data.value_cache, device)
-        elif isinstance(data, torch.Tensor):
-            kwargs = {"device": device}
-            return data.to(**kwargs)
-        return data
+    """
+    Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
+    """
+    if isinstance(data, Mapping):
+        return type(data)({k: _prepare_input(v, device) for k, v in data.items()})
+    elif isinstance(data, (tuple, list)):
+        return type(data)(_prepare_input(v, device) for v in data)
+    elif isinstance(data, DynamicCache):
+        data.key_cache = _prepare_input(data.key_cache, device)
+        data.value_cache = _prepare_input(data.value_cache, device)
+    elif isinstance(data, torch.Tensor):
+        kwargs = {"device": device}
+        return data.to(**kwargs)
+    return data
     
 
 def _prepare_inputs(
@@ -190,58 +189,38 @@ def stages_forward(
     return outputs
 
 
+def _prepare_decoding_inputs(
+    inputs: Dict[str, Union[torch.Tensor, Any]],
+):
+    new_inputs = inputs.copy() # Don't modify the original dict
+    labels = new_inputs.pop("labels")
+    labels_attention_mask = torch.ones_like(labels)
+    new_inputs['input_ids'] = torch.cat((inputs['input_ids'], labels), dim=1)
+    new_inputs['attention_mask'] = torch.cat((inputs['attention_mask'], labels_attention_mask), dim=1)
+    new_labels = torch.cat(
+        (-100 * torch.ones_like(inputs['input_ids']), labels), dim=1
+    )
+    new_inputs['labels'] = new_labels
+    return new_inputs
+
+
 def stages_decoding(
     stages: List[Union[GPTEndingStage, LlamaEndingStage]], 
     inputs: Dict[str, Union[torch.Tensor, Any]],
-    labels: Dict[str, Union[torch.Tensor, Any]],
 ):
-    # Step 1: prepare inputs
     # For clm, we need to mask the sentence (-100) and add to the labels
-    new_inputs = inputs.copy()
-    for k in ['input_ids', 'attention_mask']:
-        new_inputs[k] = torch.cat((inputs[k], labels[k]), dim=1)
-    new_labels = torch.cat(
-        (-100 * torch.ones_like(inputs["input_ids"]), labels["input_ids"]), 
-        dim=1,
-    )
-    new_inputs['labels'] = new_labels
+    new_inputs = _prepare_decoding_inputs(inputs)
     return stages_forward(stages, new_inputs)
-    
-    
-def compute_nll_loss(
-    model: LlamaEndingStage,
-    inputs: Dict[str, Union[torch.Tensor, Any]], 
-    labels: Dict[str, Union[torch.Tensor, Any]],
-    concate_keys: List[str] = ['input_ids', 'attention_mask'],
-) -> torch.Tensor:
-    # For clm, we need to mask the sentence (-100) and add to the labels
-    new_inputs = inputs.copy()
-    for k in concate_keys:
-        new_inputs[k] = torch.cat((inputs[k], labels[k]), dim=1)
-    new_labels = torch.cat(
-        (-100 * torch.ones_like(inputs["input_ids"]), labels["input_ids"]), 
-        dim=1,
-    )
-    outputs = model(**new_inputs, labels=new_labels)
-    return outputs.loss
+
 
 
 if __name__ == '__main__':
     import time
-    import pdb
+    from datasets import load_dataset
+    from torch.utils.data import DataLoader
+    from transformers import DataCollatorForSeq2Seq 
     
-    texts = [
-        "Hello, my dog is cute",
-        "What is your name?",
-        "I recently bought a new car. It is a Tesla, and it is very fast.",
-    ]
-    references = [
-        "\nI'm glad you think so! Dogs are always a joy to have around, and they can bring so much happiness and companionship to our lives. Is your dog a specific breed, or a mix of breeds? Do you have any funny or interesting stories about your dog that you'd like to share?", 
-        '\n\nMy name is Sherlock Holmes.\n\nWhat is your occupation?\n\nI am a consulting detective.\n\nWhat is your address?\n\nI do not have an address. I am a wanderer of the streets of London.\n\nWhat is your favorite food?\n\nI do not have a favorite food. I am a man of simple tastes and eat whatever is available.\n\nWhat is your favorite drink?\n\nI do not drink alcohol. I find it to be a hindrance to my work.\n\nWhat is your favorite hobby?\n\nI do not have a favorite hobby. I am too busy solving crimes to have time for hobbies.\n\nWhat is your favorite book?\n\nI do not have a favorite book. I am more interested in solving crimes than reading books.\n\nWhat is your favorite music?\n\nI do not have a favorite type of music. I am too busy solving crimes to listen to music.\n\nWhat is your favorite sport?\n\nI do not have a favorite sport. I am too busy solving crimes to have time for sports.\n\nWhat is your favorite animal?\n\nI do not have a favorite animal. I am too busy solving crimes to have time for pets.\n\nWhat is your favorite color?\n\nI do not have a favorite color. I am too busy solving crimes to have time to think about such trivial matters.\n\nWhat is your favorite place to visit?\n\nI do not have a favorite place to visit. I am too busy solving crimes to have time to travel.\n\nWhat is your favorite thing to do?\n\nI do not have a favorite thing to do. I am too busy solving crimes to have time for leisure activities.\n\nWhat is your favorite quote?\n\n"Elementary, my dear Watson."', 
-        'I can go from 0 to 60 in just 3.2 seconds. It is also very environmentally friendly, as it runs on electricity and produces zero emissions. I am very happy with my new car and I think it will be a great addition to my family.\n\nI am writing to tell you about my new car because I am very excited about it. I have always been interested in technology and innovation, and a Tesla is the perfect combination of both. The car is equipped with advanced technology, including a large touchscreen display and a sophisticated autopilot system. It also has a range of safety features, such as automatic emergency braking and lane departure warning.\n\nI am also impressed with the design of the car. It has a sleek and modern look, and it is very easy to drive. The car is also very spacious, with plenty of room for passengers and cargo. I am confident that it will be a reliable and comfortable vehicle for many years to come.\n\nOverall, I am very pleased with my new Tesla and I think it will be a great addition to my family. I am excited to take it on long road trips and to show it off to my friends and family. I am sure that it will provide many years of safe and enjoyable driving.',
-    ]
-    print("Queries: ", texts)
-    
+    datasets = load_dataset('data/Anthropic')
     access_token = "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"
     # model_name_or_path = "meta-llama/Llama-2-7b-chat-hf"
     model_name_or_path = "microsoft/DialoGPT-small"
@@ -266,40 +245,72 @@ if __name__ == '__main__':
         timing_info=timing_info,
     )
     
-    # Test Causal Language Modeling (CLM)
-    inputs = tokenizer(texts, return_tensors="pt", padding=True)
-    inputs['labels'] = inputs['input_ids'].clone()
-    encoder_input_ids = inputs["input_ids"].clone()
+    def tokenize_and_align_labels(examples):
+        tokenized_inputs = tokenizer(
+            examples['query'], 
+            padding=False, 
+            truncation=True,
+        )
+        labels = tokenizer(
+            examples['reference'], 
+            padding=False, 
+            truncation=True,
+            
+        )
+        tokenized_inputs['labels'] = labels['input_ids']
+        return tokenized_inputs
     
-    start = time.time()
-    outputs = model(**inputs)
-    loss = outputs.loss
-    logits = outputs.logits
-    end = time.time()
-    print(f'loss: {loss}, logits: {logits.shape}')
-    print(f'forward overhead {end - start}')
+    train_dataset = datasets['test'].map(
+        tokenize_and_align_labels,
+        batched=True,
+    ).remove_columns(datasets['test'].column_names)
+    
+    label_pad_token_id = tokenizer.pad_token_id
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer,
+        model=model,
+        label_pad_token_id=label_pad_token_id,
+        pad_to_multiple_of=None,
+    )
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=10,
+        collate_fn=data_collator,
+    )
+    inputs = next(iter(train_dataloader))
+    
+    # # Test Causal Language Modeling (CLM)
+    # start = time.time()
+    # outputs = model(**inputs)
+    # loss = outputs.loss
+    # logits = outputs.logits
+    # end = time.time()
+    # print(f'loss: {loss}, logits: {logits.shape}')
+    # print(f'forward overhead {end - start}')
 
-    start = time.time()
-    outputs = stages_forward(stages, inputs)
-    loss = outputs[0]
-    logits = outputs[1]
-    end = time.time()
-    print(f'loss: {loss}, logits: {logits.shape}')
-    print(f'forward overhead {end - start}')
+    # start = time.time()
+    # outputs = stages_forward(stages, inputs)
+    # loss = outputs[0]
+    # logits = outputs[1]
+    # end = time.time()
+    # print(f'loss: {loss}, logits: {logits.shape}')
+    # print(f'forward overhead {end - start}')
     # loss.backward()
     # timing_info['0_end'].append((time.time(), 'backward'))
     # print(timing_info)
     
     # Test decoding nll loss
-    inputs = tokenizer(texts, return_tensors="pt", padding=True)
-    labels = tokenizer(references, return_tensors="pt", padding=True)
     start = time.time()
-    loss = compute_nll_loss(model, inputs, labels)
+    # loss = compute_nll_loss(model, inputs, labels)
+    new_inputs = _prepare_decoding_inputs(inputs)
+    print({k: v.shape for k, v in new_inputs.items()})
+    outputs = model(**new_inputs)
+    loss = outputs.loss
     end = time.time()
     print(f'nll loss: {loss}, overhead: {end - start}')
     
     start = time.time()
-    outputs = stages_decoding(stages, inputs, labels)
+    outputs = stages_decoding(stages, inputs)
     loss = outputs[0]
     end = time.time()
     print(f'nll loss: {loss}, overhead: {end - start}')

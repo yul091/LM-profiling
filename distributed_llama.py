@@ -16,7 +16,12 @@ from collections import defaultdict
 from torch.utils.data import DataLoader
 from concurrent.futures import ThreadPoolExecutor
 from datasets import load_dataset, Dataset
-from transformers import AutoConfig, AutoTokenizer, default_data_collator
+from transformers import (
+    AutoConfig, 
+    AutoTokenizer, 
+    # default_data_collator, 
+    DataCollatorForSeq2Seq,
+)
 from utils import record_time
 from models import (
     get_stages, 
@@ -121,12 +126,12 @@ class DistributedLLM:
     def tokenize_and_align_labels(self, examples):
         tokenized_inputs = self.tokenizer(
             examples['query'], 
-            padding=True, 
+            padding=False, 
             truncation=True,
         )
         labels = self.tokenizer(
             examples['reference'], 
-            padding=True, 
+            padding=False, 
             truncation=True,
         )
         tokenized_inputs['labels'] = labels['input_ids']
