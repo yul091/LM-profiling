@@ -6,12 +6,13 @@ import json
 import queue
 import random
 import argparse
-import torch
 import pdb
 from tqdm import tqdm
 from typing import List, Dict, Optional, Any, Union
 from collections import defaultdict
+import torch
 from torch.utils.data import DataLoader
+from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
 from datasets import load_dataset, Dataset
 from transformers import (
@@ -21,7 +22,6 @@ from transformers import (
     set_seed,
     AdamW,
     get_scheduler,
-    # get_linear_schedule_with_warmup,
 )
 from utils import record_time, Node, Task
 from models import (
@@ -33,7 +33,7 @@ from models import (
     CausalLMOutputWithCrossAttentions,
 )
 
-        
+optimizer_lock = Lock()   
 
 class DistributedLLM:
     model_n = 'dialogpt'
@@ -142,7 +142,6 @@ class DistributedLLM:
         }
         
         
-        
     def tokenize_and_align_labels(self, examples):
         tokenized_inputs = self.tokenizer(
             examples['query'], 
@@ -228,7 +227,7 @@ class DistributedLLM:
             else:
                 raise ValueError(f"Invalid workload type: {workload}")
             # 10% of the time, produce a task with feedback
-            print("Producing task {} with input shape {}".format(i, batch['input_ids'].shape))
+            # print("Producing task {} with input shape {}".format(i, batch['input_ids'].shape))
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(i)
             
@@ -253,7 +252,7 @@ class DistributedLLM:
             nodeID = random.choice(list(distributed_nodes.keys()))
             # Each node queue store task IDs
             distributed_nodes[nodeID].device_queues[0].put(taskID)
-            print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
+            # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
 
 
     def device_inference(
@@ -316,7 +315,7 @@ class DistributedLLM:
                 task.hiddens[stageID+1] = outputs
                 nextdeviceQueue.put(taskID)
                 
-            else: # ending stage
+            else: # last stage
                 outputs = CausalLMOutputWithCrossAttentions(
                     loss=tuple_outputs[0],
                     logits=tuple_outputs[1],
@@ -326,7 +325,7 @@ class DistributedLLM:
                     cross_attentions=tuple_outputs[5],
                 )
                 loss = outputs.loss
-                print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
+                # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())
                 
                 # if self.setting == 'active':
@@ -334,11 +333,10 @@ class DistributedLLM:
                     # Backprop on the last stage
                     loss.backward()
                     record_time(init_device, 'end', 'backward', timing_info)
+                    # Update the model
                     self.distributed_optimizers[nodeID].step()
                     self.distributed_schedulers[nodeID].step()
-                    # Clear gradients
-                    for stage in stage:
-                        stage.zero_grad()
+                    self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                 # else:
                 #     task.hiddens.append(loss)
@@ -347,6 +345,7 @@ class DistributedLLM:
 
     def node_inference(
         self,
+        nodeID: int,
         node: Node,
         preloaded_tasks: List[Task],
         stages: List[GPTEndingStage], 
@@ -359,7 +358,7 @@ class DistributedLLM:
                     self.device_inference, 
                     stage=stage, 
                     stageID=stageID,
-                    nodeID=node.node_id,
+                    nodeID=nodeID,
                     timing_info=timing_info, 
                     preloaded_tasks=preloaded_tasks,
                     deviceQueue=node.device_queues[stageID],
@@ -386,6 +385,7 @@ class DistributedLLM:
             for nodeID, node in distributed_nodes.items():
                 future = executor.submit(
                     self.node_inference, 
+                    nodeID,
                     node, 
                     distributed_preloaded_tasks[nodeID], 
                     distributed_stages[nodeID], 
@@ -475,7 +475,6 @@ class DistributedLLM:
         for key, value in metrics.items():
             metrics[key] = sum(value) / len(value)
         
-        # print("# tasks: {}, # idles: {}, # tasks X # nodes X # gpus: {}".format(num_tasks, len(total_idles), num_tasks * len(total_latencies)))
         metrics['bubble_rate'] = bubble_rate 
         metrics['idleness'] = sum(total_idles) / len(total_idles)
         metrics['response_time'] = sum(total_latencies) * 2 / (num_tasks * len(total_latencies))

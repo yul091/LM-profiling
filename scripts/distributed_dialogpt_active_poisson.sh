@@ -5,7 +5,7 @@ LAYERS=12
 WORKLOAD=poisson
 SETTING=active
 OUTPUT_DIR=prof_async
-RETRAIN_RATE=0
+RETRAIN_RATE=0.0
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_dialogpt.py \
     --model_name_or_path "microsoft/DialoGPT-small" \
