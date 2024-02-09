@@ -1,4 +1,5 @@
 import os
+import pdb
 import sys
 sys.dont_write_bytecode = True
 import time
@@ -6,6 +7,7 @@ import json
 import queue
 import random
 import argparse
+import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -27,12 +29,12 @@ class Node:
         self, 
         node_id: int, 
         num_gpus_per_node: int, 
-        init_device: Optional[int] = 0,
+        init_device: Optional[int] = None,
     ):
         self.node_id = node_id
         self.num_gpus_per_node = num_gpus_per_node
         self.device_queues = [queue.Queue() for _ in range(num_gpus_per_node)]
-        self.init_device = init_device
+        self.init_device = init_device if init_device is not None else 0
         self.last_device = init_device + num_gpus_per_node - 1
         
         
@@ -52,12 +54,13 @@ class Task:
         self.hiddens = [query] + [None for _ in range(num_gpus_per_node - 1)]
         self.feedback = feedback
         self.node_id = node_id if node_id is not None else 0
-        self.require_training = False if require_training is None else True
+        self.require_training = False if require_training is None else require_training
         
 
 class DistributedTransformer:
     
     def __init__(self, args: argparse.Namespace):
+        self.args = args
         n_samples = args.n_samples
         self.setting = args.setting
         self.num_nodes = args.num_nodes
@@ -72,6 +75,7 @@ class DistributedTransformer:
         self.output_dir = args.output_dir
         self.workload = args.workload
         self.retraining_rate = args.retraining_rate
+        self.training_strategy = args.training_strategy
         self.num_gpus_per_node = torch.cuda.device_count() // self.num_nodes
         self.distributed_nodes = [
             Node(i, self.num_gpus_per_node, i * self.num_gpus_per_node) 
@@ -192,7 +196,7 @@ class DistributedTransformer:
             else:
                 raise ValueError(f"Invalid workload type: {workload}")
             # 10% of the time, produce a task with feedback
-            print("Producing task {} with length {}".format(i, batch[0].size(1)))
+            # print("Producing task {} with length {}".format(i, batch[0].size(1)))
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(i)
             
@@ -216,7 +220,7 @@ class DistributedTransformer:
             nodeID = random.randint(0, len(distributed_nodes) - 1)
             # Each node queue store task IDs
             distributed_nodes[nodeID].device_queues[0].put(taskID)
-            print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
+            # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
 
 
     def device_inference(
@@ -227,7 +231,7 @@ class DistributedTransformer:
         preloaded_tasks: List[Task], 
         deviceQueue: queue.Queue,
         nextdeviceQueue: queue.Queue = None,
-        criterion: nn.CrossEntropyLoss = nn.CrossEntropyLoss(),
+        criterion: nn.CrossEntropyLoss = None,
         init_device: int = 0,
     ):
         device = stage.device
@@ -245,12 +249,13 @@ class DistributedTransformer:
             if hidden is None:
                 print("Stage {} waiting for task {}".format(stage.device, taskID))
                 continue
+            # print(f"task: {vars(task)}")
             
             if task.require_training:
                 # This is a retraining task
-                record_time(device, 'start', 'forward_loss', timing_info)
+                record_time(device, 'start', 'forward_grad', timing_info)
                 output = stage(hidden)
-                record_time(device, 'end', 'forward_loss', timing_info)
+                record_time(device, 'end', 'forward_grad', timing_info)
             else:
                 record_time(device, 'start', 'forward', timing_info)
                 with torch.no_grad():
@@ -259,12 +264,13 @@ class DistributedTransformer:
             
             if nextdeviceQueue is None:
                 # Backprop on the last stage
-                # print("Stage {} start backward propagation for task {}".format(stage.device, taskID))
+                # print("Stage {} calculate loss for task {}".format(stage.device, taskID))
                 output_flat = output.contiguous().view(-1, output.size(-1)) # (B * T, C)
                 # print("output_flat shape: {}, feedback shape: {}".format(output_flat.shape, task.feedback.shape))
+                # pdb.set_trace()
                 loss = criterion(output_flat, task.feedback)
+                # print("eval loss: {}".format(loss))
                 self.metrics["loss"].append(loss.item())
-                # print("loss: {}, start loss backward ...".format(loss))
                 if task.require_training:
                     loss.backward()
                     record_time(init_device, 'end', 'backward', timing_info)
@@ -296,7 +302,6 @@ class DistributedTransformer:
                     criterion=nn.CrossEntropyLoss(),
                     init_device=node.init_device,
                 )
-                
         print("Node {} finished inference".format(node.node_id))
 
 
@@ -363,6 +368,52 @@ class DistributedTransformer:
                 self.distributed_nodes,
             )
             
+        # Save timing info
+        self.save_timing_info()
+            
+        # Calculate metrics
+        start_time = None
+        total_idles = []
+        total_latencies = []
+        for nodeID, node in enumerate(self.distributed_nodes):
+            # Load timing information
+            timing_info = self.timing_infos[nodeID]
+            for times_list in timing_info.values():
+                for times in times_list:
+                    if start_time is None or times[0] < start_time:
+                        start_time = times[0]
+                        
+            min_time = start_time if start_time is not None else 0
+            timing_info = {k: [[t[0] - min_time, t[1]] for t in v] for k, v in timing_info.items()}
+            
+            for gpu_id in range(self.num_gpus_per_node):
+                min_t, max_t = float('inf'), float('-inf')
+                gpu_idx = node.init_device + gpu_id
+                starts = timing_info.get(f"{gpu_idx}_start", [])
+                ends = timing_info.get(f"{gpu_idx}_end", [])
+                if len(starts) == 1:
+                    idles = [0]
+                else:
+                    idles = [start - end for (start, _), (end, _) in zip(starts[1:], ends[:-1])]
+                total_idles.extend(idles)
+                
+                tasks = list(zip(starts, ends))
+                for i, ((start, start_label), (end, _)) in enumerate(tasks):
+                    self.metrics[start_label].append(end - start)
+                    min_t = min(min_t, start)
+                    max_t = max(max_t, end)
+                total_latencies.append(max_t - min_t)
+                    
+        num_tasks = len(preloaded_tasks[0])
+        bubble_rate = sum(total_idles) / sum(total_latencies) if sum(total_latencies) > 0 else 0
+        for key, value in self.metrics.items():
+            self.metrics[key] = sum(value) / len(value)
+        
+        print("# tasks: {}, # idles: {}, # tasks X # nodes X # gpus: {}".format(num_tasks, len(total_idles), num_tasks * len(total_latencies)))
+        self.metrics['bubble_rate'] = bubble_rate 
+        self.metrics['idleness'] = sum(total_idles) / len(total_idles)
+        self.metrics['response_time'] = sum(total_latencies) * 2 / (num_tasks * len(total_latencies))
+            
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)
         stats_f = f'{self.output_dir}/metrics_{self.setting}_{self.workload}_{self.retraining_rate}.json'
@@ -370,8 +421,7 @@ class DistributedTransformer:
             json.dump(self.metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}:\n{self.metrics}")
             
-        # Save timing info
-        self.save_timing_info()
+        
 
 
     def save_timing_info(self):
@@ -394,6 +444,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=200)
     parser.add_argument('--setting', type=str, default='random', choices=['identical','random', 'variant'], help='workload setting')
+    parser.add_argument('--training_strategy', type=str, default='active', choices=['active', 'interval', 'isolated'])
     parser.add_argument('--nlayers', type=int, default=24)
     parser.add_argument('--emsize', type=int, default=2048)
     parser.add_argument('--nhead', type=int, default=8)

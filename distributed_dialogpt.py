@@ -38,12 +38,12 @@ class Node:
         self, 
         node_id: int, 
         num_gpus_per_node: int, 
-        init_device: int = 0,
+        init_device: Optional[int] = None,
     ):
         self.node_id = node_id
         self.num_gpus_per_node = num_gpus_per_node
         self.device_queues = [queue.Queue() for _ in range(num_gpus_per_node)]
-        self.init_device = init_device
+        self.init_device = init_device if init_device is not None else 0
         self.last_device = init_device + num_gpus_per_node - 1
         
         
