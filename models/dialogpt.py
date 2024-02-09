@@ -29,6 +29,7 @@ class CustomizedGPT2Out(ModelOutput):
     all_self_attentions: Optional[Tuple[torch.FloatTensor]] = None
     all_cross_attentions: Optional[torch.LongTensor] = None
     output_shape: Optional[Tuple[int]] = None
+        
 
 # GPT2LMHeadModel(
 #   (transformer): GPT2Model(

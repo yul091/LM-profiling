@@ -1,4 +1,5 @@
 import time
+import queue
 import logging
 from typing import Dict, Union, Any, List, Tuple, Optional, Callable
 import pandas as pd
@@ -37,6 +38,39 @@ SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
 
+class Node:
+    def __init__(
+        self, 
+        node_id: int, 
+        num_gpus_per_node: int, 
+        init_device: Optional[int] = None,
+    ):
+        self.node_id = node_id
+        self.num_gpus_per_node = num_gpus_per_node
+        self.device_queues = [queue.Queue() for _ in range(num_gpus_per_node)]
+        self.init_device = init_device if init_device is not None else 0
+        self.last_device = init_device + num_gpus_per_node - 1
+        
+        
+class Task:
+    def __init__(
+        self, 
+        task_id: int, 
+        query: Union[torch.Tensor, Dict[str, Any]], 
+        feedback: Optional[torch.Tensor] = None, 
+        node_id: Optional[int] = None, 
+        num_gpus_per_node: Optional[int] = None,
+        require_training: Optional[bool] = None,
+    ):
+        self.task_id = task_id
+        self.query = query
+        num_gpus_per_node = num_gpus_per_node if num_gpus_per_node is not None else 1
+        self.hiddens = [query] + [None for _ in range(num_gpus_per_node - 1)]
+        self.feedback = feedback
+        self.node_id = node_id if node_id is not None else 0
+        self.require_training = False if require_training is None else require_training
+
+
 def record_time(device: int, event_type: str, opt_type: str, timing_info: Dict[str, List[float]], verbose: bool = False):
     # event_type can be 'start' or 'end'
     timestamp = time.time()
@@ -73,6 +107,7 @@ def get_transformer_layers(
         decoder_layers = model.model.decoder.layers
         layers = encoder_layers + decoder_layers
     return layers
+
 
 def get_colors(index: List[str], color_map: dict = COLOR_MAP):
     return [

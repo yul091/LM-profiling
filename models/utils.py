@@ -55,7 +55,7 @@ def _prepare_inputs(
     handling potential state.
     """
     new_inputs = _prepare_input(inputs, device=device)
-    if len(new_inputs) == 0:
+    if new_inputs is None or len(new_inputs) == 0:
         raise ValueError(
             "The batch received was empty, your model won't be able to train on it."
         )

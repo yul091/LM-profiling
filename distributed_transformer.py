@@ -18,44 +18,11 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Subset
 from concurrent.futures import ThreadPoolExecutor
 
-from utils import record_time
+from utils import record_time, Node, Task
 from models import PipelineStage, get_transformer_stages
 from dataset import get_data, SentencePairDataset
 
 
-
-class Node:
-    def __init__(
-        self, 
-        node_id: int, 
-        num_gpus_per_node: int, 
-        init_device: Optional[int] = None,
-    ):
-        self.node_id = node_id
-        self.num_gpus_per_node = num_gpus_per_node
-        self.device_queues = [queue.Queue() for _ in range(num_gpus_per_node)]
-        self.init_device = init_device if init_device is not None else 0
-        self.last_device = init_device + num_gpus_per_node - 1
-        
-        
-class Task:
-    def __init__(
-        self, 
-        task_id: int, 
-        query: Tensor, 
-        feedback: Optional[Tensor] = None, 
-        node_id: Optional[int] = None, 
-        num_gpus_per_node: Optional[int] = None,
-        require_training: Optional[bool] = None,
-    ):
-        self.task_id = task_id
-        self.query = query
-        num_gpus_per_node = num_gpus_per_node if num_gpus_per_node is not None else 1
-        self.hiddens = [query] + [None for _ in range(num_gpus_per_node - 1)]
-        self.feedback = feedback
-        self.node_id = node_id if node_id is not None else 0
-        self.require_training = False if require_training is None else require_training
-        
 
 class DistributedTransformer:
     

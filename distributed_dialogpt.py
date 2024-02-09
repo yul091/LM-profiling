@@ -21,7 +21,7 @@ from transformers import (
     AutoTokenizer, 
     DataCollatorForSeq2Seq,
 )
-from utils import record_time
+from utils import record_time, Node, Task
 from models import (
     get_stages, 
     GPTEndingStage,
@@ -31,38 +31,6 @@ from models import (
     CausalLMOutputWithCrossAttentions,
 )
 
-
-
-class Node:
-    def __init__(
-        self, 
-        node_id: int, 
-        num_gpus_per_node: int, 
-        init_device: Optional[int] = None,
-    ):
-        self.node_id = node_id
-        self.num_gpus_per_node = num_gpus_per_node
-        self.device_queues = [queue.Queue() for _ in range(num_gpus_per_node)]
-        self.init_device = init_device if init_device is not None else 0
-        self.last_device = init_device + num_gpus_per_node - 1
-        
-        
-class Task:
-    def __init__(
-        self, 
-        task_id: int, 
-        query: Dict[str, Union[torch.Tensor, Any]], 
-        feedback: torch.Tensor, 
-        node_id: Optional[int] = None, 
-        num_gpus_per_node: Optional[int] = None,
-        require_training: Optional[bool] = None,
-    ):
-        self.task_id = task_id
-        self.feedback = feedback
-        num_gpus_per_node = num_gpus_per_node if num_gpus_per_node is not None else 1
-        self.hiddens = [query] + [None for _ in range(num_gpus_per_node - 1)]
-        self.node_id = node_id if node_id is not None else 0
-        self.require_training = False if require_training is None else require_training
         
 
 class DistributedLLM:
@@ -145,7 +113,7 @@ class DistributedLLM:
         self, 
         batch_size: Optional[int] = None, 
         dataset: Optional[Dataset] = None,
-    ):
+    ) -> DataLoader:
         batch_size = batch_size if batch_size is not None else self.batch_size
         dataset = dataset if dataset is not None else self.train_dataset
         return DataLoader(
@@ -157,12 +125,16 @@ class DistributedLLM:
         
     def get_preloaded_dataset(
         self,
-        distributed_nodes: List[Node], 
-        dataloader: DataLoader, 
-        retraining_rate: float = 0.1,
+        distributed_nodes: Optional[List[Node]] = None, 
+        dataloader: Optional[DataLoader] = None, 
+        retraining_rate: Optional[float] = None,
     ) -> Dict[int, List[Task]]:
         print("Using preloaded data ...")
+        distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
+        dataloader = dataloader if dataloader is not None else self.test_dataloader
+        retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
         preloaded_tasks = defaultdict(list)
+        
         for nodeID, node in enumerate(distributed_nodes):
             for i, batch in enumerate(dataloader):
                 # 10% of the time, produce a task with feedback
@@ -203,7 +175,7 @@ class DistributedLLM:
             else:
                 raise ValueError(f"Invalid workload type: {workload}")
             # 10% of the time, produce a task with feedback
-            print("Producing task {} with length {}".format(i, batch[0].size(1)))
+            print("Producing task {} with input_ids {}".format(i, batch['input_ids'].shape))
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(i)
             
@@ -237,10 +209,12 @@ class DistributedLLM:
         timing_info: dict, 
         preloaded_tasks: List[Task], 
         deviceQueue: queue.Queue,
-        nextdeviceQueue: queue.Queue = None,
-        init_device: int = 0,
+        nextdeviceQueue: Optional[queue.Queue] = None,
+        init_device: Optional[int] = None,
     ):
-        device = stage.device
+        device = stage._device
+        init_device = init_device if init_device is not None else 0
+        
         while True:
             taskID: int = deviceQueue.get()
             if taskID is None:
@@ -259,21 +233,27 @@ class DistributedLLM:
             
             if stageID == 0: # prepare inputs
                 inputs = _prepare_decoding_inputs(inputs)
+                task.feedback = inputs.pop('labels', None)
+                
+            print("Stage {} start inference for task {}".format(device, taskID,))
             
             if task.require_training: # this is a retraining task
                 record_time(device, 'start', 'forward_loss', timing_info)
-                tuple_outputs = stage(**inputs)
+                tuple_outputs = stage(**inputs, labels=task.feedback)
                 record_time(device, 'end', 'forward_loss', timing_info)
             else:
                 record_time(device, 'start', 'forward', timing_info)
                 with torch.no_grad():
-                    tuple_outputs = stage(**inputs)
+                    tuple_outputs = stage(**inputs, labels=task.feedback)
                 record_time(device, 'end', 'forward', timing_info)
                 
+            print("Stage {} finished inference for task {}".format(device, taskID))
+                
             if nextdeviceQueue is not None: # intermediate stage
+                # Need to send the output to the next stage, except for the last stage
                 outputs = CustomizedGPT2Out(
-                    hidden_states=tuple_outputs[0],
-                    attention_mask=tuple_outputs[1],
+                    hidden_states=tuple_outputs[0].to(device+1),
+                    attention_mask=tuple_outputs[1].to(device+1),
                     head_mask=tuple_outputs[2],
                     encoder_hidden_states=tuple_outputs[3],
                     encoder_attention_mask=tuple_outputs[4],
@@ -281,9 +261,8 @@ class DistributedLLM:
                     all_self_attentions=tuple_outputs[6],
                     all_cross_attentions=tuple_outputs[7],
                     output_shape=tuple_outputs[8],
-                )
-                # Need to send the output to the next stage, except for the last stage
-                task.hiddens[stageID+1] = _prepare_inputs(outputs, device+1)
+                )   
+                task.hiddens[stageID+1] = outputs
                 nextdeviceQueue.put(taskID)
                 
             else: # ending stage
@@ -302,15 +281,13 @@ class DistributedLLM:
                 
                 if self.setting == 'active':
                     # Backprop on the last stage
-                    # print("Stage {} start backward propagation for task {}".format(device, taskID))
-                    # print("output_flat shape: {}, feedback shape: {}".format(output_flat.shape, task.feedback.shape))
-                    # print("loss: {}, start loss backward ...".format(nll_loss))
                     loss.backward()
                     record_time(init_device, 'end', 'backward', timing_info)
                     # print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                 else:
                     task.hiddens.append(loss)
                     deviceQueue.put(taskID) # put it back to the queue
+            print("Outputs: {}".format(vars(outputs)))
 
 
     def node_inference(
@@ -374,9 +351,8 @@ class DistributedLLM:
                 timing_info=self.timing_infos[nodeID],
             ) for nodeID in range(self.num_nodes)
         ]
-        # get a batch
-        print("Node [0] preloaded task [0]: ", vars(preloaded_tasks[0][0]))
-        # pdb.set_trace()
+        # Get a batch
+        # print("Node [0] preloaded task [0]: ", vars(preloaded_tasks[0][0]))
 
         # Run the stages concurrently
         task_queue = queue.Queue()
@@ -428,7 +404,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=200)
     parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'one_node'], help='training setting')
-    parser.add_argument('--batch_size', type=int, default=3)
+    parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--rate_lambda', type=float, default=60, help='Average number of tasks produced per minute')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
