@@ -34,6 +34,7 @@ from models import (
         
 
 class DistributedLLM:
+    model_n = 'dialogpt'
     
     def __init__(self, args: argparse.Namespace):
         n_samples = args.n_samples
@@ -235,19 +236,15 @@ class DistributedLLM:
                 inputs = _prepare_decoding_inputs(inputs)
                 task.feedback = inputs.pop('labels', None)
                 
-            print("Stage {} start inference for task {}".format(device, taskID,))
-            
             if task.require_training: # this is a retraining task
-                record_time(device, 'start', 'forward_loss', timing_info)
+                record_time(device, 'start', 'forward_grad', timing_info)
                 tuple_outputs = stage(**inputs, labels=task.feedback)
-                record_time(device, 'end', 'forward_loss', timing_info)
+                record_time(device, 'end', 'forward_grad', timing_info)
             else:
                 record_time(device, 'start', 'forward', timing_info)
                 with torch.no_grad():
                     tuple_outputs = stage(**inputs, labels=task.feedback)
                 record_time(device, 'end', 'forward', timing_info)
-                
-            print("Stage {} finished inference for task {}".format(device, taskID))
                 
             if nextdeviceQueue is not None: # intermediate stage
                 # Need to send the output to the next stage, except for the last stage
@@ -275,19 +272,19 @@ class DistributedLLM:
                     cross_attentions=tuple_outputs[5],
                 )
                 loss = outputs.loss
-                print("[loss={}] stage {} finished inference for task {}".format(
+                print("[NLL loss={}] stage {} finished inference for task {}".format(
                     loss, device, taskID
                 ))
                 
-                if self.setting == 'active':
+                # if self.setting == 'active':
+                if task.require_training:
                     # Backprop on the last stage
                     loss.backward()
                     record_time(init_device, 'end', 'backward', timing_info)
-                    # print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                    print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                 else:
                     task.hiddens.append(loss)
                     deviceQueue.put(taskID) # put it back to the queue
-            print("Outputs: {}".format(vars(outputs)))
 
 
     def node_inference(
@@ -390,7 +387,7 @@ class DistributedLLM:
             # for gpu_id in gpus:
             #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
             #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            stats_f = f'{self.output_dir}/timing_info_coroutine_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
     

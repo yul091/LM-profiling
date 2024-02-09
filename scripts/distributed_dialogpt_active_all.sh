@@ -15,10 +15,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_dialogpt.py \
     --retraining_rate $RETRAIN_RATE \
     --output_dir $OUTPUT_DIR
 
-# python plot.py \
-#     --node $NUM_NODES \
-#     --coroutine \
-#     --setting $SETTING \
-#     --workload $WORKLOAD \
-#     --retraining_rate $RETRAIN_RATE \
-#     --output_dir $OUTPUT_DIR
+python plot.py \
+    --node $NUM_NODES \
+    --coroutine \
+    --setting $SETTING \
+    --workload $WORKLOAD \
+    --retraining_rate $RETRAIN_RATE \
+    --output_dir $OUTPUT_DIR

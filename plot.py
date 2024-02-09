@@ -9,20 +9,18 @@ import argparse
 
 def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     output_dir = args.output_dir
-    coroutine = args.coroutine
     setting = args.setting
     workload = args.workload
     retraining_rate = args.retraining_rate
-    
+    model_name = args.model_name
     
     # Load timing information
-    execution = 'coroutine' if coroutine else 'sync'
     if args.test_asyncio:
         stats_f = f'{output_dir}/test_asyncio.json'
     elif node is None:
-        stats_f = f'{output_dir}/timing_info_{execution}_{setting}.json'
+        stats_f = f'{output_dir}/timing_info_{model_name}_{setting}.json'
     else:
-        stats_f = f'{output_dir}/timing_info_{execution}_{setting}_{workload}_{retraining_rate}_node{node}.json'
+        stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json'
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
 
@@ -105,8 +103,8 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--output_dir', type=str, default='prof')
-    parser.add_argument('--coroutine', action='store_true')
-    parser.add_argument('--setting', type=str, choices=['identical','random', 'variant'], default='random', help='workload setting')
+    parser.add_argument('--model_name', type=str, default='dialogpt', help='model name')
+    parser.add_argument('--setting', type=str, default='random', help='workload setting')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
     parser.add_argument('--node', type=int, default=None, help='number of nodes for distributed systems')
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
@@ -115,11 +113,10 @@ if __name__ == '__main__':
     
     start_time = None
     output_dir = args.output_dir
-    coroutine = args.coroutine
     setting = args.setting
     workload = args.workload
+    model_name = args.model_name
     retraining_rate = args.retraining_rate
-    execution = 'coroutine' if coroutine else 'sync'
     
     if not args.node:
         # Load timing information
@@ -144,7 +141,7 @@ if __name__ == '__main__':
     else:
         for node in range(args.node):
             # Load timing information
-            stats_f = f'{output_dir}/timing_info_{execution}_{setting}_{workload}_{retraining_rate}_node{node}.json' if node is not None else f'{output_dir}/timing_info_{execution}_{setting}.json'
+            stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json' if node is not None else f'{output_dir}/timing_info_{model_name}_{setting}.json'
             with open(stats_f, 'r') as f:
                 timing_info = json.load(f)
                 
@@ -164,5 +161,5 @@ if __name__ == '__main__':
             
         # Show the plot
         plt.tight_layout()
-        plt.savefig(f"{output_dir}/timing_info_{execution}_{setting}_{workload}_{retraining_rate}.png")
+        plt.savefig(f"{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}.png")
         plt.show()
