@@ -20,7 +20,7 @@ from transformers import (
     AutoTokenizer, 
     DataCollatorForSeq2Seq,
     set_seed,
-    AdamW,
+    # AdamW,
     get_scheduler,
 )
 from utils import record_time, Node, Task
@@ -32,8 +32,7 @@ from models import (
     CustomizedGPT2Out,
     CausalLMOutputWithCrossAttentions,
 )
-
-optimizer_lock = Lock()   
+ 
 
 class DistributedLLM:
     model_n = 'dialogpt'
@@ -48,6 +47,7 @@ class DistributedLLM:
         self.lr = args.lr
         self.workload = args.workload
         self.retraining_rate = args.retraining_rate
+        self.optimizer_lock = Lock()  
         
         # Reproducibility
         set_seed(args.seed)
@@ -130,7 +130,7 @@ class DistributedLLM:
             # Collect all parameters from stages in each node
             for stage in self.distributed_stages[nodeID]: 
                 all_parameters.extend(list(stage.parameters()))
-            self.distributed_optimizers[nodeID] = AdamW(all_parameters, lr=self.lr)
+            self.distributed_optimizers[nodeID] = torch.optim.AdamW(all_parameters, lr=self.lr)
         
         self.distributed_schedulers = {
             nodeID: get_scheduler(
@@ -253,6 +253,27 @@ class DistributedLLM:
             # Each node queue store task IDs
             distributed_nodes[nodeID].device_queues[0].put(taskID)
             # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
+            
+    
+    # @torch.no_grad()
+    # def custom_step(self, stages: List[GPTEndingStage], lr: float):
+    #     """
+    #     Applies a simple gradient descent update to the parameters.
+
+    #     Args:
+    #         parameters (Iterable[torch.nn.Parameter]): An iterable of Parameters to update.
+    #         lr (float): The learning rate to use for the update.
+    #     """
+    #     # with torch.no_grad():  # Ensure gradients are not tracked in this operation
+    #     #     for param in parameters:
+    #     #         if param.grad is not None:  # Skip parameters without gradients
+    #     #             param -= lr * param.grad  # Update parameter using gradient descent
+    #     for stage in stages:
+    #         for param in stage.parameters():
+    #             if param.grad is not None:
+    #                 # Manually update the model parameters using the gradient descent rule
+    #                 # param.data = param.data - learning_rate * param.grad
+    #                 param -= lr * param.grad
 
 
     def device_inference(
@@ -334,9 +355,11 @@ class DistributedLLM:
                     loss.backward()
                     record_time(init_device, 'end', 'backward', timing_info)
                     # Update the model
-                    self.distributed_optimizers[nodeID].step()
-                    self.distributed_schedulers[nodeID].step()
-                    self.distributed_optimizers[nodeID].zero_grad() # clear gradients
+                    with self.optimizer_lock:
+                        # self.distributed_optimizers[nodeID].step()
+                        # self.custom_step(self.distributed_stages[nodeID], self.lr)
+                        self.distributed_schedulers[nodeID].step()
+                        self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                 # else:
                 #     task.hiddens.append(loss)
