@@ -8,8 +8,6 @@ import random
 import argparse
 import torch
 import pdb
-import torch.nn as nn
-from torch import Tensor
 from tqdm import tqdm
 from typing import List, Dict, Optional, Any, Union
 from collections import defaultdict
@@ -103,9 +101,16 @@ class DistributedLLM:
             self.tokenize_and_align_labels,
             batched=True,
         ).remove_columns(datasets['train'].column_names)
-        # Batch: input_ids, attention_mask, labels, labels_attention_mask
-        self.train_dataloader = self.get_dataloader(dataset=self.train_dataset)
+    
+        # self.train_dataloader = self.get_dataloader(dataset=self.train_dataset)
         self.test_dataloader = self.get_dataloader(dataset=self.test_dataset)
+        
+        # Preloaded dataset
+        self.distributed_preloaded_tasks = self.get_preloaded_dataset(
+            self.distributed_nodes, 
+            self.test_dataloader, 
+            retraining_rate=self.retraining_rate,
+        )
         
         # Stages, opimizer, and scheduler
         self.distributed_stages = {
@@ -135,6 +140,7 @@ class DistributedLLM:
                 num_training_steps=100,
             ) for nodeID in range(self.num_nodes)
         }
+        
         
         
     def tokenize_and_align_labels(self, examples):
@@ -177,7 +183,7 @@ class DistributedLLM:
         distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         dataloader = dataloader if dataloader is not None else self.test_dataloader
         retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
-        preloaded_tasks = defaultdict(list)
+        distributed_preloaded_tasks = defaultdict(list)
         
         for nodeID, node in distributed_nodes.items():
             for i, batch in enumerate(dataloader):
@@ -197,18 +203,21 @@ class DistributedLLM:
                     num_gpus_per_node=node.num_gpus_per_node,
                     require_training=require_training,
                 )
-                preloaded_tasks[node.node_id].append(task)
+                distributed_preloaded_tasks[nodeID].append(task)
                 
-        return preloaded_tasks
+        return distributed_preloaded_tasks
 
 
     def producer(
         self,
         taskQueue: queue.Queue, 
-        dataloader: DataLoader, 
-        rate_lambda: float, 
-        workload: str = 'poisson',
+        dataloader: Optional[DataLoader] = None, 
+        rate_lambda: Optional[float] = None, 
+        workload: Optional[str] = None,
     ):
+        dataloader = dataloader if dataloader is not None else self.test_dataloader
+        rate_lambda = rate_lambda if rate_lambda is not None else self.rate_lambda
+        workload = workload if workload is not None else self.workload
         # Produce using the dataset
         for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
@@ -219,7 +228,7 @@ class DistributedLLM:
             else:
                 raise ValueError(f"Invalid workload type: {workload}")
             # 10% of the time, produce a task with feedback
-            print("Producing task {} with input_ids {}".format(i, batch['input_ids'].shape))
+            print("Producing task {} with input shape {}".format(i, batch['input_ids'].shape))
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(i)
             
@@ -230,8 +239,9 @@ class DistributedLLM:
     def globalScheduler(
         self, 
         taskQueue: queue.Queue, 
-        distributed_nodes: Dict[int, Node],
+        distributed_nodes: Optional[Dict[int, Node]] = None,
     ):
+        distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         # Global scheduler
         while True:
             taskID: int = taskQueue.get() # ID
@@ -362,57 +372,71 @@ class DistributedLLM:
 
     def run_stages_concurrently(
         self,
-        preloaded_tasks: Dict[int, List[Task]],
-        distributed_stages: Dict[int, List[GPTEndingStage]], 
-        timing_infos: Dict[int, dict], 
-        distributed_nodes: Dict[int, Node],
+        distributed_preloaded_tasks: Optional[Dict[int, List[Task]]] = None,
+        distributed_stages: Optional[Dict[int, List[GPTEndingStage]]] = None, 
+        timing_infos: Optional[Dict[int, dict]] = None, 
+        distributed_nodes: Optional[Dict[int, Node]] = None,
     ):
+        distributed_preloaded_tasks = distributed_preloaded_tasks if distributed_preloaded_tasks is not None else self.distributed_preloaded_tasks
+        distributed_stages = distributed_stages if distributed_stages is not None else self.distributed_stages
+        timing_infos = timing_infos if timing_infos is not None else self.timing_infos
+        distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
+        
         with ThreadPoolExecutor(max_workers=len(distributed_nodes)) as executor:
             for nodeID, node in distributed_nodes.items():
                 future = executor.submit(
                     self.node_inference, 
                     node, 
-                    preloaded_tasks[nodeID], 
+                    distributed_preloaded_tasks[nodeID], 
                     distributed_stages[nodeID], 
                     timing_infos[nodeID],
                 )
             
             
     def run(self):
-        # Preloaded dataset
-        preloaded_tasks = self.get_preloaded_dataset(
-            self.distributed_nodes, 
-            self.test_dataloader, 
-            retraining_rate=self.retraining_rate,
-        )
-
         # Run the stages concurrently
         task_queue = queue.Queue()
-        
         with ThreadPoolExecutor(max_workers=3) as executor:
             future1 = executor.submit(
                 self.producer,
                 task_queue, 
-                self.test_dataloader, 
-                self.rate_lambda, 
-                self.workload,
+                dataloader=self.test_dataloader,
             )
             future2 = executor.submit(
                 self.globalScheduler,
                 task_queue,
-                self.distributed_nodes,
             )
-            future3 = executor.submit(
-                self.run_stages_concurrently,  
-                preloaded_tasks, 
-                self.distributed_stages,
-                self.timing_infos,
-                self.distributed_nodes,
-            )
+            future3 = executor.submit(self.run_stages_concurrently)
             
         # Save timing info
         self.save_timing_info()
         
+        # Calculate metrics
+        self.calculate_metrics()
+        
+        
+    def save_timing_info(
+        self, 
+        timing_infos: Optional[Dict[int, dict]] = None,
+    ):
+        timing_infos = timing_infos if timing_infos is not None else self.timing_infos
+        os.makedirs(self.output_dir, exist_ok=True)
+        for nodeID, timing_info in timing_infos.items():
+            # # Remove the first start and end time for each GPU
+            # gpus = list(set(int(key.split('_')[0]) for key in timing_info))
+            # for gpu_id in gpus:
+            #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
+            #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
+            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+            with open(stats_f, 'w') as f:
+                json.dump(timing_info, f, indent=4)
+        
+        
+    def calculate_metrics(
+        self, 
+        metrics: Optional[Dict[str, Union[float, int]]] = None,
+    ):
+        metrics = metrics if metrics is not None else self.metrics
         # Calculate metrics
         start_time = None
         total_idles = []
@@ -441,40 +465,29 @@ class DistributedLLM:
                 
                 tasks = list(zip(starts, ends))
                 for i, ((start, start_label), (end, _)) in enumerate(tasks):
-                    self.metrics[start_label].append(end - start)
+                    metrics[start_label].append(end - start)
                     min_t = min(min_t, start)
                     max_t = max(max_t, end)
                 total_latencies.append(max_t - min_t)
                     
-        num_tasks = len(preloaded_tasks[0])
+        num_tasks = len(self.distributed_preloaded_tasks[0])
         bubble_rate = sum(total_idles) / sum(total_latencies) if sum(total_latencies) > 0 else 0
-        for key, value in self.metrics.items():
-            self.metrics[key] = sum(value) / len(value)
+        for key, value in metrics.items():
+            metrics[key] = sum(value) / len(value)
         
         # print("# tasks: {}, # idles: {}, # tasks X # nodes X # gpus: {}".format(num_tasks, len(total_idles), num_tasks * len(total_latencies)))
-        self.metrics['bubble_rate'] = bubble_rate 
-        self.metrics['idleness'] = sum(total_idles) / len(total_idles)
-        self.metrics['response_time'] = sum(total_latencies) * 2 / (num_tasks * len(total_latencies))
+        metrics['bubble_rate'] = bubble_rate 
+        metrics['idleness'] = sum(total_idles) / len(total_idles)
+        metrics['response_time'] = sum(total_latencies) * 2 / (num_tasks * len(total_latencies))
             
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)
         stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}.json'
         with open(stats_f, 'w') as f:
-            json.dump(self.metrics, f, indent=4)
-        print(f"Metrics saved to {stats_f}:\n{self.metrics}")
+            json.dump(metrics, f, indent=4)
+        print(f"Metrics saved to {stats_f}:\n{metrics}")
 
-
-    def save_timing_info(self):
-        os.makedirs(self.output_dir, exist_ok=True)
-        for nodeID, timing_info in self.timing_infos.items():
-            # # Remove the first start and end time for each GPU
-            # gpus = list(set(int(key.split('_')[0]) for key in timing_info))
-            # for gpu_id in gpus:
-            #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
-            #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
-            with open(stats_f, 'w') as f:
-                json.dump(timing_info, f, indent=4)
+    
     
         
 if __name__ == '__main__':
