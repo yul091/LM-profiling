@@ -1,5 +1,5 @@
 NUM_NODES=2
-NUM_SAMPLES=20
+NUM_SAMPLES=200
 LAYERS=12
 WORKLOAD=all
 SETTING=active
@@ -17,7 +17,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_dialogpt.py \
 
 python plot.py \
     --node $NUM_NODES \
-    --coroutine \
+    --model_name "dialogpt" \
     --setting $SETTING \
     --workload $WORKLOAD \
     --retraining_rate $RETRAIN_RATE \

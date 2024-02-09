@@ -20,6 +20,10 @@ from transformers import (
     AutoConfig, 
     AutoTokenizer, 
     DataCollatorForSeq2Seq,
+    set_seed,
+    AdamW,
+    get_scheduler,
+    # get_linear_schedule_with_warmup,
 )
 from utils import record_time, Node, Task
 from models import (
@@ -43,14 +47,22 @@ class DistributedLLM:
         self.batch_size = args.batch_size
         self.rate_lambda = args.rate_lambda
         self.output_dir = args.output_dir
+        self.lr = args.lr
         self.workload = args.workload
         self.retraining_rate = args.retraining_rate
+        
+        # Reproducibility
+        set_seed(args.seed)
         self.num_gpus_per_node = torch.cuda.device_count() // self.num_nodes
-        self.distributed_nodes = [
-            Node(i, self.num_gpus_per_node, i * self.num_gpus_per_node) 
-            for i in range(self.num_nodes)
-        ]
-        self.timing_infos = [defaultdict(list) for _ in range(self.num_nodes)]
+        self.distributed_nodes = {
+            nodeID: Node(nodeID, self.num_gpus_per_node, nodeID * self.num_gpus_per_node) 
+            for nodeID in range(self.num_nodes)
+        }
+        self.timing_infos = {
+            nodeID: defaultdict(list) 
+            for nodeID in range(self.num_nodes)
+        }
+        self.metrics = defaultdict(list)
         
         # Load the model and tokenizer
         self.access_token = args.access_token
@@ -64,13 +76,15 @@ class DistributedLLM:
             token=self.access_token,
         )
         self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Data collator
         self.data_collator = DataCollatorForSeq2Seq(
             self.tokenizer,
             label_pad_token_id=self.tokenizer.pad_token_id,
             pad_to_multiple_of=None,
         )
         
-        # Load the dataset
+        # Load datasets and dataloaders
         datasets = load_dataset('data/Anthropic')
         train_dataset = datasets['train']
         test_dataset = datasets['test']
@@ -92,7 +106,36 @@ class DistributedLLM:
         # Batch: input_ids, attention_mask, labels, labels_attention_mask
         self.train_dataloader = self.get_dataloader(dataset=self.train_dataset)
         self.test_dataloader = self.get_dataloader(dataset=self.test_dataset)
-    
+        
+        # Stages, opimizer, and scheduler
+        self.distributed_stages = {
+            nodeID: get_stages(
+                self.config,
+                token=self.access_token,
+                model_name_or_path=self.model_name_or_path,
+                num_stages=self.num_gpus_per_node,
+                init_device=self.distributed_nodes[nodeID].init_device,
+                timing_info=self.timing_infos[nodeID],
+            ) for nodeID in range(self.num_nodes)
+        }
+
+        self.distributed_optimizers = {}
+        for nodeID in range(self.num_nodes):
+            all_parameters = []
+            # Collect all parameters from stages in each node
+            for stage in self.distributed_stages[nodeID]: 
+                all_parameters.extend(list(stage.parameters()))
+            self.distributed_optimizers[nodeID] = AdamW(all_parameters, lr=self.lr)
+        
+        self.distributed_schedulers = {
+            nodeID: get_scheduler(
+                "linear",
+                optimizer=self.distributed_optimizers[nodeID], 
+                num_warmup_steps=0, 
+                num_training_steps=100,
+            ) for nodeID in range(self.num_nodes)
+        }
+        
         
     def tokenize_and_align_labels(self, examples):
         tokenized_inputs = self.tokenizer(
@@ -126,7 +169,7 @@ class DistributedLLM:
         
     def get_preloaded_dataset(
         self,
-        distributed_nodes: Optional[List[Node]] = None, 
+        distributed_nodes: Optional[Dict[int, Node]] = None, 
         dataloader: Optional[DataLoader] = None, 
         retraining_rate: Optional[float] = None,
     ) -> Dict[int, List[Task]]:
@@ -136,7 +179,7 @@ class DistributedLLM:
         retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
         preloaded_tasks = defaultdict(list)
         
-        for nodeID, node in enumerate(distributed_nodes):
+        for nodeID, node in distributed_nodes.items():
             for i, batch in enumerate(dataloader):
                 # 10% of the time, produce a task with feedback
                 if random.random() < retraining_rate:
@@ -187,17 +230,17 @@ class DistributedLLM:
     def globalScheduler(
         self, 
         taskQueue: queue.Queue, 
-        distributed_nodes: List[Node],
+        distributed_nodes: Dict[int, Node],
     ):
         # Global scheduler
         while True:
             taskID: int = taskQueue.get() # ID
             if taskID is None:
                 print("Global scheduler finished scheduling tasks")
-                for node in distributed_nodes:
+                for node in distributed_nodes.values():
                     node.device_queues[0].put(None)
                 break
-            nodeID = random.randint(0, len(distributed_nodes) - 1)
+            nodeID = random.choice(list(distributed_nodes.keys()))
             # Each node queue store task IDs
             distributed_nodes[nodeID].device_queues[0].put(taskID)
             print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
@@ -207,6 +250,7 @@ class DistributedLLM:
         self,
         stage: GPTEndingStage, 
         stageID: int,
+        nodeID: int,
         timing_info: dict, 
         preloaded_tasks: List[Task], 
         deviceQueue: queue.Queue,
@@ -272,19 +316,23 @@ class DistributedLLM:
                     cross_attentions=tuple_outputs[5],
                 )
                 loss = outputs.loss
-                print("[NLL loss={}] stage {} finished inference for task {}".format(
-                    loss, device, taskID
-                ))
+                print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
+                self.metrics["loss"].append(loss.item())
                 
                 # if self.setting == 'active':
                 if task.require_training:
                     # Backprop on the last stage
                     loss.backward()
                     record_time(init_device, 'end', 'backward', timing_info)
+                    self.distributed_optimizers[nodeID].step()
+                    self.distributed_schedulers[nodeID].step()
+                    # Clear gradients
+                    for stage in stage:
+                        stage.zero_grad()
                     print("Stage {} finish backward propagation for task {} !".format(device, taskID))
-                else:
-                    task.hiddens.append(loss)
-                    deviceQueue.put(taskID) # put it back to the queue
+                # else:
+                #     task.hiddens.append(loss)
+                #     deviceQueue.put(taskID) # put it back to the queue
 
 
     def node_inference(
@@ -292,17 +340,18 @@ class DistributedLLM:
         node: Node,
         preloaded_tasks: List[Task],
         stages: List[GPTEndingStage], 
-        timing_info: dict,
+        timing_info: Dict[str, List[List[float]]],
     ):
         # We use 16 workers to simulateously get task from the queue and inference
         with ThreadPoolExecutor(max_workers=len(stages)) as executor:
             for stageID, stage in enumerate(stages):
                 future = executor.submit(
                     self.device_inference, 
-                    stage, 
-                    stageID,
-                    timing_info, 
-                    preloaded_tasks,
+                    stage=stage, 
+                    stageID=stageID,
+                    nodeID=node.node_id,
+                    timing_info=timing_info, 
+                    preloaded_tasks=preloaded_tasks,
                     deviceQueue=node.device_queues[stageID],
                     nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(stages) - 1 else None,
                     init_device=node.init_device,
@@ -314,12 +363,12 @@ class DistributedLLM:
     def run_stages_concurrently(
         self,
         preloaded_tasks: Dict[int, List[Task]],
-        distributed_stages: List[List[GPTEndingStage]], 
-        timing_infos: List[dict], 
-        distributed_nodes: List[Node],
+        distributed_stages: Dict[int, List[GPTEndingStage]], 
+        timing_infos: Dict[int, dict], 
+        distributed_nodes: Dict[int, Node],
     ):
         with ThreadPoolExecutor(max_workers=len(distributed_nodes)) as executor:
-            for nodeID, node in enumerate(distributed_nodes):
+            for nodeID, node in distributed_nodes.items():
                 future = executor.submit(
                     self.node_inference, 
                     node, 
@@ -330,26 +379,12 @@ class DistributedLLM:
             
             
     def run(self):
-        
         # Preloaded dataset
         preloaded_tasks = self.get_preloaded_dataset(
             self.distributed_nodes, 
             self.test_dataloader, 
             retraining_rate=self.retraining_rate,
         )
-        
-        distributed_stages = [
-            get_stages(
-                self.config,
-                token=self.access_token,
-                model_name_or_path=self.model_name_or_path,
-                num_stages=self.num_gpus_per_node,
-                init_device=self.distributed_nodes[nodeID].init_device,
-                timing_info=self.timing_infos[nodeID],
-            ) for nodeID in range(self.num_nodes)
-        ]
-        # Get a batch
-        # print("Node [0] preloaded task [0]: ", vars(preloaded_tasks[0][0]))
 
         # Run the stages concurrently
         task_queue = queue.Queue()
@@ -370,18 +405,68 @@ class DistributedLLM:
             future3 = executor.submit(
                 self.run_stages_concurrently,  
                 preloaded_tasks, 
-                distributed_stages,
+                self.distributed_stages,
                 self.timing_infos,
                 self.distributed_nodes,
             )
             
         # Save timing info
         self.save_timing_info()
+        
+        # Calculate metrics
+        start_time = None
+        total_idles = []
+        total_latencies = []
+        for nodeID, node in self.distributed_nodes.items():
+            # Load timing information
+            timing_info = self.timing_infos[nodeID]
+            for times_list in timing_info.values():
+                for times in times_list:
+                    if start_time is None or times[0] < start_time:
+                        start_time = times[0]
+                        
+            min_time = start_time if start_time is not None else 0
+            timing_info = {k: [[t[0] - min_time, t[1]] for t in v] for k, v in timing_info.items()}
+            
+            for gpu_id in range(self.num_gpus_per_node):
+                min_t, max_t = float('inf'), float('-inf')
+                gpu_idx = node.init_device + gpu_id
+                starts = timing_info.get(f"{gpu_idx}_start", [])
+                ends = timing_info.get(f"{gpu_idx}_end", [])
+                if len(starts) == 1:
+                    idles = [0]
+                else:
+                    idles = [start - end for (start, _), (end, _) in zip(starts[1:], ends[:-1])]
+                total_idles.extend(idles)
+                
+                tasks = list(zip(starts, ends))
+                for i, ((start, start_label), (end, _)) in enumerate(tasks):
+                    self.metrics[start_label].append(end - start)
+                    min_t = min(min_t, start)
+                    max_t = max(max_t, end)
+                total_latencies.append(max_t - min_t)
+                    
+        num_tasks = len(preloaded_tasks[0])
+        bubble_rate = sum(total_idles) / sum(total_latencies) if sum(total_latencies) > 0 else 0
+        for key, value in self.metrics.items():
+            self.metrics[key] = sum(value) / len(value)
+        
+        # print("# tasks: {}, # idles: {}, # tasks X # nodes X # gpus: {}".format(num_tasks, len(total_idles), num_tasks * len(total_latencies)))
+        self.metrics['bubble_rate'] = bubble_rate 
+        self.metrics['idleness'] = sum(total_idles) / len(total_idles)
+        self.metrics['response_time'] = sum(total_latencies) * 2 / (num_tasks * len(total_latencies))
+            
+        # Save metrics
+        os.makedirs(self.output_dir, exist_ok=True)
+        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}.json'
+        with open(stats_f, 'w') as f:
+            json.dump(self.metrics, f, indent=4)
+        print(f"Metrics saved to {stats_f}:\n{self.metrics}")
 
 
     def save_timing_info(self):
         os.makedirs(self.output_dir, exist_ok=True)
-        for nodeID, timing_info in enumerate(self.timing_infos):
+        for nodeID, timing_info in self.timing_infos.items():
             # # Remove the first start and end time for each GPU
             # gpus = list(set(int(key.split('_')[0]) for key in timing_info))
             # for gpu_id in gpus:
@@ -399,10 +484,12 @@ if __name__ == '__main__':
     parser.add_argument('--model_name_or_path', type=str, default='gpt2', help='model name or path')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--num_nodes', type=int, default=2)
-    parser.add_argument('--n_samples', type=int, default=200)
+    parser.add_argument('--n_samples', type=int, default=-1)
+    parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'one_node'], help='training setting')
-    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
+    parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
     parser.add_argument('--rate_lambda', type=float, default=60, help='Average number of tasks produced per minute')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--output_dir', type=str, default='prof')
