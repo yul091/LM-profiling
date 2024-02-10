@@ -30,7 +30,7 @@ logger = logging.get_logger(__name__)
 
 
 @dataclass
-class CustomizedOut(ModelOutput):
+class CustomizedLlamaOut(ModelOutput):
     hidden_states: torch.FloatTensor = None
     past_key_values: Optional[List[torch.FloatTensor]] = None
     all_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
@@ -99,7 +99,7 @@ class LlamaStartingStage(LlamaPreTrainedModel):
         labels: Optional[LongTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-    ) -> CustomizedOut:
+    ) -> CustomizedLlamaOut:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -198,7 +198,7 @@ class LlamaStartingStage(LlamaPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
                 
-        # return CustomizedOut(
+        # return CustomizedLlamaOut(
         #     hidden_states=hidden_states,
         #     past_key_values=past_key_values,
         #     all_hidden_states=all_hidden_states,
@@ -261,7 +261,7 @@ class LlamaIntermediateStage(LlamaPreTrainedModel):
         labels: Optional[LongTensor] = None,
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
-    ) -> CustomizedOut:
+    ) -> CustomizedLlamaOut:
         
         next_decoder_cache = None
         for decoder_layer in self.layers:
@@ -296,7 +296,7 @@ class LlamaIntermediateStage(LlamaPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
                 
-        # return CustomizedOut(
+        # return CustomizedLlamaOut(
         #     hidden_states=hidden_states,
         #     past_key_values=past_key_values,
         #     all_hidden_states=all_hidden_states,

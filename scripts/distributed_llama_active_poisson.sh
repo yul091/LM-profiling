@@ -1,6 +1,5 @@
 NUM_NODES=2
-NUM_SAMPLES=20
-LAYERS=12
+NUM_SAMPLES=200
 WORKLOAD=poisson
 SETTING=active
 OUTPUT_DIR=prof_async
@@ -16,11 +15,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_llama.py \
     --retraining_rate $RETRAIN_RATE \
     --output_dir $OUTPUT_DIR
 
-# python plot.py \
-#     --node $NUM_NODES \
-#     --coroutine \
-#     --setting $SETTING \
-#     --workload $WORKLOAD \
-#     --retraining_rate $RETRAIN_RATE \
-#     --output_dir $OUTPUT_DIR
-
+python plot.py \
+    --node $NUM_NODES \
+    -model_name "llama2" \
+    --setting $SETTING \
+    --workload $WORKLOAD \
+    --retraining_rate $RETRAIN_RATE \
+    --output_dir $OUTPUT_DIR

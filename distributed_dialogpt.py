@@ -4,7 +4,7 @@ sys.dont_write_bytecode = True
 import queue
 import argparse
 import pdb
-from typing import List, Dict, Optional, Any, Union, Tuple
+from typing import List, Dict, Optional, Any, Union
 import torch
 import logging
 from utils import record_time, Node, Task
@@ -18,7 +18,6 @@ from models import (
 )
 
 # torch.autograd.set_detect_anomaly(True)
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
  
 
@@ -52,7 +51,7 @@ class DistributedDialoGPT(DistributedLLM):
 
     def device_inference(
         self,
-        stage: GPTEndingStage, 
+        stage: Union[GPTStartingStage, GPTIntermediateStage, GPTEndingStage], 
         stageID: int,
         nodeID: int,
         timing_info: Dict[str, List[float]], 
@@ -148,7 +147,7 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_name_or_path', type=str, default='data/Anthropic', help='dataset name')
-    parser.add_argument('--model_name_or_path', type=str, default='gpt2', help='model name or path')
+    parser.add_argument('--model_name_or_path', type=str, default='microsoft/DialoGPT-small', help='model name or path')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
