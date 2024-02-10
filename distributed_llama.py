@@ -13,6 +13,7 @@ from models import (
     LlamaStartingStage,
     LlamaIntermediateStage,
     LlamaEndingStage, 
+    _prepare_inputs,
     _prepare_decoding_inputs,
     CustomizedLlamaOut,
 )
@@ -91,7 +92,7 @@ class DistributedLlama(DistributedLLM):
             if nextdeviceQueue is not None: # intermediate stage
                 outputs = CustomizedLlamaOut(
                     hidden_states=tuple_outputs[0].to(device+1),
-                    past_key_values=tuple_outputs[1].to(device+1),
+                    past_key_values=_prepare_inputs(tuple_outputs[1], device+1),
                     all_hidden_states=tuple_outputs[2],
                     all_self_attns=tuple_outputs[3],
                     position_ids=tuple_outputs[4].to(device+1),
@@ -111,14 +112,12 @@ class DistributedLlama(DistributedLLM):
                 # )
                 # loss = outputs.loss
                 loss = tuple_outputs[0]
-                print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
+                # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())
                 
-                if self.setting == 'active':
+                # if self.setting == 'active':
+                if task.require_training:
                     # Backprop on the last stage
-                    # print("Stage {} start backward propagation for task {}".format(device, taskID))
-                    # print("output_flat shape: {}, feedback shape: {}".format(output_flat.shape, task.feedback.shape))
-                    # print("loss: {}, start loss backward ...".format(nll_loss))
                     try:
                         loss.backward()
                         record_time(init_device, 'end', 'backward', timing_info)

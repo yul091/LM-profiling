@@ -6,7 +6,8 @@ SETTING=active
 OUTPUT_DIR=prof_async
 # RETRAIN_RATE=0.8
 
-for RETRAIN_RATE in 0.8 0.9 1.0; do
+# 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0
+for RETRAIN_RATE in 1.0; do
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_dialogpt.py \
         --model_name_or_path "microsoft/DialoGPT-small" \
         --num_nodes $NUM_NODES \

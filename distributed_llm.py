@@ -366,19 +366,11 @@ class DistributedLLM:
     ):
         metrics = metrics if metrics is not None else self.metrics
         # Calculate metrics
-        start_time = None
+        global_min_time, global_max_time = float('inf'), float('-inf')
         total_idles = []
         total_latencies = []
         for nodeID, node in self.distributed_nodes.items():
-            # Load timing information
             timing_info = self.timing_infos[nodeID]
-            for times_list in timing_info.values():
-                for times in times_list:
-                    if start_time is None or times[0] < start_time:
-                        start_time = times[0]
-                        
-            min_time = start_time if start_time is not None else 0
-            timing_info = {k: [[t[0] - min_time, t[1]] for t in v] for k, v in timing_info.items()}
             
             for gpu_id in range(self.num_gpus_per_node):
                 min_t, max_t = float('inf'), float('-inf')
@@ -388,7 +380,7 @@ class DistributedLLM:
                 if len(starts) == 1:
                     idles = [0]
                 else:
-                    idles = [start - end for (start, _), (end, _) in zip(starts[1:], ends[:-1])]
+                    idles = [start - end for (start, start_label), (end, end_label) in zip(starts[1:], ends[:-1]) if (start_label == end_label and start > end)]
                 total_idles.extend(idles)
                 
                 tasks = list(zip(starts, ends))
@@ -397,15 +389,20 @@ class DistributedLLM:
                     min_t = min(min_t, start)
                     max_t = max(max_t, end)
                 total_latencies.append(max_t - min_t)
+                global_min_time = min(global_min_time, min_t)
+                global_max_time = max(global_max_time, max_t)
                     
         num_tasks = len(self.distributed_preloaded_tasks[0])
         bubble_rate = sum(total_idles) / sum(total_latencies) if sum(total_latencies) > 0 else 0
         for key, value in metrics.items():
             metrics[key] = sum(value) / len(value)
         
+        metrics['num_tasks'] = num_tasks
         metrics['bubble_rate'] = bubble_rate 
         metrics['idleness'] = sum(total_idles) / len(total_idles)
         metrics['response_time'] = sum(total_latencies) * 2 / (num_tasks * len(total_latencies))
+        metrics['end2end_latency'] = global_max_time - global_min_time
+        metrics['throughput'] = num_tasks / (global_max_time - global_min_time)
             
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)

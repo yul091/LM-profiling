@@ -121,7 +121,6 @@ class DistributedDialoGPT(DistributedLLM):
                 # if self.setting == 'active':
                 if task.require_training:
                     # Backprop on the last stage
-                    # self.backward(loss, init_device, timing_info)
                     try:
                         loss.backward()
                         record_time(init_device, 'end', 'backward', timing_info)
