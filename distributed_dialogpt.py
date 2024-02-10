@@ -8,11 +8,13 @@ import random
 import argparse
 import pdb
 from tqdm import tqdm
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Optional, Any, Union, Tuple
 from collections import defaultdict
 import torch
 from torch.utils.data import DataLoader
-from threading import Lock
+import logging
+import threading
+from threading import Lock, current_thread, get_ident, get_native_id
 from concurrent.futures import ThreadPoolExecutor
 from datasets import load_dataset, Dataset
 from transformers import (
@@ -20,23 +22,28 @@ from transformers import (
     AutoTokenizer, 
     DataCollatorForSeq2Seq,
     set_seed,
-    # AdamW,
     get_scheduler,
 )
 from utils import record_time, Node, Task
 from models import (
     get_stages, 
+    GPTStartingStage,
+    GPTIntermediateStage,
     GPTEndingStage,
     _prepare_inputs,
     _prepare_decoding_inputs,
     CustomizedGPT2Out,
     CausalLMOutputWithCrossAttentions,
 )
+
+# torch.autograd.set_detect_anomaly(True)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
  
 
 class DistributedLLM:
-    model_n = 'dialogpt'
-    
+    model_n: str = 'dialogpt'
+
     def __init__(self, args: argparse.Namespace):
         n_samples = args.n_samples
         self.setting = args.setting
@@ -46,8 +53,7 @@ class DistributedLLM:
         self.output_dir = args.output_dir
         self.lr = args.lr
         self.workload = args.workload
-        self.retraining_rate = args.retraining_rate
-        self.optimizer_lock = Lock()  
+        self.retraining_rate = args.retraining_rate  
         
         # Reproducibility
         set_seed(args.seed)
@@ -254,26 +260,60 @@ class DistributedLLM:
             distributed_nodes[nodeID].device_queues[0].put(taskID)
             # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
             
+            
+    def forward(
+        self, 
+        task: Task,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        stage: Union[GPTStartingStage, GPTIntermediateStage, GPTEndingStage],
+        device: int, 
+        timing_info: Dict[str, List[float]],
+    ):
+        if task.require_training: # this is a retraining task
+            record_time(device, 'start', 'forward_grad', timing_info)
+            tuple_outputs = stage(**inputs, labels=task.feedback)
+            record_time(device, 'end', 'forward_grad', timing_info)
+        else:
+            record_time(device, 'start', 'forward', timing_info)
+            with torch.no_grad():
+                tuple_outputs = stage(**inputs, labels=task.feedback)
+            record_time(device, 'end', 'forward', timing_info)
+        
+        return tuple_outputs
     
-    # @torch.no_grad()
-    # def custom_step(self, stages: List[GPTEndingStage], lr: float):
-    #     """
-    #     Applies a simple gradient descent update to the parameters.
-
-    #     Args:
-    #         parameters (Iterable[torch.nn.Parameter]): An iterable of Parameters to update.
-    #         lr (float): The learning rate to use for the update.
-    #     """
-    #     # with torch.no_grad():  # Ensure gradients are not tracked in this operation
-    #     #     for param in parameters:
-    #     #         if param.grad is not None:  # Skip parameters without gradients
-    #     #             param -= lr * param.grad  # Update parameter using gradient descent
-    #     for stage in stages:
-    #         for param in stage.parameters():
-    #             if param.grad is not None:
-    #                 # Manually update the model parameters using the gradient descent rule
-    #                 # param.data = param.data - learning_rate * param.grad
-    #                 param -= lr * param.grad
+    
+    # def backward(
+    #     self,
+    #     loss: torch.Tensor,
+    #     init_device: int,
+    #     timing_info: Dict[str, List[float]],
+    # ):
+    #     try:
+    #         loss.backward()
+    #     except Exception as e:
+    #         logging.error(f"Thread {current_thread().name}: Backward error occurred: {e}")
+    #     record_time(init_device, 'end', 'backward', timing_info)
+            
+    
+    # def optimize(self, nodeID: int):
+        # while True:
+        #     if self.global_F == 0 and self.global_B == 0:
+        #         # Update the model
+        #         # print(f'[backward {nodeID} start]: name={current_thread().name}, idnet={get_ident()}, id={get_native_id()}')
+        #         # try:
+        #         #     loss.backward()
+        #         #     logging.info(f"Thread {current_thread().name}: {self._count_bq_success} Backward propagation succeeded!")
+        #         # except Exception as e:
+        #         #     logging.error(f"Thread {current_thread().name}: {self._count_bq_fail} Backward error occurred: {e}")
+        
+        #         # print(f'[backward {nodeID} end]: name={current_thread().name}, idnet={get_ident()}, id={get_native_id()}')
+        #         # print(f'[optimizer {nodeID} start]: name={current_thread().name}, idnet={get_ident()}, id={get_native_id()}')
+                
+        #         # for stage in self.distributed_stages[nodeID]:
+        #         #     stage.zero_grad()
+        #         self.global_OPT = False
+        #         break
+            # print(f'[optimizer {nodeID} end]: name={current_thread().name}, idnet={get_ident()}, id={get_native_id()}')
 
 
     def device_inference(
@@ -281,7 +321,7 @@ class DistributedLLM:
         stage: GPTEndingStage, 
         stageID: int,
         nodeID: int,
-        timing_info: dict, 
+        timing_info: Dict[str, List[float]], 
         preloaded_tasks: List[Task], 
         deviceQueue: queue.Queue,
         nextdeviceQueue: Optional[queue.Queue] = None,
@@ -293,8 +333,9 @@ class DistributedLLM:
         while True:
             taskID: int = deviceQueue.get()
             if taskID is None:
+                # Signal that this thread is done
                 print("Stage {} finished inference".format(device))
-                if nextdeviceQueue is not None:
+                if nextdeviceQueue is not None: # intermediate stage
                     nextdeviceQueue.put(None)
                 break
             
@@ -304,21 +345,15 @@ class DistributedLLM:
             
             if inputs is None:
                 print("Stage {} waiting for task {}".format(device, taskID))
-                continue
-            
+                continue    
+                
             if stageID == 0: # prepare inputs
                 inputs = _prepare_decoding_inputs(inputs)
                 task.feedback = inputs.pop('labels', None)
                 
-            if task.require_training: # this is a retraining task
-                record_time(device, 'start', 'forward_grad', timing_info)
-                tuple_outputs = stage(**inputs, labels=task.feedback)
-                record_time(device, 'end', 'forward_grad', timing_info)
-            else:
-                record_time(device, 'start', 'forward', timing_info)
-                with torch.no_grad():
-                    tuple_outputs = stage(**inputs, labels=task.feedback)
-                record_time(device, 'end', 'forward', timing_info)
+            tuple_outputs = self.forward(task, inputs, stage, device, timing_info)
+            # Clear the input from task.hiddens that is no longer needed
+            task.hiddens[stageID] = None
                 
             if nextdeviceQueue is not None: # intermediate stage
                 # Need to send the output to the next stage, except for the last stage
@@ -337,33 +372,41 @@ class DistributedLLM:
                 nextdeviceQueue.put(taskID)
                 
             else: # last stage
-                outputs = CausalLMOutputWithCrossAttentions(
-                    loss=tuple_outputs[0],
-                    logits=tuple_outputs[1],
-                    past_key_values=tuple_outputs[2],
-                    hidden_states=tuple_outputs[3],
-                    attentions=tuple_outputs[4],
-                    cross_attentions=tuple_outputs[5],
-                )
-                loss = outputs.loss
+                # outputs = CausalLMOutputWithCrossAttentions(
+                #     loss=tuple_outputs[0],
+                #     logits=tuple_outputs[1],
+                #     past_key_values=tuple_outputs[2],
+                #     hidden_states=tuple_outputs[3],
+                #     attentions=tuple_outputs[4],
+                #     cross_attentions=tuple_outputs[5],
+                # )
+                # loss = outputs.loss
+                loss = tuple_outputs[0]
                 # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())
                 
                 # if self.setting == 'active':
                 if task.require_training:
                     # Backprop on the last stage
-                    loss.backward()
-                    record_time(init_device, 'end', 'backward', timing_info)
-                    # Update the model
-                    with self.optimizer_lock:
-                        # self.distributed_optimizers[nodeID].step()
-                        # self.custom_step(self.distributed_stages[nodeID], self.lr)
-                        self.distributed_schedulers[nodeID].step()
-                        self.distributed_optimizers[nodeID].zero_grad() # clear gradients
+                    # self.backward(loss, init_device, timing_info)
+                    try:
+                        loss.backward()
+                        record_time(init_device, 'end', 'backward', timing_info)
+                    except Exception as e:
+                        # logging.error(f"Thread {current_thread().name}: Backward error occurred: {e}")
+                        pass
+                    
+                    # Optimize
+                    # self.optimize(nodeID)
+                    self.distributed_optimizers[nodeID].step()
+                    self.distributed_schedulers[nodeID].step()
+                    self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                    
                 # else:
                 #     task.hiddens.append(loss)
                 #     deviceQueue.put(taskID) # put it back to the queue
+                
 
 
     def node_inference(
