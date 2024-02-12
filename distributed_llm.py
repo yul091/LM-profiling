@@ -182,14 +182,14 @@ class DistributedLLM:
         retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
         distributed_preloaded_tasks = defaultdict(list)
         
-        for nodeID, node in distributed_nodes.items():
-            for i, batch in enumerate(dataloader):
-                # 10% of the time, produce a task with feedback
-                if random.random() < retraining_rate:
-                    require_training = True
-                else:
-                    require_training = False  
+        for i, batch in enumerate(dataloader):
+            # 10% of the time, produce a task with feedback
+            if random.random() < retraining_rate:
+                require_training = True
+            else:
+                require_training = False  
                 
+            for nodeID, node in distributed_nodes.items():
                 task = Task(
                     task_id=i,
                     query=_prepare_inputs(batch, device=node.init_device),
@@ -245,7 +245,14 @@ class DistributedLLM:
                 for node in distributed_nodes.values():
                     node.device_queues[0].put(None)
                 break
-            nodeID = random.choice(list(distributed_nodes.keys()))
+            if self.setting != 'isolated':
+                nodeID = random.choice(list(distributed_nodes.keys()))
+            else:
+                # If the task require training, we schedule it to the last node
+                if self.distributed_preloaded_tasks[0][taskID].require_training:
+                    nodeID = self.num_nodes - 1
+                else:
+                    nodeID = random.choice(list(distributed_nodes.keys()))
             # Each node queue store task IDs
             distributed_nodes[nodeID].device_queues[0].put(taskID)
             # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
@@ -442,7 +449,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
-    parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'one_node'], help='training setting')
+    parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'isolated'], help='training setting')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')

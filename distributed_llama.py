@@ -127,7 +127,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
-    parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'one_node'], help='training setting')
+    parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'isolated'], help='training setting')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
