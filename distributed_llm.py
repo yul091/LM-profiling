@@ -6,6 +6,7 @@ import json
 import queue
 import random
 import argparse
+import logging
 from tqdm import tqdm
 from typing import List, Dict, Optional, Any, Union, Tuple
 from collections import defaultdict
@@ -20,11 +21,15 @@ from transformers import (
     set_seed,
     get_scheduler,
 )
-from utils import Node, Task
+from utils import Node, Task, record_time
 from models import (
     get_stages, 
     _prepare_inputs,
 )
+
+
+# torch.autograd.set_detect_anomaly(True)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
  
 
 class DistributedLLM:
@@ -250,11 +255,25 @@ class DistributedLLM:
         self, 
         task: Task,
         inputs: Dict[str, Union[torch.Tensor, Any]],
-        stage: Union[torch.nn.Module],
+        stage: torch.nn.Module,
         device: int, 
         timing_info: Dict[str, List[float]],
     ):
-        raise NotImplementedError("forward method must be implemented")
+        try:
+            if task.require_training: # this is a retraining task
+                record_time(device, 'start', 'forward_grad', timing_info)
+                tuple_outputs = stage(**inputs, labels=task.feedback)
+                record_time(device, 'end', 'forward_grad', timing_info)
+            else:
+                record_time(device, 'start', 'forward', timing_info)
+                with torch.no_grad():
+                    tuple_outputs = stage(**inputs, labels=task.feedback)
+                record_time(device, 'end', 'forward', timing_info)
+        except Exception as e:
+            logging.error(f"Error occurred: {e}")
+            tuple_outputs = None
+        
+        return tuple_outputs
     
 
     def device_inference(

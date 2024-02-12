@@ -2,11 +2,11 @@ import os
 import sys
 sys.dont_write_bytecode = True
 import queue
+import logging
 import argparse
 import pdb
 from typing import List, Dict, Optional, Any, Union
 import torch
-import logging
 from utils import record_time, Node, Task
 from distributed_llm import DistributedLLM
 from models import (
@@ -19,39 +19,14 @@ from models import (
 )
 
 # torch.autograd.set_detect_anomaly(True)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')  
+    
 
 class DistributedLlama(DistributedLLM):
     model_n: str = 'llama2'
     
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
-    
-
-    def forward(
-        self, 
-        task: Task,
-        inputs: Dict[str, Union[torch.Tensor, Any]],
-        stage: Union[LlamaStartingStage, LlamaIntermediateStage, LlamaEndingStage],
-        device: int, 
-        timing_info: Dict[str, List[float]],
-    ):
-        try:
-            if task.require_training: # this is a retraining task
-                record_time(device, 'start', 'forward_grad', timing_info)
-                tuple_outputs = stage(**inputs, labels=task.feedback)
-                record_time(device, 'end', 'forward_grad', timing_info)
-            else:
-                record_time(device, 'start', 'forward', timing_info)
-                with torch.no_grad():
-                    tuple_outputs = stage(**inputs, labels=task.feedback)
-                record_time(device, 'end', 'forward', timing_info)
-        except Exception as e:
-            logging.error(f"Error occurred: {e}")
-            tuple_outputs = None
-        
-        return tuple_outputs
 
 
     def device_inference(
@@ -126,8 +101,8 @@ class DistributedLlama(DistributedLLM):
                         loss.backward()
                         record_time(init_device, 'end', 'backward', timing_info)
                     except Exception as e:
-                        # logging.error(f"Thread {current_thread().name}: Backward error occurred: {e}")
-                        pass
+                        logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
+                        # pass
                     
                     # Optimize
                     # self.optimize(nodeID)

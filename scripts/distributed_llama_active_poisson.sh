@@ -5,8 +5,9 @@ SETTING=active
 OUTPUT_DIR=prof_async
 BATCH_SIZE=2
 # RETRAIN_RATE=0.2
+# 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0
 
-for RETRAIN_RATE in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0; do
+for RETRAIN_RATE in 0; do
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_llama.py \
         --access_token "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" \
         --model_name_or_path "meta-llama/Llama-2-7b-chat-hf" \

@@ -17,7 +17,7 @@ from models import (
     CustomizedGPT2Out,
 )
 
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
  
 
@@ -26,31 +26,6 @@ class DistributedDialoGPT(DistributedLLM):
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
         self.model_n = args.model_name
-            
-            
-    def forward(
-        self, 
-        task: Task,
-        inputs: Dict[str, Union[torch.Tensor, Any]],
-        stage: Union[GPTStartingStage, GPTIntermediateStage, GPTEndingStage],
-        device: int, 
-        timing_info: Dict[str, List[float]],
-    ):
-        try:
-            if task.require_training: # this is a retraining task
-                record_time(device, 'start', 'forward_grad', timing_info)
-                tuple_outputs = stage(**inputs, labels=task.feedback)
-                record_time(device, 'end', 'forward_grad', timing_info)
-            else:
-                record_time(device, 'start', 'forward', timing_info)
-                with torch.no_grad():
-                    tuple_outputs = stage(**inputs, labels=task.feedback)
-                record_time(device, 'end', 'forward', timing_info)
-        except Exception as e:
-            logging.error(f"Error occurred: {e}")
-            tuple_outputs = None
-        
-        return tuple_outputs
 
 
     def device_inference(
@@ -129,8 +104,8 @@ class DistributedDialoGPT(DistributedLLM):
                         loss.backward()
                         record_time(init_device, 'end', 'backward', timing_info)
                     except Exception as e:
-                        logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
-                        # pass
+                        # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
+                        pass
                     
                     # Optimize
                     # self.optimize(nodeID)

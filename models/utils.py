@@ -92,13 +92,21 @@ def get_stages(
     
     pretrained_model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        low_cpu_mem_usage=True,
+        # low_cpu_mem_usage=True,
         token=token,
         config=config,
         # torch_dtype="float32",
     )
+    if 'llama' in model_name_or_path.lower():
+        pretrained_model = pretrained_model.half()
     # pretrained_model = pretrained_model.half()
     # pretrained_model.gradient_checkpointing_enable()
+    print("Model hidden dim {}, num layers {}, num heads {}, num parameters {}".format(
+        pretrained_model.config.hidden_size, 
+        pretrained_model.config.num_hidden_layers, 
+        pretrained_model.config.num_attention_heads, 
+        pretrained_model.num_parameters()
+    ))
     
     pipeline_stages = []
     totoal_params = 0
