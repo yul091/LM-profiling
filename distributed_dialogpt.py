@@ -17,15 +17,15 @@ from models import (
     CustomizedGPT2Out,
 )
 
-# torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
  
 
 class DistributedDialoGPT(DistributedLLM):
-    model_n: str = 'dialogpt'
     
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
+        self.model_n = args.model_name
             
             
     def forward(
@@ -36,15 +36,19 @@ class DistributedDialoGPT(DistributedLLM):
         device: int, 
         timing_info: Dict[str, List[float]],
     ):
-        if task.require_training: # this is a retraining task
-            record_time(device, 'start', 'forward_grad', timing_info)
-            tuple_outputs = stage(**inputs, labels=task.feedback)
-            record_time(device, 'end', 'forward_grad', timing_info)
-        else:
-            record_time(device, 'start', 'forward', timing_info)
-            with torch.no_grad():
+        try:
+            if task.require_training: # this is a retraining task
+                record_time(device, 'start', 'forward_grad', timing_info)
                 tuple_outputs = stage(**inputs, labels=task.feedback)
-            record_time(device, 'end', 'forward', timing_info)
+                record_time(device, 'end', 'forward_grad', timing_info)
+            else:
+                record_time(device, 'start', 'forward', timing_info)
+                with torch.no_grad():
+                    tuple_outputs = stage(**inputs, labels=task.feedback)
+                record_time(device, 'end', 'forward', timing_info)
+        except Exception as e:
+            logging.error(f"Error occurred: {e}")
+            tuple_outputs = None
         
         return tuple_outputs
 
@@ -125,8 +129,8 @@ class DistributedDialoGPT(DistributedLLM):
                         loss.backward()
                         record_time(init_device, 'end', 'backward', timing_info)
                     except Exception as e:
-                        # logging.error(f"Thread {current_thread().name}: Backward error occurred: {e}")
-                        pass
+                        logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
+                        # pass
                     
                     # Optimize
                     # self.optimize(nodeID)
@@ -147,6 +151,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_name_or_path', type=str, default='data/Anthropic', help='dataset name')
     parser.add_argument('--model_name_or_path', type=str, default='microsoft/DialoGPT-small', help='model name or path')
+    parser.add_argument('--model_name', type=str, default='dialogpt', help='model name')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)

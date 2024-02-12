@@ -2,7 +2,6 @@
 import time
 from dataclasses import dataclass
 from functools import partial
-from collections import OrderedDict
 from typing import Optional, Tuple, Dict, List, Any, Union
 import torch
 import torch.nn as nn
@@ -13,10 +12,6 @@ from transformers import (
     LlamaConfig, 
     LlamaForCausalLM,
     LlamaPreTrainedModel,
-)
-from transformers.models.llama.modeling_llama import (
-    LlamaDecoderLayer,
-    LlamaRMSNorm,
 )
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import ModelOutput, CausalLMOutputWithPast

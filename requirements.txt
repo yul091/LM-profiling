@@ -3,7 +3,7 @@ evaluate
 torch
 torchvision
 torchaudio
-transformers[torch]==4.34.1
+transformers[torch]==4.36.2
 wandb
 portalocker
 torchdata

@@ -18,7 +18,6 @@ from .dialogpt import (
 )
 from transformers import (
     LlamaConfig, 
-    PreTrainedTokenizer,
     AutoTokenizer, 
     AutoConfig, 
     AutoModelForCausalLM,
@@ -92,16 +91,21 @@ def get_stages(
     assert len(hidden_layers_assignments) == num_stages
     
     pretrained_model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path, 
-        config=config, 
+        model_name_or_path,
+        low_cpu_mem_usage=True,
         token=token,
+        config=config,
+        # torch_dtype="float32",
     )
+    # pretrained_model = pretrained_model.half()
+    # pretrained_model.gradient_checkpointing_enable()
     
     pipeline_stages = []
     totoal_params = 0
     start_stage_class = GPTStartingStage if 'gpt' in model_name_or_path.lower() else LlamaStartingStage
     intermediate_stage_class = GPTIntermediateStage if 'gpt' in model_name_or_path.lower() else LlamaIntermediateStage
     end_stage_class = GPTEndingStage if 'gpt' in model_name_or_path.lower() else LlamaEndingStage
+    # gradient_checkpointing_kwargs={"use_reentrant":False}
     
     for stage_id in range(num_stages):
         # Overwrite num_hidden_layers with the number for this stage
@@ -119,6 +123,7 @@ def get_stages(
                 pretrained_model=pretrained_model,
                 timing_info=timing_info,
             )
+            # stage.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
         elif stage_id == num_stages - 1:
             # Ending stage
             stage = end_stage_class(
@@ -128,6 +133,7 @@ def get_stages(
                 pretrained_model=pretrained_model,
                 timing_info=timing_info,
             )
+            # stage.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
             # Set pad_token_id to eos_token_id because Llama / GPT does not have a PAD token
             stage.generation_config.pad_token_id = stage.generation_config.eos_token_id
         else:
@@ -139,6 +145,7 @@ def get_stages(
                 pretrained_model=pretrained_model,
                 timing_info=timing_info,
             )
+            # stage.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
             
         print(f"Put stage {stage.__class__.__name__} ({stage.num_parameters()} parameters) on device {device}")
         totoal_params += stage.num_parameters()
@@ -192,15 +199,17 @@ def stages_forward(
 def _prepare_decoding_inputs(
     inputs: Dict[str, Union[torch.Tensor, Any]],
 ):
-    new_inputs = inputs.copy() # Don't modify the original dict
-    labels = new_inputs.pop("labels")
-    labels_attention_mask = torch.ones_like(labels)
-    new_inputs['input_ids'] = torch.cat((inputs['input_ids'], labels), dim=1)
-    new_inputs['attention_mask'] = torch.cat((inputs['attention_mask'], labels_attention_mask), dim=1)
-    new_labels = torch.cat(
-        (-100 * torch.ones_like(inputs['input_ids']), labels), dim=1
-    )
-    new_inputs['labels'] = new_labels
+    # Create a new dictionary to avoid modifying the original inputs
+    new_inputs = {key: val.clone() if torch.is_tensor(val) else val for key, val in inputs.items()}
+    labels = new_inputs.pop("labels", None)
+    if labels is not None:
+        labels_attention_mask = torch.ones_like(labels)
+        new_inputs['input_ids'] = torch.cat((inputs['input_ids'], labels), dim=1)
+        new_inputs['attention_mask'] = torch.cat((inputs['attention_mask'], labels_attention_mask), dim=1)
+        new_labels = torch.cat(
+            (-100 * torch.ones_like(inputs['input_ids']), labels), dim=1
+        )
+        new_inputs['labels'] = new_labels
     return new_inputs
 
 
@@ -222,8 +231,8 @@ if __name__ == '__main__':
     
     datasets = load_dataset('data/Anthropic')
     access_token = "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"
-    # model_name_or_path = "meta-llama/Llama-2-7b-chat-hf"
-    model_name_or_path = "microsoft/DialoGPT-small"
+    model_name_or_path = "meta-llama/Llama-2-7b-chat-hf"
+    # model_name_or_path = "microsoft/DialoGPT-small"
     config = AutoConfig.from_pretrained(model_name_or_path, token=access_token)
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, token=access_token)
     tokenizer.pad_token = tokenizer.eos_token
@@ -235,7 +244,7 @@ if __name__ == '__main__':
         # torch_dtype="auto"
     )
     
-    num_stages = 4
+    num_stages = 8
     timing_info = defaultdict(list)
     stages = get_stages(
         config, 
@@ -300,14 +309,14 @@ if __name__ == '__main__':
     # print(timing_info)
     
     # Test decoding nll loss
-    start = time.time()
-    # loss = compute_nll_loss(model, inputs, labels)
-    new_inputs = _prepare_decoding_inputs(inputs)
-    print({k: v.shape for k, v in new_inputs.items()})
-    outputs = model(**new_inputs)
-    loss = outputs.loss
-    end = time.time()
-    print(f'nll loss: {loss}, overhead: {end - start}')
+    # start = time.time()
+    # # loss = compute_nll_loss(model, inputs, labels)
+    # new_inputs = _prepare_decoding_inputs(inputs)
+    # print({k: v.shape for k, v in new_inputs.items()})
+    # outputs = model(**new_inputs)
+    # loss = outputs.loss
+    # end = time.time()
+    # print(f'nll loss: {loss}, overhead: {end - start}')
     
     start = time.time()
     outputs = stages_decoding(stages, inputs)

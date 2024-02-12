@@ -37,15 +37,19 @@ class DistributedLlama(DistributedLLM):
         device: int, 
         timing_info: Dict[str, List[float]],
     ):
-        if task.require_training: # this is a retraining task
-            record_time(device, 'start', 'forward_grad', timing_info)
-            tuple_outputs = stage(**inputs, labels=task.feedback)
-            record_time(device, 'end', 'forward_grad', timing_info)
-        else:
-            record_time(device, 'start', 'forward', timing_info)
-            with torch.no_grad():
+        try:
+            if task.require_training: # this is a retraining task
+                record_time(device, 'start', 'forward_grad', timing_info)
                 tuple_outputs = stage(**inputs, labels=task.feedback)
-            record_time(device, 'end', 'forward', timing_info)
+                record_time(device, 'end', 'forward_grad', timing_info)
+            else:
+                record_time(device, 'start', 'forward', timing_info)
+                with torch.no_grad():
+                    tuple_outputs = stage(**inputs, labels=task.feedback)
+                record_time(device, 'end', 'forward', timing_info)
+        except Exception as e:
+            logging.error(f"Error occurred: {e}")
+            tuple_outputs = None
         
         return tuple_outputs
 
@@ -112,7 +116,7 @@ class DistributedLlama(DistributedLLM):
                 # )
                 # loss = outputs.loss
                 loss = tuple_outputs[0]
-                # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
+                print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())
                 
                 # if self.setting == 'active':
