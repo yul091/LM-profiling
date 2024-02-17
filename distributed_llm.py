@@ -1,6 +1,7 @@
 import os
 import sys
 sys.dont_write_bytecode = True
+import pdb
 import time
 import json
 import queue
@@ -45,6 +46,7 @@ class DistributedLLM:
         self.lr = args.lr
         self.workload = args.workload
         self.retraining_rate = args.retraining_rate  
+        self._ISOLATED = False
         
         # Reproducibility
         set_seed(args.seed)
@@ -109,6 +111,7 @@ class DistributedLLM:
             self.test_dataloader, 
             retraining_rate=self.retraining_rate,
         )
+        # pdb.set_trace()
         
         # Stages, opimizer, and scheduler
         self.distributed_stages = {
@@ -176,18 +179,19 @@ class DistributedLLM:
         dataloader: Optional[DataLoader] = None, 
         retraining_rate: Optional[float] = None,
     ) -> Dict[int, List[Task]]:
+        
         print("Using preloaded data ...")
         distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         dataloader = dataloader if dataloader is not None else self.test_dataloader
         retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
-        distributed_preloaded_tasks = defaultdict(list)
+        if self.setting != 'isolated':
+            distributed_preloaded_tasks = defaultdict(list)
+        else:
+            distributed_preloaded_tasks = defaultdict(lambda: {'train': [], 'no_train': []})
         
         for i, batch in enumerate(dataloader):
             # 10% of the time, produce a task with feedback
-            if random.random() < retraining_rate:
-                require_training = True
-            else:
-                require_training = False  
+            require_training = random.random() < retraining_rate
                 
             for nodeID, node in distributed_nodes.items():
                 task = Task(
@@ -198,23 +202,43 @@ class DistributedLLM:
                     num_gpus_per_node=node.num_gpus_per_node,
                     require_training=require_training,
                 )
-                distributed_preloaded_tasks[nodeID].append(task)
-                
-        return distributed_preloaded_tasks
+                if self.setting != 'isolated':
+                    distributed_preloaded_tasks[nodeID].append(task)
+                else:
+                    if require_training:
+                        distributed_preloaded_tasks[nodeID]['train'].append(task)
+                    else:
+                        distributed_preloaded_tasks[nodeID]['no_train'].append(task)
+                # distributed_preloaded_tasks[nodeID].append(task)
+        
+        if self.setting != 'isolated':
+            return distributed_preloaded_tasks
+
+        # Reorganize tasks
+        final_distributed_tasks = defaultdict(list)
+        for nodeID, tasks in distributed_preloaded_tasks.items():
+            tasks['train'][0].is_train_first = True # mark the first train task
+            tasks['train'][-1].is_train_last = True # mark the last train task
+            # random.shuffle(no_train_tasks)
+            mid_point = len(tasks['no_train']) // 2
+            final_distributed_tasks[nodeID] = tasks['no_train'][:mid_point] + tasks['train'] + tasks['no_train'][mid_point:]
+        return final_distributed_tasks
+        
+        # return distributed_preloaded_tasks
 
 
     def producer(
         self,
         taskQueue: queue.Queue, 
-        dataloader: Optional[DataLoader] = None, 
+        preloaded_tasks: Optional[List[Task]] = None, 
         rate_lambda: Optional[float] = None, 
         workload: Optional[str] = None,
     ):
-        dataloader = dataloader if dataloader is not None else self.test_dataloader
+        preloaded_tasks = preloaded_tasks if preloaded_tasks is not None else self.distributed_preloaded_tasks[0]
         rate_lambda = rate_lambda if rate_lambda is not None else self.rate_lambda
         workload = workload if workload is not None else self.workload
         # Produce using the dataset
-        for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+        for taskID in range(len(preloaded_tasks)):
             # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
             if workload == 'poisson':
                 time.sleep(random.expovariate(rate_lambda))
@@ -225,7 +249,7 @@ class DistributedLLM:
             # 10% of the time, produce a task with feedback
             # print("Producing task {} with input shape {}".format(i, batch['input_ids'].shape))
             # Essentially, we are using preloaded data (task ID)
-            taskQueue.put(i)
+            taskQueue.put(taskID)
             
         taskQueue.put(None)  # Signal the end of the dataset
         print("Producer finished producing tasks")
@@ -239,6 +263,9 @@ class DistributedLLM:
         distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         # Global scheduler
         while True:
+            # if self._ISOLATED: # keep busy until the last node has finished training
+            #     continue
+            
             taskID: int = taskQueue.get() # ID
             if taskID is None:
                 print("Global scheduler finished scheduling tasks")
@@ -252,10 +279,11 @@ class DistributedLLM:
                 if self.distributed_preloaded_tasks[0][taskID].require_training:
                     nodeID = self.num_nodes - 1
                 else:
-                    nodeID = random.choice(list(distributed_nodes.keys()))
+                    # Randomly choose another node (not the last node)
+                    nodeID = random.choice(list(distributed_nodes.keys())[:-1])
             # Each node queue store task IDs
             distributed_nodes[nodeID].device_queues[0].put(taskID)
-            # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
+            print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
             
             
     def forward(
@@ -265,7 +293,7 @@ class DistributedLLM:
         stage: torch.nn.Module,
         device: int, 
         timing_info: Dict[str, List[float]],
-    ):
+    ) -> Tuple[torch.Tensor, ...]:
         try:
             if task.require_training: # this is a retraining task
                 record_time(device, 'start', 'forward_grad', timing_info)
@@ -354,7 +382,6 @@ class DistributedLLM:
             future1 = executor.submit(
                 self.producer,
                 task_queue, 
-                dataloader=self.test_dataloader,
             )
             future2 = executor.submit(
                 self.globalScheduler,
@@ -453,7 +480,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
-    parser.add_argument('--rate_lambda', type=float, default=60, help='Average number of tasks produced per minute')
+    parser.add_argument('--rate_lambda', type=float, default=5, help='Average number of tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
