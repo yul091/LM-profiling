@@ -24,6 +24,11 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
 
+    if not timing_info:
+        print(f"No timing information found in {stats_f}")
+        return
+    
+    # print(f"Plotting timing information {timing_info}")
     # Normalize the times by the smallest timestamp
     min_time = start_time if start_time is not None else 0
     timing_info = {k: [[t[0] - min_time, t[1]] for t in v] for k, v in timing_info.items()}
@@ -32,7 +37,6 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     gpus = list(set(int(key.split('_')[0]) for key in timing_info))  # GPUs are 0-indexed
     init_gpu, last_gpu = min(gpus, default=0), max(gpus, default=0)
     num_gpus = len(gpus)
-    # print("GPUs: ", gpus)
 
     # Define colors for each operation
     # base_colors = {'forward': 'b', 'forward_grad': 'g', 'backward': 'r'}
@@ -71,9 +75,12 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
         for start_label in latencies.keys():
             if start_label == 'backward' and gpu_id != num_gpus - 1:
                 continue
-            # print(f'\t{start_label} latency statistics: mean {np.mean(latencies[start_label])}, var {np.var(latencies[start_label])}, median {np.median(latencies[start_label])}')
+            # print(f'\t{start_label} latency statistics: ' + 
+            #      f'mean {np.mean(latencies[start_label])}, ' +
+            #      f'var {np.var(latencies[start_label])}, ' +
+            #      f'median {np.median(latencies[start_label])}')
         
-        total_idles = sum(idles)
+        # total_idles = sum(idles)
         # print(f'\tTotal latency: {max_t - min_t}')
         # print(f'\tTotal idle time: {total_idles}')
         # print(f'\tRubble rate: {total_idles / (max_t - min_t)}')
@@ -99,7 +106,6 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     ax.legend(by_label.values(), by_label.keys())
 
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--output_dir', type=str, default='prof')
@@ -120,7 +126,7 @@ if __name__ == '__main__':
     
     if not args.node:
         # Load timing information
-        stats_f = f'{output_dir}/test_asyncio.json' if args.test_asyncio else f'{output_dir}/timing_info_{execution}_{setting}.json'
+        stats_f = f'{output_dir}/test_asyncio.json' if args.test_asyncio else f'{output_dir}/timing_info_{setting}.json'
         with open(stats_f, 'r') as f:
             timing_info = json.load(f)
             
@@ -139,27 +145,28 @@ if __name__ == '__main__':
         plt.show()
         
     else:
+        gpus = 0
         for node in range(args.node):
             # Load timing information
-            stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json' if node is not None else f'{output_dir}/timing_info_{model_name}_{setting}.json'
+            stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json' \
+                if node is not None else f'{output_dir}/timing_info_{model_name}_{setting}.json'
             with open(stats_f, 'r') as f:
                 timing_info = json.load(f)
-                
+            if not timing_info:
+                continue
+            gpus = list(set(int(key.split('_')[0]) for key in timing_info))  # GPUs are 0-indexed
             for times_list in timing_info.values():
                 for times in times_list:
                     if start_time is None or times[0] < start_time:
                         start_time = times[0]
                         
-        gpus = list(set(int(key.split('_')[0]) for key in timing_info))  # GPUs are 0-indexed
-        fig, axes = plt.subplots(args.node, 1, figsize=(20, args.node * len(gpus)/1.3), sharex=True)
         # fig.subplots_adjust(hspace=0)  # Adjust this value as needed to reduce the gap
-            
+        fig, axes = plt.subplots(args.node, 1, figsize=(20, args.node * len(gpus)/1.3), sharex=True)
         for node in range(args.node):
             # plot(args, node)
             ax = axes[node] if args.node > 1 else axes
             plot_mix(args, ax, node, start_time)
-            
-        # Show the plot
         plt.tight_layout()
-        plt.savefig(f"{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}.png")
-        plt.show()
+        plt.savefig(f"{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300) 
+        # plt.savefig(f"{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}.png")
+        # plt.show()

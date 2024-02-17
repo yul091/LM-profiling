@@ -6,6 +6,7 @@ SETTING=active
 OUTPUT_DIR=prof_async
 MODEL_NAME=dialogpt-small
 RATE_LAMBDA=60 # number of tasks arriving per second
+
 # 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0
 for RETRAIN_RATE in 0.5; do
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_dialogpt.py \

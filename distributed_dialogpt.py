@@ -51,20 +51,20 @@ class DistributedDialoGPT(DistributedLLM):
                     nextdeviceQueue.put(None)
                 break
             
-            print("Stage {} start taskID {}".format(device, taskID))
+            # print("Stage {} start taskID {}".format(device, taskID))
             task = preloaded_tasks[taskID]
             # assert task.task_id == taskID
             inputs = task.hiddens[stageID]
-            print("[Task {} on stage {}] is_train_first: {} / is_train_last: {}".format(taskID, device, task.is_train_first, task.is_train_last))
+            # print("[Task {} on stage {}] is_train_first: {} / is_train_last: {}".format(taskID, device, task.is_train_first, task.is_train_last))
             
             if inputs is None:
                 print("Stage {} waiting for task {}".format(device, taskID))
                 continue    
                 
             if stageID == 0: # prepare inputs
-                # if task.is_train_first:
-                #     print(f" *** Isolated training start on Node {nodeID} *** ")
-                #     self._ISOLATED = True
+                if task.is_train_first:
+                    print(f" *** Isolated training start on Node {nodeID} *** ")
+                    self._ISOLATED = True
                 
                 inputs = _prepare_decoding_inputs(inputs)
                 task.feedback = inputs.pop('labels', None)
@@ -101,8 +101,9 @@ class DistributedDialoGPT(DistributedLLM):
                 # loss = outputs.loss
                 loss = tuple_outputs[0]
                 # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
-                if self.setting != 'isolated' or nodeID != self.num_nodes - 1:
-                    self.metrics["loss"].append(loss.item())
+                # if self.setting != 'isolated' or nodeID != self.num_nodes - 1:
+                #     self.metrics["loss"].append(loss.item())
+                self.metrics["loss"].append(loss.item())
                 
                 # if self.setting == 'active':
                 if task.require_training:
@@ -121,11 +122,10 @@ class DistributedDialoGPT(DistributedLLM):
                     self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                     
-                    # if task.is_train_last:
-                    #     # Save the parameters ofstages in the last node and load them in other nodes
-                        
-                    #     self._ISOLATED = False # reset the flag
-                    #     print(f" *** Isolated training end on Node {nodeID} *** ")
+                    if task.is_train_last:
+                        # Save the parameters ofstages in the last node and load them in other nodes
+                        self._ISOLATED = False # reset the flag
+                        print(f" *** Isolated training end on Node {nodeID} *** ")
                 # else:
                 #     task.hiddens.append(loss)
                 #     deviceQueue.put(taskID) # put it back to the queue

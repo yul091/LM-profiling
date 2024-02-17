@@ -103,7 +103,11 @@ class DistributedLLM:
         ).remove_columns(datasets['train'].column_names)
     
         # self.train_dataloader = self.get_dataloader(dataset=self.train_dataset)
-        self.test_dataloader = self.get_dataloader(dataset=self.test_dataset)
+        self.test_dataloader = DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            collate_fn=self.data_collator,
+        )
         
         # Preloaded dataset
         self.distributed_preloaded_tasks = self.get_preloaded_dataset(
@@ -157,20 +161,6 @@ class DistributedLLM:
         tokenized_inputs['labels'] = labels['input_ids']
         # tokenized_inputs['labels_attention_mask'] = labels['attention_mask']
         return tokenized_inputs
-        
-        
-    def get_dataloader(
-        self, 
-        batch_size: Optional[int] = None, 
-        dataset: Optional[Dataset] = None,
-    ) -> DataLoader:
-        batch_size = batch_size if batch_size is not None else self.batch_size
-        dataset = dataset if dataset is not None else self.train_dataset
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            collate_fn=self.data_collator,
-        )
 
         
     def get_preloaded_dataset(
@@ -217,14 +207,13 @@ class DistributedLLM:
         # Reorganize tasks
         final_distributed_tasks = defaultdict(list)
         for nodeID, tasks in distributed_preloaded_tasks.items():
-            tasks['train'][0].is_train_first = True # mark the first train task
-            tasks['train'][-1].is_train_last = True # mark the last train task
+            if tasks['train']:
+                tasks['train'][0].is_train_first = True # mark the first train task
+                tasks['train'][-1].is_train_last = True # mark the last train task
             # random.shuffle(no_train_tasks)
             mid_point = len(tasks['no_train']) // 2
             final_distributed_tasks[nodeID] = tasks['no_train'][:mid_point] + tasks['train'] + tasks['no_train'][mid_point:]
         return final_distributed_tasks
-        
-        # return distributed_preloaded_tasks
 
 
     def producer(
@@ -239,7 +228,10 @@ class DistributedLLM:
         workload = workload if workload is not None else self.workload
         # Produce using the dataset
         for taskID in range(len(preloaded_tasks)):
-            # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
+            # while True:
+            #     if not self._ISOLATED or self.distributed_preloaded_tasks[0][taskID].require_training:
+            #         break
+            
             if workload == 'poisson':
                 time.sleep(random.expovariate(rate_lambda))
             elif workload == 'all':
@@ -263,8 +255,6 @@ class DistributedLLM:
         distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         # Global scheduler
         while True:
-            # if self._ISOLATED: # keep busy until the last node has finished training
-            #     continue
             
             taskID: int = taskQueue.get() # ID
             if taskID is None:
@@ -279,8 +269,13 @@ class DistributedLLM:
                 if self.distributed_preloaded_tasks[0][taskID].require_training:
                     nodeID = self.num_nodes - 1
                 else:
+                    # if self._ISOLATED: # keep busy until the last node has finished training
+                    #     continue
                     # Randomly choose another node (not the last node)
                     nodeID = random.choice(list(distributed_nodes.keys())[:-1])
+            # if self._ISOLATED: # keep busy until the last node has finished training
+            #     taskQueue.put(taskID)
+            #     continue
             # Each node queue store task IDs
             distributed_nodes[nodeID].device_queues[0].put(taskID)
             print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
@@ -424,6 +419,8 @@ class DistributedLLM:
         total_latencies = []
         for nodeID, node in self.distributed_nodes.items():
             timing_info = self.timing_infos[nodeID]
+            if not timing_info:
+                continue
             
             for gpu_id in range(self.num_gpus_per_node):
                 min_t, max_t = float('inf'), float('-inf')
