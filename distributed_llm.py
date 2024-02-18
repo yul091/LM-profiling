@@ -47,6 +47,7 @@ class DistributedLLM:
         self.workload = args.workload
         self.retraining_rate = args.retraining_rate  
         self._ISOLATED = False
+        self.ckpt_path = None
         
         # Reproducibility
         set_seed(args.seed)
@@ -115,7 +116,6 @@ class DistributedLLM:
             self.test_dataloader, 
             retraining_rate=self.retraining_rate,
         )
-        # pdb.set_trace()
         
         # Stages, opimizer, and scheduler
         self.distributed_stages = {
@@ -228,9 +228,9 @@ class DistributedLLM:
         workload = workload if workload is not None else self.workload
         # Produce using the dataset
         for taskID in range(len(preloaded_tasks)):
-            # while True:
-            #     if not self._ISOLATED or self.distributed_preloaded_tasks[0][taskID].require_training:
-            #         break
+            while True:
+                if not self._ISOLATED or preloaded_tasks[taskID].require_training:
+                    break
             
             if workload == 'poisson':
                 time.sleep(random.expovariate(rate_lambda))
@@ -239,7 +239,7 @@ class DistributedLLM:
             else:
                 raise ValueError(f"Invalid workload type: {workload}")
             # 10% of the time, produce a task with feedback
-            # print("Producing task {} with input shape {}".format(i, batch['input_ids'].shape))
+            # print("Producing task {} with input query shape {}".format(taskID, preloaded_tasks[taskID].query['input_ids'].shape))
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(taskID)
             
@@ -269,35 +269,32 @@ class DistributedLLM:
                 if self.distributed_preloaded_tasks[0][taskID].require_training:
                     nodeID = self.num_nodes - 1
                 else:
-                    # if self._ISOLATED: # keep busy until the last node has finished training
-                    #     continue
                     # Randomly choose another node (not the last node)
                     nodeID = random.choice(list(distributed_nodes.keys())[:-1])
-            # if self._ISOLATED: # keep busy until the last node has finished training
-            #     taskQueue.put(taskID)
-            #     continue
+
             # Each node queue store task IDs
             distributed_nodes[nodeID].device_queues[0].put(taskID)
-            print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
+            # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
             
             
     def forward(
         self, 
         task: Task,
         inputs: Dict[str, Union[torch.Tensor, Any]],
-        stage: torch.nn.Module,
+        stageID: int,
+        nodeID: int,
         device: int, 
         timing_info: Dict[str, List[float]],
     ) -> Tuple[torch.Tensor, ...]:
         try:
             if task.require_training: # this is a retraining task
                 record_time(device, 'start', 'forward_grad', timing_info)
-                tuple_outputs = stage(**inputs, labels=task.feedback)
+                tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 record_time(device, 'end', 'forward_grad', timing_info)
             else:
                 record_time(device, 'start', 'forward', timing_info)
                 with torch.no_grad():
-                    tuple_outputs = stage(**inputs, labels=task.feedback)
+                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 record_time(device, 'end', 'forward', timing_info)
         except Exception as e:
             logging.error(f"Error occurred: {e}")
@@ -308,7 +305,6 @@ class DistributedLLM:
 
     def device_inference(
         self,
-        stage: torch.nn.Module, 
         stageID: int,
         nodeID: int,
         timing_info: Dict[str, List[float]],
@@ -325,21 +321,19 @@ class DistributedLLM:
         nodeID: int,
         node: Node,
         preloaded_tasks: List[Task],
-        stages: List[torch.nn.Module], 
         timing_info: Dict[str, List[List[float]]],
     ):
         # We use 16 workers to simulateously get task from the queue and inference
-        with ThreadPoolExecutor(max_workers=len(stages)) as executor:
-            for stageID, stage in enumerate(stages):
+        with ThreadPoolExecutor(max_workers=len(self.distributed_stages[nodeID])) as executor:
+            for stageID in range(len(self.distributed_stages[nodeID])):
                 future = executor.submit(
                     self.device_inference, 
-                    stage=stage, 
-                    stageID=stageID,
-                    nodeID=nodeID,
-                    timing_info=timing_info, 
-                    preloaded_tasks=preloaded_tasks,
-                    deviceQueue=node.device_queues[stageID],
-                    nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(stages) - 1 else None,
+                    stageID,
+                    nodeID,
+                    timing_info, 
+                    preloaded_tasks,
+                    node.device_queues[stageID],
+                    nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(self.distributed_stages[nodeID]) - 1 else None,
                     init_device=node.init_device,
                 )
                 
@@ -349,12 +343,11 @@ class DistributedLLM:
     def run_stages_concurrently(
         self,
         distributed_preloaded_tasks: Optional[Dict[int, List[Task]]] = None,
-        distributed_stages: Optional[Dict[int, List[torch.nn.Module]]] = None, 
         timing_infos: Optional[Dict[int, dict]] = None, 
         distributed_nodes: Optional[Dict[int, Node]] = None,
     ):
         distributed_preloaded_tasks = distributed_preloaded_tasks if distributed_preloaded_tasks is not None else self.distributed_preloaded_tasks
-        distributed_stages = distributed_stages if distributed_stages is not None else self.distributed_stages
+        # distributed_stages = distributed_stages if distributed_stages is not None else self.distributed_stages
         timing_infos = timing_infos if timing_infos is not None else self.timing_infos
         distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         
@@ -365,7 +358,6 @@ class DistributedLLM:
                     nodeID,
                     node, 
                     distributed_preloaded_tasks[nodeID], 
-                    distributed_stages[nodeID], 
                     timing_infos[nodeID],
                 )
             
@@ -383,7 +375,11 @@ class DistributedLLM:
                 task_queue,
             )
             future3 = executor.submit(self.run_stages_concurrently)
-            
+        
+        # Delete checkpoint file in the disk if self.ckpt_path is not None
+        if self.ckpt_path is not None:
+            os.remove(self.ckpt_path)
+        
         # Save timing info
         self.save_timing_info()
         
