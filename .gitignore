@@ -6,3 +6,4 @@ logging
 results
 wandb
 data
+*.ipynb
