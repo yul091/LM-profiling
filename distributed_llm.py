@@ -377,7 +377,7 @@ class DistributedLLM:
             future3 = executor.submit(self.run_stages_concurrently)
         
         # Delete checkpoint file in the disk if self.ckpt_path is not None
-        if self.ckpt_path is not None:
+        if self.ckpt_path is not None and os.path.exists(self.ckpt_path):
             os.remove(self.ckpt_path)
         
         # Save timing info

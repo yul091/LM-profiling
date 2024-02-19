@@ -29,8 +29,7 @@ class DistributedDialoGPT(DistributedLLM):
         self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}.pth'
 
     def device_inference(
-        self,
-        # stage: Union[GPTStartingStage, GPTIntermediateStage, GPTEndingStage], 
+        self, 
         stageID: int,
         nodeID: int,
         timing_info: Dict[str, List[float]], 

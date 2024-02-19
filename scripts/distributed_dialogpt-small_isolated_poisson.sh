@@ -8,7 +8,7 @@ MODEL_NAME=dialogpt-small
 RATE_LAMBDA=10 # number of tasks arriving per second
 
 # 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0
-for RETRAIN_RATE in 0.2; do
+for RETRAIN_RATE in 1.0; do
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_dialogpt.py \
         --model_name_or_path "microsoft/DialoGPT-small" \
         --model_name $MODEL_NAME \
