@@ -53,7 +53,7 @@ class DistributedLlama(DistributedLLM):
                 break
             
             task = preloaded_tasks[taskID]
-            assert task.task_id == taskID
+            # assert task.task_id == taskID
             inputs = task.hiddens[stageID]
             
             if inputs is None:
@@ -91,8 +91,9 @@ class DistributedLlama(DistributedLLM):
                 # )
                 # loss = outputs.loss
                 loss = tuple_outputs[0]
-                print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
-                self.metrics["loss"].append(loss.item())
+                # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
+                if self.setting != 'isolated' or nodeID != self.num_nodes - 1:
+                    self.metrics["loss"].append(loss.item())
                 
                 # if self.setting == 'active':
                 if task.require_training:

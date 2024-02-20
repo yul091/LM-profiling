@@ -1,6 +1,7 @@
 import os
 import sys
 sys.dont_write_bytecode = True
+import pdb
 import time
 import json
 import queue
@@ -42,16 +43,21 @@ class DistributedLLM:
         self.batch_size = args.batch_size
         self.rate_lambda = args.rate_lambda
         self.output_dir = args.output_dir
+        self.dataset_name_or_path = args.dataset_name_or_path
         self.lr = args.lr
         self.workload = args.workload
         self.retraining_rate = args.retraining_rate  
+        self.ckpt_path = None
         
         # Reproducibility
         set_seed(args.seed)
         self.num_gpus_per_node = torch.cuda.device_count() // self.num_nodes
         self.distributed_nodes = {
-            nodeID: Node(nodeID, self.num_gpus_per_node, nodeID * self.num_gpus_per_node) 
-            for nodeID in range(self.num_nodes)
+            nodeID: Node(
+                nodeID, 
+                self.num_gpus_per_node, 
+                init_device=nodeID * self.num_gpus_per_node,
+            ) for nodeID in range(self.num_nodes)
         }
         self.timing_infos = {
             nodeID: defaultdict(list) 
@@ -80,7 +86,6 @@ class DistributedLLM:
         )
         
         # Load datasets and dataloaders
-        self.dataset_name_or_path = args.dataset_name_or_path
         datasets = load_dataset(self.dataset_name_or_path)
         train_dataset = datasets['train']
         test_dataset = datasets['test']
@@ -101,14 +106,21 @@ class DistributedLLM:
         ).remove_columns(datasets['train'].column_names)
     
         # self.train_dataloader = self.get_dataloader(dataset=self.train_dataset)
-        self.test_dataloader = self.get_dataloader(dataset=self.test_dataset)
+        self.test_dataloader = DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            collate_fn=self.data_collator,
+        )
         
         # Preloaded dataset
-        self.distributed_preloaded_tasks = self.get_preloaded_dataset(
+        self.distributed_preloaded_tasks, self.total_tasks, self.retraining_tasks = self.get_preloaded_dataset(
             self.distributed_nodes, 
             self.test_dataloader, 
             retraining_rate=self.retraining_rate,
         )
+        self.saving_steps = max(min(100, self.retraining_tasks // 2), 1)
+        print(f" ** Total tasks: {self.total_tasks}, retraining tasks: {self.retraining_tasks}, saving steps: {self.saving_steps} ** ")
+        self._trained_tasks = 0
         
         # Stages, opimizer, and scheduler
         self.distributed_stages = {
@@ -154,20 +166,6 @@ class DistributedLLM:
         tokenized_inputs['labels'] = labels['input_ids']
         # tokenized_inputs['labels_attention_mask'] = labels['attention_mask']
         return tokenized_inputs
-        
-        
-    def get_dataloader(
-        self, 
-        batch_size: Optional[int] = None, 
-        dataset: Optional[Dataset] = None,
-    ) -> DataLoader:
-        batch_size = batch_size if batch_size is not None else self.batch_size
-        dataset = dataset if dataset is not None else self.train_dataset
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            collate_fn=self.data_collator,
-        )
 
         
     def get_preloaded_dataset(
@@ -175,19 +173,20 @@ class DistributedLLM:
         distributed_nodes: Optional[Dict[int, Node]] = None, 
         dataloader: Optional[DataLoader] = None, 
         retraining_rate: Optional[float] = None,
-    ) -> Dict[int, List[Task]]:
+    ) -> Tuple[Dict[int, List[Task]], int, int]:
+        
         print("Using preloaded data ...")
         distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         dataloader = dataloader if dataloader is not None else self.test_dataloader
         retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
         distributed_preloaded_tasks = defaultdict(list)
+        total_tasks, retraining_tasks = 0, 0
         
         for i, batch in enumerate(dataloader):
             # 10% of the time, produce a task with feedback
-            if random.random() < retraining_rate:
-                require_training = True
-            else:
-                require_training = False  
+            require_training = random.random() < retraining_rate
+            total_tasks += 1
+            retraining_tasks += 1 if require_training else 0
                 
             for nodeID, node in distributed_nodes.items():
                 task = Task(
@@ -199,23 +198,23 @@ class DistributedLLM:
                     require_training=require_training,
                 )
                 distributed_preloaded_tasks[nodeID].append(task)
-                
-        return distributed_preloaded_tasks
+        
+        return distributed_preloaded_tasks, total_tasks, retraining_tasks
 
 
     def producer(
         self,
         taskQueue: queue.Queue, 
-        dataloader: Optional[DataLoader] = None, 
+        preloaded_tasks: Optional[List[Task]] = None, 
         rate_lambda: Optional[float] = None, 
         workload: Optional[str] = None,
     ):
-        dataloader = dataloader if dataloader is not None else self.test_dataloader
+        preloaded_tasks = preloaded_tasks if preloaded_tasks is not None else self.distributed_preloaded_tasks[0]
         rate_lambda = rate_lambda if rate_lambda is not None else self.rate_lambda
         workload = workload if workload is not None else self.workload
         # Produce using the dataset
-        for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
-            # print(f"query shape: {batch[0].shape}, target shape: {batch[1].shape}")
+        for taskID in range(len(preloaded_tasks)):
+            
             if workload == 'poisson':
                 time.sleep(random.expovariate(rate_lambda))
             elif workload == 'all':
@@ -223,9 +222,9 @@ class DistributedLLM:
             else:
                 raise ValueError(f"Invalid workload type: {workload}")
             # 10% of the time, produce a task with feedback
-            # print("Producing task {} with input shape {}".format(i, batch['input_ids'].shape))
+            # print("Producing task {} with input query shape {}".format(taskID, preloaded_tasks[taskID].query['input_ids'].shape))
             # Essentially, we are using preloaded data (task ID)
-            taskQueue.put(i)
+            taskQueue.put(taskID)
             
         taskQueue.put(None)  # Signal the end of the dataset
         print("Producer finished producing tasks")
@@ -239,6 +238,7 @@ class DistributedLLM:
         distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         # Global scheduler
         while True:
+            
             taskID: int = taskQueue.get() # ID
             if taskID is None:
                 print("Global scheduler finished scheduling tasks")
@@ -252,7 +252,9 @@ class DistributedLLM:
                 if self.distributed_preloaded_tasks[0][taskID].require_training:
                     nodeID = self.num_nodes - 1
                 else:
-                    nodeID = random.choice(list(distributed_nodes.keys()))
+                    # Randomly choose another node (not the last node)
+                    nodeID = random.choice(list(range(self.num_nodes - 1)))
+
             # Each node queue store task IDs
             distributed_nodes[nodeID].device_queues[0].put(taskID)
             # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
@@ -262,19 +264,20 @@ class DistributedLLM:
         self, 
         task: Task,
         inputs: Dict[str, Union[torch.Tensor, Any]],
-        stage: torch.nn.Module,
+        stageID: int,
+        nodeID: int,
         device: int, 
         timing_info: Dict[str, List[float]],
-    ):
+    ) -> Tuple[torch.Tensor, ...]:
         try:
             if task.require_training: # this is a retraining task
                 record_time(device, 'start', 'forward_grad', timing_info)
-                tuple_outputs = stage(**inputs, labels=task.feedback)
+                tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 record_time(device, 'end', 'forward_grad', timing_info)
             else:
                 record_time(device, 'start', 'forward', timing_info)
                 with torch.no_grad():
-                    tuple_outputs = stage(**inputs, labels=task.feedback)
+                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 record_time(device, 'end', 'forward', timing_info)
         except Exception as e:
             logging.error(f"Error occurred: {e}")
@@ -285,7 +288,6 @@ class DistributedLLM:
 
     def device_inference(
         self,
-        stage: torch.nn.Module, 
         stageID: int,
         nodeID: int,
         timing_info: Dict[str, List[float]],
@@ -302,21 +304,19 @@ class DistributedLLM:
         nodeID: int,
         node: Node,
         preloaded_tasks: List[Task],
-        stages: List[torch.nn.Module], 
         timing_info: Dict[str, List[List[float]]],
     ):
         # We use 16 workers to simulateously get task from the queue and inference
-        with ThreadPoolExecutor(max_workers=len(stages)) as executor:
-            for stageID, stage in enumerate(stages):
+        with ThreadPoolExecutor(max_workers=len(self.distributed_stages[nodeID])) as executor:
+            for stageID in range(len(self.distributed_stages[nodeID])):
                 future = executor.submit(
                     self.device_inference, 
-                    stage=stage, 
-                    stageID=stageID,
-                    nodeID=nodeID,
-                    timing_info=timing_info, 
-                    preloaded_tasks=preloaded_tasks,
-                    deviceQueue=node.device_queues[stageID],
-                    nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(stages) - 1 else None,
+                    stageID,
+                    nodeID,
+                    timing_info, 
+                    preloaded_tasks,
+                    node.device_queues[stageID],
+                    nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(self.distributed_stages[nodeID]) - 1 else None,
                     init_device=node.init_device,
                 )
                 
@@ -326,12 +326,11 @@ class DistributedLLM:
     def run_stages_concurrently(
         self,
         distributed_preloaded_tasks: Optional[Dict[int, List[Task]]] = None,
-        distributed_stages: Optional[Dict[int, List[torch.nn.Module]]] = None, 
         timing_infos: Optional[Dict[int, dict]] = None, 
         distributed_nodes: Optional[Dict[int, Node]] = None,
     ):
         distributed_preloaded_tasks = distributed_preloaded_tasks if distributed_preloaded_tasks is not None else self.distributed_preloaded_tasks
-        distributed_stages = distributed_stages if distributed_stages is not None else self.distributed_stages
+        # distributed_stages = distributed_stages if distributed_stages is not None else self.distributed_stages
         timing_infos = timing_infos if timing_infos is not None else self.timing_infos
         distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         
@@ -342,7 +341,6 @@ class DistributedLLM:
                     nodeID,
                     node, 
                     distributed_preloaded_tasks[nodeID], 
-                    distributed_stages[nodeID], 
                     timing_infos[nodeID],
                 )
             
@@ -354,14 +352,17 @@ class DistributedLLM:
             future1 = executor.submit(
                 self.producer,
                 task_queue, 
-                dataloader=self.test_dataloader,
             )
             future2 = executor.submit(
                 self.globalScheduler,
                 task_queue,
             )
             future3 = executor.submit(self.run_stages_concurrently)
-            
+        
+        # Delete checkpoint file in the disk if self.ckpt_path is not None
+        if self.ckpt_path is not None and os.path.exists(self.ckpt_path):
+            os.remove(self.ckpt_path)
+        
         # Save timing info
         self.save_timing_info()
         
@@ -397,6 +398,8 @@ class DistributedLLM:
         total_latencies = []
         for nodeID, node in self.distributed_nodes.items():
             timing_info = self.timing_infos[nodeID]
+            if not timing_info:
+                continue
             
             for gpu_id in range(self.num_gpus_per_node):
                 min_t, max_t = float('inf'), float('-inf')
@@ -418,7 +421,7 @@ class DistributedLLM:
                 global_min_time = min(global_min_time, min_t)
                 global_max_time = max(global_max_time, max_t)
                     
-        num_tasks = len(self.distributed_preloaded_tasks[0])
+        num_tasks = self.total_tasks
         bubble_rate = sum(total_idles) / sum(total_latencies) if sum(total_latencies) > 0 else 0
         for key, value in metrics.items():
             metrics[key] = sum(value) / len(value)
@@ -453,7 +456,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
-    parser.add_argument('--rate_lambda', type=float, default=60, help='Average number of tasks produced per minute')
+    parser.add_argument('--rate_lambda', type=float, default=5, help='Average number of tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()

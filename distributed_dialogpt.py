@@ -7,14 +7,14 @@ import pdb
 from typing import List, Dict, Optional, Any, Union
 import torch
 import logging
-from utils import record_time, Node, Task
+from utils import record_time, Task
 from distributed_llm import DistributedLLM
 from models import (
-    GPTStartingStage,
-    GPTIntermediateStage,
-    GPTEndingStage,
-    _prepare_decoding_inputs,
+    # GPTStartingStage,
+    # GPTIntermediateStage,
+    # GPTEndingStage,
     CustomizedGPT2Out,
+    _prepare_decoding_inputs,
 )
 
 # torch.autograd.set_detect_anomaly(True)
@@ -26,11 +26,10 @@ class DistributedDialoGPT(DistributedLLM):
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
         self.model_n = args.model_name
-
+        self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}.pth'
 
     def device_inference(
-        self,
-        stage: Union[GPTStartingStage, GPTIntermediateStage, GPTEndingStage], 
+        self, 
         stageID: int,
         nodeID: int,
         timing_info: Dict[str, List[float]], 
@@ -39,7 +38,7 @@ class DistributedDialoGPT(DistributedLLM):
         nextdeviceQueue: Optional[queue.Queue] = None,
         init_device: Optional[int] = None,
     ):
-        device = stage._device
+        device = self.distributed_stages[nodeID][stageID]._device
         init_device = init_device if init_device is not None else 0
         
         while True:
@@ -52,7 +51,7 @@ class DistributedDialoGPT(DistributedLLM):
                 break
             
             task = preloaded_tasks[taskID]
-            assert task.task_id == taskID
+            # assert task.task_id == taskID
             inputs = task.hiddens[stageID]
             
             if inputs is None:
@@ -63,9 +62,8 @@ class DistributedDialoGPT(DistributedLLM):
                 inputs = _prepare_decoding_inputs(inputs)
                 task.feedback = inputs.pop('labels', None)
                 
-            tuple_outputs = self.forward(task, inputs, stage, device, timing_info)
-            # Clear the input from task.hiddens that is no longer needed
-            task.hiddens[stageID] = None
+            tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
+            task.hiddens[stageID] = None # clear the input that is no longer needed
                 
             if nextdeviceQueue is not None: # intermediate stage
                 # Need to send the output to the next stage, except for the last stage
@@ -97,7 +95,6 @@ class DistributedDialoGPT(DistributedLLM):
                 # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())
                 
-                # if self.setting == 'active':
                 if task.require_training:
                     # Backprop on the last stage
                     try:
@@ -106,14 +103,31 @@ class DistributedDialoGPT(DistributedLLM):
                     except Exception as e:
                         # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                         pass
+                    self._trained_tasks += 1
                     
-                    # Optimize
-                    # self.optimize(nodeID)
-                    self.distributed_optimizers[nodeID].step()
-                    self.distributed_schedulers[nodeID].step()
-                    self.distributed_optimizers[nodeID].zero_grad() # clear gradients
+                    # Optimization
+                    try:
+                        self.distributed_optimizers[nodeID].step()
+                        self.distributed_schedulers[nodeID].step()
+                        self.distributed_optimizers[nodeID].zero_grad() # clear gradients
+                    except Exception as e:
+                        # logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
+                        pass
                     print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                     
+                    if (self.setting == 'isolated') and (self._trained_tasks % self.saving_steps == 0): 
+                        # Save the parameters of stages in the last node and load them in other nodes
+                        print(f" *** Save checkpoint {self.ckpt_path} *** ")
+                        torch.save(self.distributed_stages[nodeID], self.ckpt_path)
+                        # For other nodes, load the parameters from the last node
+                        for i in range(self.num_nodes - 1):
+                            print(f" *** Load checkpoint for Node {i} *** ")
+                            self.distributed_stages[i] = torch.load(self.ckpt_path)
+                            # Adjust stage device
+                            for j in range(len(self.distributed_stages[i])):
+                                self.distributed_stages[i][j].to(self.distributed_nodes[i].init_device + j)
+                                self.distributed_stages[i][j]._device = self.distributed_nodes[i].init_device + j
+                                
                 # else:
                 #     task.hiddens.append(loss)
                 #     deviceQueue.put(taskID) # put it back to the queue
