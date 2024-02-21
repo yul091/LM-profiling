@@ -205,24 +205,17 @@ class DistributedLLM:
     def producer(
         self,
         taskQueue: queue.Queue, 
-        preloaded_tasks: Optional[List[Task]] = None, 
-        rate_lambda: Optional[float] = None, 
-        workload: Optional[str] = None,
     ):
-        preloaded_tasks = preloaded_tasks if preloaded_tasks is not None else self.distributed_preloaded_tasks[0]
-        rate_lambda = rate_lambda if rate_lambda is not None else self.rate_lambda
-        workload = workload if workload is not None else self.workload
         # Produce using the dataset
-        for taskID in range(len(preloaded_tasks)):
-            
-            if workload == 'poisson':
-                time.sleep(random.expovariate(rate_lambda))
-            elif workload == 'all':
+        for taskID in range(len(self.distributed_preloaded_tasks[0])):
+            if self.workload == 'poisson':
+                time.sleep(random.expovariate(self.rate_lambda))
+            elif self.workload == 'all':
                 time.sleep(0)
             else:
-                raise ValueError(f"Invalid workload type: {workload}")
+                raise ValueError(f"Invalid workload type: {self.workload}")
             # 10% of the time, produce a task with feedback
-            # print("Producing task {} with input query shape {}".format(taskID, preloaded_tasks[taskID].query['input_ids'].shape))
+            # print("Producing task {} with input query shape {}".format(taskID, self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape))
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(taskID)
             
@@ -233,20 +226,18 @@ class DistributedLLM:
     def globalScheduler(
         self, 
         taskQueue: queue.Queue, 
-        distributed_nodes: Optional[Dict[int, Node]] = None,
     ):
-        distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         # Global scheduler
         while True:
-            
             taskID: int = taskQueue.get() # ID
             if taskID is None:
                 print("Global scheduler finished scheduling tasks")
-                for node in distributed_nodes.values():
-                    node.device_queues[0].put(None)
+                for node in self.distributed_nodes.values():
+                    # node.device_queues[0].put(None)
+                    node.device_queues[0].put((float('inf'), float('inf'))) # for priority_queue, use a large number to signal the end
                 break
             if self.setting != 'isolated':
-                nodeID = random.choice(list(distributed_nodes.keys()))
+                nodeID = random.choice(list(self.distributed_nodes.keys()))
             else:
                 # If the task require training, we schedule it to the last node
                 if self.distributed_preloaded_tasks[0][taskID].require_training:
@@ -256,7 +247,11 @@ class DistributedLLM:
                     nodeID = random.choice(list(range(self.num_nodes - 1)))
 
             # Each node queue store task IDs
-            distributed_nodes[nodeID].device_queues[0].put(taskID)
+            if self.setting == 'interval':
+                seq_length = self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]
+                self.distributed_nodes[nodeID].device_queues[0].put((seq_length, taskID))
+            else:
+                self.distributed_nodes[nodeID].device_queues[0].put((taskID, taskID))
             # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
             
             
@@ -280,7 +275,7 @@ class DistributedLLM:
                     tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 record_time(device, 'end', 'forward', timing_info)
         except Exception as e:
-            logging.error(f"Error occurred: {e}")
+            logging.error(f"[Node {nodeID} - stage {stageID} - device {device}] Forward error occurred: {e}")
             tuple_outputs = None
         
         return tuple_outputs
@@ -292,7 +287,7 @@ class DistributedLLM:
         nodeID: int,
         timing_info: Dict[str, List[float]],
         preloaded_tasks: List[Task], 
-        deviceQueue: queue.Queue,
+        deviceQueue: Union[queue.Queue, queue.PriorityQueue],
         nextdeviceQueue: Optional[queue.Queue] = None,
         init_device: Optional[int] = None,
     ):
@@ -303,18 +298,16 @@ class DistributedLLM:
         self,
         nodeID: int,
         node: Node,
-        preloaded_tasks: List[Task],
-        timing_info: Dict[str, List[List[float]]],
     ):
         # We use 16 workers to simulateously get task from the queue and inference
-        with ThreadPoolExecutor(max_workers=len(self.distributed_stages[nodeID])) as executor:
-            for stageID in range(len(self.distributed_stages[nodeID])):
+        with ThreadPoolExecutor(max_workers=self.num_gpus_per_node) as executor:
+            for stageID in range(self.num_gpus_per_node):
                 future = executor.submit(
                     self.device_inference, 
                     stageID,
                     nodeID,
-                    timing_info, 
-                    preloaded_tasks,
+                    self.timing_infos[nodeID], 
+                    self.distributed_preloaded_tasks[nodeID],
                     node.device_queues[stageID],
                     nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(self.distributed_stages[nodeID]) - 1 else None,
                     init_device=node.init_device,
@@ -323,25 +316,13 @@ class DistributedLLM:
         print("Node {} finished inference".format(node.node_id))
 
 
-    def run_stages_concurrently(
-        self,
-        distributed_preloaded_tasks: Optional[Dict[int, List[Task]]] = None,
-        timing_infos: Optional[Dict[int, dict]] = None, 
-        distributed_nodes: Optional[Dict[int, Node]] = None,
-    ):
-        distributed_preloaded_tasks = distributed_preloaded_tasks if distributed_preloaded_tasks is not None else self.distributed_preloaded_tasks
-        # distributed_stages = distributed_stages if distributed_stages is not None else self.distributed_stages
-        timing_infos = timing_infos if timing_infos is not None else self.timing_infos
-        distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
-        
-        with ThreadPoolExecutor(max_workers=len(distributed_nodes)) as executor:
-            for nodeID, node in distributed_nodes.items():
+    def run_stages_concurrently(self):
+        with ThreadPoolExecutor(max_workers=len(self.distributed_nodes)) as executor:
+            for nodeID, node in self.distributed_nodes.items():
                 future = executor.submit(
                     self.node_inference, 
                     nodeID,
                     node, 
-                    distributed_preloaded_tasks[nodeID], 
-                    timing_infos[nodeID],
                 )
             
             
@@ -360,8 +341,11 @@ class DistributedLLM:
             future3 = executor.submit(self.run_stages_concurrently)
         
         # Delete checkpoint file in the disk if self.ckpt_path is not None
-        if self.ckpt_path is not None and os.path.exists(self.ckpt_path):
-            os.remove(self.ckpt_path)
+        # if self.ckpt_path is not None and os.path.exists(self.ckpt_path):
+        #     os.remove(self.ckpt_path)
+        for j in range(self.num_gpus_per_node):
+            if self.ckpt_path is not None and os.path.exists(f"{self.ckpt_path}_stage{j}.pt"):
+                os.remove(f"{self.ckpt_path}_stage{j}.pt")
         
         # Save timing info
         self.save_timing_info()
@@ -370,13 +354,9 @@ class DistributedLLM:
         self.calculate_metrics()
         
         
-    def save_timing_info(
-        self, 
-        timing_infos: Optional[Dict[int, dict]] = None,
-    ):
-        timing_infos = timing_infos if timing_infos is not None else self.timing_infos
+    def save_timing_info(self):
         os.makedirs(self.output_dir, exist_ok=True)
-        for nodeID, timing_info in timing_infos.items():
+        for nodeID, timing_info in self.timing_infos.items():
             # # Remove the first start and end time for each GPU
             # gpus = list(set(int(key.split('_')[0]) for key in timing_info))
             # for gpu_id in gpus:

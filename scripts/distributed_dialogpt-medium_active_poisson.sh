@@ -3,7 +3,6 @@ NUM_SAMPLES=600
 BATCH_SIZE=3
 WORKLOAD=poisson
 SETTING=active
-OUTPUT_DIR=prof_async
 MODEL_NAME=dialogpt-medium
 
 for RATE_LAMBDA in 10 20 30 40 50 60; do

@@ -26,7 +26,7 @@ class DistributedDialoGPT(DistributedLLM):
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
         self.model_n = args.model_name
-        self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}.pth'
+        self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}'
 
     def device_inference(
         self, 
@@ -34,20 +34,22 @@ class DistributedDialoGPT(DistributedLLM):
         nodeID: int,
         timing_info: Dict[str, List[float]], 
         preloaded_tasks: List[Task], 
-        deviceQueue: queue.Queue,
-        nextdeviceQueue: Optional[queue.Queue] = None,
+        deviceQueue: Union[queue.Queue, queue.PriorityQueue],
+        nextdeviceQueue: Optional[Union[queue.Queue, queue.PriorityQueue]] = None,
         init_device: Optional[int] = None,
     ):
-        device = self.distributed_stages[nodeID][stageID]._device
-        init_device = init_device if init_device is not None else 0
+        device = self.distributed_nodes[nodeID].init_device + stageID
+        init_device = init_device if init_device is not None else self.distributed_nodes[nodeID].init_device
         
         while True:
-            taskID: int = deviceQueue.get()
-            if taskID is None:
+            seq_length, taskID = deviceQueue.get()
+            # if taskID is None:
+            if taskID == float('inf'):
                 # Signal that this thread is done
                 print("Stage {} finished inference".format(device))
                 if nextdeviceQueue is not None: # intermediate stage
-                    nextdeviceQueue.put(None)
+                    # nextdeviceQueue.put(None)
+                    nextdeviceQueue.put((float('inf'), float('inf')))
                 break
             
             task = preloaded_tasks[taskID]
@@ -79,7 +81,7 @@ class DistributedDialoGPT(DistributedLLM):
                     output_shape=tuple_outputs[8],
                 )   
                 task.hiddens[stageID+1] = outputs
-                nextdeviceQueue.put(taskID)
+                nextdeviceQueue.put((seq_length, taskID))
                 
             else: # last stage
                 # outputs = CausalLMOutputWithCrossAttentions(
@@ -118,15 +120,13 @@ class DistributedDialoGPT(DistributedLLM):
                     if (self.setting == 'isolated') and (self._trained_tasks % self.saving_steps == 0): 
                         # Save the parameters of stages in the last node and load them in other nodes
                         print(f" *** Save checkpoint {self.ckpt_path} *** ")
-                        torch.save(self.distributed_stages[nodeID], self.ckpt_path)
+                        for j in range(self.num_gpus_per_node):
+                            torch.save(self.distributed_stages[nodeID][j].state_dict(), f"{self.ckpt_path}_stage{j}.pt")
                         # For other nodes, load the parameters from the last node
                         for i in range(self.num_nodes - 1):
                             print(f" *** Load checkpoint for Node {i} *** ")
-                            self.distributed_stages[i] = torch.load(self.ckpt_path)
-                            # Adjust stage device
-                            for j in range(len(self.distributed_stages[i])):
-                                self.distributed_stages[i][j].to(self.distributed_nodes[i].init_device + j)
-                                self.distributed_stages[i][j]._device = self.distributed_nodes[i].init_device + j
+                            for j in range(self.num_gpus_per_node):
+                                self.distributed_stages[i][j].load_state_dict(torch.load(f"{self.ckpt_path}_stage{j}.pt"))
                                 
                 # else:
                 #     task.hiddens.append(loss)
