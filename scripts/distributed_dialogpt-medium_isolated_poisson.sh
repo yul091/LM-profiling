@@ -7,7 +7,8 @@ MODEL_NAME=dialogpt-medium
 # RATE_LAMBDA=10 # number of tasks arriving per second
 
 for RATE_LAMBDA in 30; do
-    OUTPUT_DIR=prof/lambda_${RATE_LAMBDA}/$MODEL_NAME
+    OUTPUT_DIR=prof/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
+    
     for RETRAIN_RATE in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 ; do
         CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distributed_dialogpt.py \
             --model_name_or_path "microsoft/DialoGPT-medium" \
