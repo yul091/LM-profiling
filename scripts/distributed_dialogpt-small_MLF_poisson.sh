@@ -1,8 +1,9 @@
-NUM_NODES=4
+NUM_NODES=2
 NUM_SAMPLES=1000
 BATCH_SIZE=3
 WORKLOAD=poisson
 SETTING=interval
+PRIORITY=MLF
 MODEL_NAME=dialogpt-small
 # RATE_LAMBDA=10 # number of tasks arriving per second
 
@@ -18,6 +19,7 @@ for RATE_LAMBDA in 10 20 30 40 50; do
             --workload $WORKLOAD \
             --rate_lambda $RATE_LAMBDA \
             --setting $SETTING \
+            --priority $PRIORITY \
             --retraining_rate $RETRAIN_RATE \
             --output_dir $OUTPUT_DIR \
             --batch_size $BATCH_SIZE
@@ -26,6 +28,7 @@ for RATE_LAMBDA in 10 20 30 40 50; do
             --node $NUM_NODES \
             --model_name $MODEL_NAME \
             --setting $SETTING \
+            --priority $PRIORITY \
             --workload $WORKLOAD \
             --retraining_rate $RETRAIN_RATE \
             --output_dir $OUTPUT_DIR

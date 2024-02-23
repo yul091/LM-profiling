@@ -42,7 +42,7 @@ class DistributedDialoGPT(DistributedLLM):
         init_device = init_device if init_device is not None else self.distributed_nodes[nodeID].init_device
         
         while True:
-            seq_length, taskID = deviceQueue.get()
+            priority, taskID = deviceQueue.get()
             # if taskID is None:
             if taskID == float('inf'):
                 # Signal that this thread is done
@@ -81,7 +81,7 @@ class DistributedDialoGPT(DistributedLLM):
                     output_shape=tuple_outputs[8],
                 )   
                 task.hiddens[stageID+1] = outputs
-                nextdeviceQueue.put((seq_length, taskID))
+                nextdeviceQueue.put((priority, taskID))
                 
             else: # last stage
                 # outputs = CausalLMOutputWithCrossAttentions(
@@ -146,6 +146,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'isolated'], help='training setting')
+    parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')

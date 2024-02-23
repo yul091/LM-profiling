@@ -39,6 +39,7 @@ class DistributedLLM:
     def __init__(self, args: argparse.Namespace):
         n_samples = args.n_samples
         self.setting = args.setting
+        self.priority = args.priority
         self.num_nodes = args.num_nodes
         self.batch_size = args.batch_size
         self.rate_lambda = args.rate_lambda
@@ -249,7 +250,13 @@ class DistributedLLM:
             # Each node queue store task IDs
             if self.setting == 'interval':
                 seq_length = self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]
-                self.distributed_nodes[nodeID].device_queues[0].put((seq_length, taskID))
+                if self.priority == 'LLF':
+                    priority = seq_length
+                elif self.priority == 'MLF':
+                    priority = -seq_length
+                else:
+                    raise ValueError(f"Invalid priority type: {self.priority}")
+                self.distributed_nodes[nodeID].device_queues[0].put((priority, taskID))
             else:
                 self.distributed_nodes[nodeID].device_queues[0].put((taskID, taskID))
             # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
@@ -362,7 +369,10 @@ class DistributedLLM:
             # for gpu_id in gpus:
             #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
             #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+            if self.priority is not None:
+                stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+            else:
+                stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
         
@@ -415,7 +425,10 @@ class DistributedLLM:
             
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)
-        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}.json'
+        if self.priority is not None:
+            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}.json'
+        else:
+            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}:\n{metrics}")
@@ -433,6 +446,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'isolated'], help='training setting')
+    parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')

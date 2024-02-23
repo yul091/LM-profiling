@@ -10,6 +10,7 @@ import argparse
 def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     output_dir = args.output_dir
     setting = args.setting
+    priority = args.priority
     workload = args.workload
     retraining_rate = args.retraining_rate
     model_name = args.model_name
@@ -20,7 +21,10 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     elif node is None:
         stats_f = f'{output_dir}/timing_info_{model_name}_{setting}.json'
     else:
-        stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json'
+        if priority is not None:
+            stats_f = f'{output_dir}/timing_info_{model_name}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
+        else:
+            stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json'
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
 
@@ -111,8 +115,9 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--model_name', type=str, default='dialogpt', help='model name')
     parser.add_argument('--setting', type=str, default='random', help='workload setting')
+    parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
-    parser.add_argument('--node', type=int, default=None, help='number of nodes for distributed systems')
+    parser.add_argument('--node', type=int, default=1, help='number of nodes for distributed systems')
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
     parser.add_argument('--test_asyncio', action='store_true')
     args = parser.parse_args()
@@ -120,6 +125,7 @@ if __name__ == '__main__':
     start_time = None
     output_dir = args.output_dir
     setting = args.setting
+    priority = args.priority
     workload = args.workload
     model_name = args.model_name
     retraining_rate = args.retraining_rate
@@ -148,8 +154,10 @@ if __name__ == '__main__':
         gpus = 0
         for node in range(args.node):
             # Load timing information
-            stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json' \
-                if node is not None else f'{output_dir}/timing_info_{model_name}_{setting}.json'
+            if priority is not None:
+                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
+            else:
+                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json'
             with open(stats_f, 'r') as f:
                 timing_info = json.load(f)
             if not timing_info:
@@ -167,6 +175,9 @@ if __name__ == '__main__':
             ax = axes[node] if args.node > 1 else axes
             plot_mix(args, ax, node, start_time)
         plt.tight_layout()
-        plt.savefig(f"{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300) 
-        # plt.savefig(f"{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}.png")
+        if priority is not None:
+            plt.savefig(f"{output_dir}/{model_name}_{setting}-{priority}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300)
+        else:
+            plt.savefig(f"{output_dir}/{model_name}_{setting}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300) 
+        # plt.savefig(f"{output_dir}/{model_name}_{setting}_{workload}_{retraining_rate}.png")
         # plt.show()
