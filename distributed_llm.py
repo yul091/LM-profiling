@@ -13,7 +13,7 @@ from typing import List, Dict, Optional, Any, Union, Tuple
 from collections import defaultdict
 import torch
 from torch.utils.data import DataLoader
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datasets import load_dataset, Dataset
 from transformers import (
     AutoConfig, 
@@ -60,6 +60,7 @@ class DistributedLLM:
                 init_device=nodeID * self.num_gpus_per_node,
             ) for nodeID in range(self.num_nodes)
         }
+        self.device_total_memory = torch.cuda.get_device_properties(0).total_memory
         self.timing_infos = {
             nodeID: defaultdict(list) 
             for nodeID in range(self.num_nodes)
@@ -98,11 +99,11 @@ class DistributedLLM:
             test_dataset = test_dataset.select(indices)
         
         self.train_dataset = train_dataset.map(
-            self.tokenize_and_align_labels,
+            self._tokenize_and_align_labels,
             batched=True,
         ).remove_columns(datasets['train'].column_names)
         self.test_dataset = test_dataset.map(
-            self.tokenize_and_align_labels,
+            self._tokenize_and_align_labels,
             batched=True,
         ).remove_columns(datasets['train'].column_names)
     
@@ -153,7 +154,7 @@ class DistributedLLM:
         }
         
         
-    def tokenize_and_align_labels(self, examples):
+    def _tokenize_and_align_labels(self, examples):
         tokenized_inputs = self.tokenizer(
             examples['query'], 
             padding=False, 
@@ -250,7 +251,7 @@ class DistributedLLM:
             # Each node queue store task IDs
             if self.setting == 'interval':
                 seq_length = self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]
-                if self.priority == 'LLF':
+                if self.priority is None or self.priority == 'LLF':
                     priority = seq_length
                 elif self.priority == 'MLF':
                     priority = -seq_length
@@ -260,7 +261,38 @@ class DistributedLLM:
             else:
                 self.distributed_nodes[nodeID].device_queues[0].put((taskID, taskID))
             # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
-            
+    
+    
+    def _check_device_availability(self, device: int, threshold: float = 0.8):
+        """
+        Check if the device has enough available memory.
+        Args:
+        - device: The device to check.
+        - threshold: The maximum allowed memory utilization ratio.
+        Returns:
+        - is_available: Boolean indicating if the device is available.
+        """
+        # Get device memory status
+        allocated_memory = torch.cuda.memory_allocated(device)
+        available_memory = self.device_total_memory - allocated_memory
+        # Calculate the available memory ratio
+        available_ratio = available_memory / self.device_total_memory
+        # Check if the available memory ratio is above the threshold
+        return available_ratio > (1 - threshold)
+    
+    
+    def _wait_for_device_availability(self, device: int, check_interval: float = 0.1, threshold: float = 0.8):
+        """
+        Wait until the device is available based on memory usage.
+        Args:
+        - device: The device to wait for.
+        - check_interval: How often to check the device status (in seconds).
+        - threshold: The maximum allowed memory utilization ratio.
+        """
+        while not self._check_device_availability(device, threshold):
+            print(f"Waiting for device {device} to become available...")
+            time.sleep(check_interval)
+
             
     def forward(
         self, 
@@ -270,7 +302,10 @@ class DistributedLLM:
         nodeID: int,
         device: int, 
         timing_info: Dict[str, List[float]],
+        threshold: float = 0.8, 
     ) -> Tuple[torch.Tensor, ...]:
+        
+        self._wait_for_device_availability(device, threshold=threshold)
         try:
             if task.require_training: # this is a retraining task
                 record_time(device, 'start', 'forward_grad', timing_info)
@@ -306,8 +341,9 @@ class DistributedLLM:
         nodeID: int,
         node: Node,
     ):
-        # We use 16 workers to simulateously get task from the queue and inference
+        # We use num_gpus_per_node workers to simulateously get task from the queue and inference
         with ThreadPoolExecutor(max_workers=self.num_gpus_per_node) as executor:
+            futures = []
             for stageID in range(self.num_gpus_per_node):
                 future = executor.submit(
                     self.device_inference, 
@@ -319,6 +355,14 @@ class DistributedLLM:
                     nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(self.distributed_stages[nodeID]) - 1 else None,
                     init_device=node.init_device,
                 )
+                futures.append(future)
+            for future in futures:
+                try:
+                    # Set a timeout for each task. Adjust the timeout value as needed.
+                    future.result(timeout=60)  # Timeout set to 60 seconds
+                except TimeoutError:
+                    # Handle the timeout, for example, by logging an error, retrying the task, or skipping it.
+                    print(f"Task execution exceeded the timeout limit and was aborted. Node ID: {nodeID}")
                 
         print("Node {} finished inference".format(node.node_id))
 
