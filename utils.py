@@ -1,9 +1,12 @@
+import os 
+import json
 import time
 import queue
 import logging
 from typing import Dict, Union, Any, List, Tuple, Optional, Callable
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 import torch
 from transformers import (
     BertModel,
@@ -235,50 +238,133 @@ def plot_layer_profiling_dist(
         plt.savefig(save_file, bbox_inches='tight')
     plt.show()
     
+    
+
+
+LABEL2METHOD = {
+    "NaiveMix": "active",
+    "Separate": "isolated",
+    "LaMix-LLF": "interval",
+    "LaMix-MLF": "interval-MLF",
+}
+
+def plot_dual(lambda_=50, label1='NaiveMix', label2='Separate', label3=None, label4=None, 
+              figname=None, setting=None, num_nodes=2, legend=True, model='dialogpt-small', use_bubble=True,
+              color1=sns.color_palette("deep")[0], 
+              color2=sns.color_palette("deep")[1],):
+    
+    res1, res2, res3, res4 = [], [], [], []
+    res_dir = f"prof/{num_nodes}_node/lambda_{lambda_}"
+    for retrain_rate in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+        if setting:
+            metric = json.load(open(f"{res_dir}/dialogpt-small/metrics_dialogpt-small_{setting}_poisson_{retrain_rate}.json"))
+            metric["retrain_rate"] = retrain_rate
+            res1.append(metric)
+            metric = json.load(open(f"{res_dir}/dialogpt-medium/metrics_dialogpt-medium_{setting}_poisson_{retrain_rate}.json"))
+            metric["retrain_rate"] = retrain_rate
+            res2.append(metric)
+        else:
+            metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label1]}_poisson_{retrain_rate}.json"))
+            metric["retrain_rate"] = retrain_rate
+            res1.append(metric)
+            metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label2]}_poisson_{retrain_rate}.json"))
+            metric["retrain_rate"] = retrain_rate
+            res2.append(metric)
+            if label3:
+                metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label3]}_poisson_{retrain_rate}.json"))
+                metric["retrain_rate"] = retrain_rate
+                res3.append(metric)
+            if label4:
+                metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label4]}_poisson_{retrain_rate}.json"))
+                metric["retrain_rate"] = retrain_rate
+                res4.append(metric)
+        
+    res1 = pd.DataFrame(res1)
+    res2 = pd.DataFrame(res2)
+    res3 = pd.DataFrame(res3) if res3 else None
+    res4 = pd.DataFrame(res4) if res4 else None
+
+    # Let's plot the metrics, x-axis is retrain_rate, y-axis is the metric value
+    os.makedirs("figure", exist_ok=True) 
+    sns.set_theme(style="ticks")
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
+    # ax.yaxis.grid(True, linestyle='dotted', which='major', color='grey', alpha=0.5)
+    line1, = axes[0].plot(res1["retrain_rate"], res1["loss"], label=label1, marker='v', color=color1)
+    line1_1, = axes[0].plot(res2["retrain_rate"], res2["loss"], label=label2, marker='v', color=color1, linestyle='--')
+    axes[0].set_ylabel("Eval loss", fontsize=14)
+    axes[0].tick_params(axis='y', colors=color1)
+    ax2 = axes[0].twinx()
+    line2, = ax2.plot(res1["retrain_rate"], res1["response_time"] * 1000, label=label1, color=color2, marker='x')
+    line2_2, = ax2.plot(res2["retrain_rate"], res2["response_time"] * 1000, label=label2, color=color2, marker='x', linestyle='--')
+    if res3 is not None:
+        line1_2, = axes[0].plot(res3["retrain_rate"], res3["loss"], label=label3, marker='v', color=color1, linestyle='dotted')
+        line2_3, = ax2.plot(res3["retrain_rate"], res3["response_time"] * 1000, label=label3, color=color2, marker='x', linestyle='dotted')
+    if res4 is not None:
+        line1_3, = axes[0].plot(res4["retrain_rate"], res4["loss"], label=label4, marker='v', color=color1, linestyle='-.')
+        line2_4, = ax2.plot(res4["retrain_rate"], res4["response_time"] * 1000, label=label4, color=color2, marker='x', linestyle='-.')
+        if res3 is not None:
+            lines = [line1, line2, line1_1, line2_2, line1_2, line2_3, line1_3, line2_4]
+        else:
+            lines = [line1, line2, line1_1, line2_2, line1_3, line2_4]
+    else:
+        if res3 is not None:
+            lines = [line1, line2, line1_1, line2_2, line1_2, line2_3]
+        else:
+            lines = [line1, line2, line1_1, line2_2]
+        
+    ax2.set_ylabel("Response time (ms)", fontsize=14)
+    ax2.tick_params(axis='y', colors=color2)
+    labels = [line.get_label() for line in lines]
+    axes[0].set_xlabel("Retraining rate", fontsize=14)
+
+    if use_bubble:
+        line1, = axes[1].plot(res1["retrain_rate"], res1["bubble_rate"] * 100, label=label1, color=color1, marker='v')
+        line1_1, = axes[1].plot(res2["retrain_rate"], res2["bubble_rate"] * 100, label=label2, color=color1, marker='v', linestyle='--')
+        axes[1].set_ylabel("Bubble rate (%)", fontsize=14)
+    else:
+        line1, = axes[1].plot(res1["retrain_rate"], res1["idleness"] * 1000, label=label1, color=color1, marker='v')
+        line1_1, = axes[1].plot(res2["retrain_rate"], res2["idleness"] * 1000, label=label2, color=color1, marker='v', linestyle='--')
+        axes[1].set_ylabel("GPU idles (ms)", fontsize=14)
+    axes[1].tick_params(axis='y', colors=color1)
+    ax2 = axes[1].twinx()
+    line2, = ax2.plot(res1["retrain_rate"], res1["end2end_latency"], label=label1, color=color2, marker='x')
+    line2_2, = ax2.plot(res2["retrain_rate"], res2["end2end_latency"], label=label2, color=color2, marker='x', linestyle='--')
+    if res3 is not None:
+        if use_bubble:
+            line1_2, = axes[1].plot(res3["retrain_rate"], res3["bubble_rate"] * 100, label=label3, color=color1, marker='v', linestyle='dotted')
+        else:
+            line1_2, = axes[1].plot(res3["retrain_rate"], res3["idleness"] * 1000, label=label3, color=color1, marker='v', linestyle='dotted')
+        line2_3, = ax2.plot(res3["retrain_rate"], res3["end2end_latency"], label=label3, color=color2, marker='x', linestyle='dotted')
+    if res4 is not None:
+        if use_bubble:
+            line1_3, = axes[1].plot(res4["retrain_rate"], res4["bubble_rate"] * 100, label=label4, color=color1, marker='v', linestyle='-.')
+        else:
+            line1_3, = axes[1].plot(res4["retrain_rate"], res4["idleness"] * 1000, label=label4, color=color1, marker='v', linestyle='-.')
+        line2_4, = ax2.plot(res4["retrain_rate"], res4["end2end_latency"], label=label4, color=color2, marker='x', linestyle='-.')
+        if res3 is not None:
+            lines = [line1, line2, line1_1, line2_2, line1_2, line2_3, line1_3, line2_4]
+        else:
+            lines = [line1, line2, line1_1, line2_2, line1_3, line2_4]
+    else:
+        if res3 is not None:
+            lines = [line1, line2, line1_1, line2_2, line1_2, line2_3]
+        else:
+            lines = [line1, line2, line1_1, line2_2]
+    ax2.set_ylabel("End2end latency (s)", fontsize=14)
+    ax2.tick_params(axis='y', colors=color2)
+    labels = [line.get_label() for line in lines]
+    # Create a single legend for both lines together
+    axes[1].set_xlabel("Retraining rate", fontsize=14)
+    if legend:
+        ncol = 2
+        if res3 is not None: ncol += 1
+        if res4 is not None: ncol += 1
+        fig.legend(lines, labels, loc='upper center', ncol=ncol, bbox_to_anchor=(0.5, 1.15), fontsize=11)
+    plt.tight_layout()
+    if figname:
+        plt.savefig(f"figure/{figname}.pdf", bbox_inches='tight')
+    else:
+        plt.savefig("figure/dialogpt_retraining_lambda={lambda_}.pdf", bbox_inches='tight')
+    plt.show()
        
-        
-# @dataclass
-# class ActiveSelectionLabelSmoother:
-#     """
-#     Adds label-smoothing on a pre-computed output from a Transformers model.
 
-#     Args:
-#         epsilon (`float`, *optional*, defaults to 0.1):
-#             The label smoothing factor.
-#         ignore_index (`int`, *optional*, defaults to -100):
-#             The index in the labels to ignore when computing the loss.
-#     """
-
-#     epsilon: float = 0.1
-#     ignore_index: int = -100
-
-#     def __call__(self, model_output, labels, shift_labels=False, indices=None):
-#         logits = model_output["logits"] if isinstance(model_output, dict) else model_output[0]
-#         if indices is not None:
-#             logits = logits[indices]
-#             labels = labels[indices]
-        
-#         if shift_labels:
-#             logits = logits[..., :-1, :].contiguous()
-#             labels = labels[..., 1:].contiguous()
-
-#         log_probs = -nn.functional.log_softmax(logits, dim=-1)
-#         if labels.dim() == log_probs.dim() - 1:
-#             labels = labels.unsqueeze(-1)
-
-#         padding_mask = labels.eq(self.ignore_index)
-#         # In case the ignore_index is -100, the gather will fail, so we replace labels by 0. The padding_mask
-#         # will ignore them in any case.
-#         labels = torch.clamp(labels, min=0)
-#         nll_loss = log_probs.gather(dim=-1, index=labels)
-#         # works for fp16 input tensor too, by internally upcasting it to fp32
-#         smoothed_loss = log_probs.sum(dim=-1, keepdim=True, dtype=torch.float32)
-
-#         nll_loss.masked_fill_(padding_mask, 0.0)
-#         smoothed_loss.masked_fill_(padding_mask, 0.0)
-
-#         # Take the mean over the label dimensions, then divide by the number of active elements (i.e. not-padded):
-#         num_active_elements = padding_mask.numel() - padding_mask.long().sum()
-#         nll_loss = nll_loss.sum() / num_active_elements
-#         smoothed_loss = smoothed_loss.sum() / (num_active_elements * log_probs.shape[-1])
-#         return (1 - self.epsilon) * nll_loss + self.epsilon * smoothed_loss

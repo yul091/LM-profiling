@@ -97,10 +97,9 @@ def get_stages(
         config=config,
         # torch_dtype="float32",
     )
-    if 'llama' in model_name_or_path.lower():
-        pretrained_model = pretrained_model.half()
-    # pretrained_model = pretrained_model.half()
-    # pretrained_model.gradient_checkpointing_enable()
+    # if 'llama' in model_name_or_path.lower():
+    #     pretrained_model = pretrained_model.half()
+    #     pretrained_model.gradient_checkpointing_enable()
     print("Model hidden dim {}, num layers {}, num heads {}, num parameters {}".format(
         pretrained_model.config.hidden_size, 
         pretrained_model.config.num_hidden_layers, 

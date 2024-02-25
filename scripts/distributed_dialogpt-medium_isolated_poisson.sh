@@ -4,7 +4,6 @@ BATCH_SIZE=3
 WORKLOAD=poisson
 SETTING=isolated
 MODEL_NAME=dialogpt-medium
-# RATE_LAMBDA=10 # number of tasks arriving per second
 
 for RATE_LAMBDA in 10 20 30 40 50 60; do
     OUTPUT_DIR=prof/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME

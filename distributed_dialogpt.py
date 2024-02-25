@@ -25,8 +25,6 @@ class DistributedDialoGPT(DistributedLLM):
     
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
-        self.model_n = args.model_name
-        self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}'
 
     def device_inference(
         self, 
@@ -52,7 +50,7 @@ class DistributedDialoGPT(DistributedLLM):
                     nextdeviceQueue.put((float('inf'), float('inf')))
                 break
             
-            task = preloaded_tasks[taskID]
+            task: Task = preloaded_tasks[taskID]
             # assert task.task_id == taskID
             inputs = task.hiddens[stageID]
             
@@ -69,7 +67,7 @@ class DistributedDialoGPT(DistributedLLM):
                 
             if nextdeviceQueue is not None: # intermediate stage
                 # Need to send the output to the next stage, except for the last stage
-                outputs = CustomizedGPT2Out(
+                task.hiddens[stageID+1] = CustomizedGPT2Out(
                     hidden_states=tuple_outputs[0].to(device+1),
                     attention_mask=tuple_outputs[1].to(device+1),
                     head_mask=tuple_outputs[2],
@@ -80,7 +78,6 @@ class DistributedDialoGPT(DistributedLLM):
                     all_cross_attentions=tuple_outputs[7],
                     output_shape=tuple_outputs[8],
                 )   
-                task.hiddens[stageID+1] = outputs
                 nextdeviceQueue.put((priority, taskID))
                 
             else: # last stage
@@ -142,11 +139,13 @@ if __name__ == '__main__':
     parser.add_argument('--model_name_or_path', type=str, default='microsoft/DialoGPT-small', help='model name or path')
     parser.add_argument('--model_name', type=str, default='dialogpt', help='model name')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
+    parser.add_argument('--memory_threshold', type=float, default=0.8, help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'isolated'], help='training setting')
     parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
+    parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')

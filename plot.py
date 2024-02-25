@@ -14,6 +14,7 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     workload = args.workload
     retraining_rate = args.retraining_rate
     model_name = args.model_name
+    load_balancing = args.load_balancing
     
     # Load timing information
     if args.test_asyncio:
@@ -22,9 +23,15 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
         stats_f = f'{output_dir}/timing_info_{model_name}_{setting}.json'
     else:
         if priority is not None:
-            stats_f = f'{output_dir}/timing_info_{model_name}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
+            if load_balancing is not None:
+                stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
+            else:
+                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
         else:
-            stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json'
+            if load_balancing is not None:
+                stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}_{workload}_{retraining_rate}_node{node}.json'
+            else:
+                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json'
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
 
@@ -116,6 +123,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default='dialogpt', help='model name')
     parser.add_argument('--setting', type=str, default='random', help='workload setting')
     parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
+    parser.add_argument('--load_balancing', type=str, default=None, choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
     parser.add_argument('--node', type=int, default=1, help='number of nodes for distributed systems')
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
@@ -129,55 +137,45 @@ if __name__ == '__main__':
     workload = args.workload
     model_name = args.model_name
     retraining_rate = args.retraining_rate
+    load_balancing = args.load_balancing
     
-    if not args.node:
+    
+    for node in range(args.node):
         # Load timing information
-        stats_f = f'{output_dir}/test_asyncio.json' if args.test_asyncio else f'{output_dir}/timing_info_{setting}.json'
+        if priority is not None:
+            if load_balancing is not None:
+                stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
+            else:
+                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
+        else:
+            if load_balancing is not None:
+                stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}_{workload}_{retraining_rate}_node{node}.json'
+            else:
+                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json'
         with open(stats_f, 'r') as f:
             timing_info = json.load(f)
-            
+        if not timing_info:
+            continue
+        gpus = list(set(int(key.split('_')[0]) for key in timing_info))  # GPUs are 0-indexed
         for times_list in timing_info.values():
             for times in times_list:
                 if start_time is None or times[0] < start_time:
                     start_time = times[0]
                     
-        gpus = list(set(int(key.split('_')[0]) for key in timing_info))  # GPUs are 0-indexed
-        fig, ax = plt.subplots(1, 1, figsize=(20, len(gpus)/1.3), sharex=True)
-        plot_mix(args, ax, None, start_time)
-        
-        # Show the plot
-        plt.tight_layout()
-        plt.savefig(f"{stats_f.split('.')[0]}.png")
-        plt.show()
-        
-    else:
-        gpus = 0
-        for node in range(args.node):
-            # Load timing information
-            if priority is not None:
-                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
-            else:
-                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json'
-            with open(stats_f, 'r') as f:
-                timing_info = json.load(f)
-            if not timing_info:
-                continue
-            gpus = list(set(int(key.split('_')[0]) for key in timing_info))  # GPUs are 0-indexed
-            for times_list in timing_info.values():
-                for times in times_list:
-                    if start_time is None or times[0] < start_time:
-                        start_time = times[0]
-                        
-        # fig.subplots_adjust(hspace=0)  # Adjust this value as needed to reduce the gap
-        fig, axes = plt.subplots(args.node, 1, figsize=(20, args.node * len(gpus)/1.3), sharex=True)
-        for node in range(args.node):
-            # plot(args, node)
-            ax = axes[node] if args.node > 1 else axes
-            plot_mix(args, ax, node, start_time)
-        plt.tight_layout()
-        if priority is not None:
+    # fig.subplots_adjust(hspace=0)  # Adjust this value as needed to reduce the gap
+    fig, axes = plt.subplots(args.node, 1, figsize=(20, args.node * len(gpus)/1.3), sharex=True)
+    for node in range(args.node):
+        # plot(args, node)
+        ax = axes[node] if args.node > 1 else axes
+        plot_mix(args, ax, node, start_time)
+    plt.tight_layout()
+    if priority is not None:
+        if load_balancing is not None:
+            plt.savefig(f"{output_dir}/{model_name}_{load_balancing}_{setting}-{priority}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300)
+        else:
             plt.savefig(f"{output_dir}/{model_name}_{setting}-{priority}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300)
+    else:
+        if load_balancing is not None:
+            plt.savefig(f"{output_dir}/{model_name}_{load_balancing}_{setting}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300)
         else:
             plt.savefig(f"{output_dir}/{model_name}_{setting}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300) 
-        # plt.savefig(f"{output_dir}/{model_name}_{setting}_{workload}_{retraining_rate}.png")
-        # plt.show()

@@ -14,7 +14,7 @@ from collections import defaultdict
 import torch
 from torch.utils.data import DataLoader
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 from transformers import (
     AutoConfig, 
     AutoTokenizer, 
@@ -34,7 +34,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
  
 
 class DistributedLLM:
-    model_n: str = 'dummy'
 
     def __init__(self, args: argparse.Namespace):
         n_samples = args.n_samples
@@ -44,11 +43,22 @@ class DistributedLLM:
         self.batch_size = args.batch_size
         self.rate_lambda = args.rate_lambda
         self.output_dir = args.output_dir
+        self.load_balancing = args.load_balancing
         self.dataset_name_or_path = args.dataset_name_or_path
         self.lr = args.lr
         self.workload = args.workload
         self.retraining_rate = args.retraining_rate  
-        self.ckpt_path = None
+        self.model_n = args.model_name
+        if self.priority is not None:
+            if self.load_balancing is not None:
+                self.ckpt_path = f'{self.output_dir}/stages-{self.load_balancing}_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
+            else:
+                self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
+        else:
+            if self.load_balancing is not None:
+                self.ckpt_path = f'{self.output_dir}/stages-{self.load_balancing}_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}'
+            else:
+                self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}'
         
         # Reproducibility
         set_seed(args.seed)
@@ -60,6 +70,7 @@ class DistributedLLM:
                 init_device=nodeID * self.num_gpus_per_node,
             ) for nodeID in range(self.num_nodes)
         }
+        self.memory_threshold = args.memory_threshold
         self.device_total_memory = torch.cuda.get_device_properties(0).total_memory
         self.timing_infos = {
             nodeID: defaultdict(list) 
@@ -224,6 +235,17 @@ class DistributedLLM:
         taskQueue.put(None)  # Signal the end of the dataset
         print("Producer finished producing tasks")
         
+        
+    def _assign_node(self, node_list: Optional[List[int]] = None):
+        node_list = node_list if node_list is not None else list(range(self.num_nodes))
+        if self.load_balancing is None or self.load_balancing == 'random':
+            return random.choice(node_list)
+        elif self.load_balancing == 'workload':
+            # Choose the node with the least workload (number of tasks in the first device queue)
+            return min(node_list, key=lambda nodeID: self.distributed_nodes[nodeID].device_queues[0].qsize())
+        else:
+            raise ValueError(f"Invalid load balancing type: {self.load_balancing}")
+        
 
     def globalScheduler(
         self, 
@@ -239,14 +261,14 @@ class DistributedLLM:
                     node.device_queues[0].put((float('inf'), float('inf'))) # for priority_queue, use a large number to signal the end
                 break
             if self.setting != 'isolated':
-                nodeID = random.choice(list(self.distributed_nodes.keys()))
+                nodeID = self._assign_node(node_list=list(range(self.num_nodes)))
             else:
                 # If the task require training, we schedule it to the last node
                 if self.distributed_preloaded_tasks[0][taskID].require_training:
                     nodeID = self.num_nodes - 1
                 else:
-                    # Randomly choose another node (not the last node)
-                    nodeID = random.choice(list(range(self.num_nodes - 1)))
+                    # Assign to another node (except the last one)
+                    nodeID = self._assign_node(node_list=list(range(self.num_nodes - 1)))
 
             # Each node queue store task IDs
             if self.setting == 'interval':
@@ -302,11 +324,10 @@ class DistributedLLM:
         nodeID: int,
         device: int, 
         timing_info: Dict[str, List[float]],
-        threshold: float = 0.8, 
     ) -> Tuple[torch.Tensor, ...]:
         
-        self._wait_for_device_availability(device, threshold=threshold)
         try:
+            self._wait_for_device_availability(device, threshold=self.memory_threshold)
             if task.require_training: # this is a retraining task
                 record_time(device, 'start', 'forward_grad', timing_info)
                 tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
@@ -343,7 +364,7 @@ class DistributedLLM:
     ):
         # We use num_gpus_per_node workers to simulateously get task from the queue and inference
         with ThreadPoolExecutor(max_workers=self.num_gpus_per_node) as executor:
-            futures = []
+            # futures = []
             for stageID in range(self.num_gpus_per_node):
                 future = executor.submit(
                     self.device_inference, 
@@ -355,14 +376,14 @@ class DistributedLLM:
                     nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(self.distributed_stages[nodeID]) - 1 else None,
                     init_device=node.init_device,
                 )
-                futures.append(future)
-            for future in futures:
-                try:
-                    # Set a timeout for each task. Adjust the timeout value as needed.
-                    future.result(timeout=60)  # Timeout set to 60 seconds
-                except TimeoutError:
-                    # Handle the timeout, for example, by logging an error, retrying the task, or skipping it.
-                    print(f"Task execution exceeded the timeout limit and was aborted. Node ID: {nodeID}")
+            #     futures.append(future)
+            # for future in futures:
+            #     try:
+            #         # Set a timeout for each task. Adjust the timeout value as needed.
+            #         future.result(timeout=60)  # Timeout set to 60 seconds
+            #     except TimeoutError:
+            #         # Handle the timeout, for example, by logging an error, retrying the task, or skipping it.
+            #         print(f"Task execution exceeded the timeout limit and was aborted. Node ID: {nodeID}")
                 
         print("Node {} finished inference".format(node.node_id))
 
@@ -392,11 +413,10 @@ class DistributedLLM:
             future3 = executor.submit(self.run_stages_concurrently)
         
         # Delete checkpoint file in the disk if self.ckpt_path is not None
-        # if self.ckpt_path is not None and os.path.exists(self.ckpt_path):
-        #     os.remove(self.ckpt_path)
-        for j in range(self.num_gpus_per_node):
-            if self.ckpt_path is not None and os.path.exists(f"{self.ckpt_path}_stage{j}.pt"):
-                os.remove(f"{self.ckpt_path}_stage{j}.pt")
+        if self.ckpt_path is not None:
+            for j in range(self.num_gpus_per_node):
+                if os.path.exists(f"{self.ckpt_path}_stage{j}.pt"):
+                    os.remove(f"{self.ckpt_path}_stage{j}.pt")
         
         # Save timing info
         self.save_timing_info()
@@ -414,9 +434,15 @@ class DistributedLLM:
             #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
             #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
             if self.priority is not None:
-                stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+                if self.load_balancing is not None:
+                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+                else:
+                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
             else:
-                stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+                if self.load_balancing is not None:
+                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+                else:
+                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
         
@@ -455,24 +481,31 @@ class DistributedLLM:
                 global_min_time = min(global_min_time, min_t)
                 global_max_time = max(global_max_time, max_t)
                     
-        num_tasks = self.total_tasks
         bubble_rate = sum(total_idles) / sum(total_latencies) if sum(total_latencies) > 0 else 0
         for key, value in metrics.items():
             metrics[key] = sum(value) / len(value)
         
-        metrics['num_tasks'] = num_tasks
+        metrics['num_tasks'] = self.total_tasks
+        metrics['retrain_tasks'] = self.retraining_tasks
+        metrics['actual_retrained_tasks'] = self._trained_tasks
         metrics['bubble_rate'] = bubble_rate 
         metrics['idleness'] = sum(total_idles) / len(total_idles)
-        metrics['response_time'] = sum(total_latencies) * 2 / (num_tasks * len(total_latencies))
+        metrics['response_time'] = sum(total_latencies) * 2 / (self.total_tasks * len(total_latencies))
         metrics['end2end_latency'] = global_max_time - global_min_time
-        metrics['throughput'] = num_tasks / (global_max_time - global_min_time)
+        metrics['throughput'] = self.total_tasks / (global_max_time - global_min_time)
             
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)
         if self.priority is not None:
-            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}.json'
+            if self.load_balancing is not None:
+                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}.json'
+            else:
+                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}.json'
         else:
-            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}.json'
+            if self.load_balancing is not None:
+                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{self.setting}_{self.workload}_{self.retraining_rate}.json'
+            else:
+                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}:\n{metrics}")
@@ -485,12 +518,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_name_or_path', type=str, default='data/Anthropic', help='dataset name')
     parser.add_argument('--model_name_or_path', type=str, help='model name or path')
+    parser.add_argument('--model_name', type=str, default='dummy', help='model name')
+    parser.add_argument('--memory_threshold', type=float, default=0.8, help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'isolated'], help='training setting')
     parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
+    parser.add_argument('--load_balancing', type=str, default=None, choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
