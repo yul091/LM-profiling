@@ -51,7 +51,7 @@ class DistributedDialoGPT(DistributedLLM):
                 break
             
             task: Task = preloaded_tasks[taskID]
-            # assert task.task_id == taskID
+            assert task.task_id == taskID
             inputs = task.hiddens[stageID]
             
             if inputs is None:
@@ -143,8 +143,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
-    parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'isolated'], help='training setting')
-    parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
+    parser.add_argument('--setting', type=str, default='active', choices=['active', 'interval', 'isolated'], help='training setting')
+    parser.add_argument('--priority', type=str, default=None, choices=['MLF', 'LLF'], help='scheduling priority')
     parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)

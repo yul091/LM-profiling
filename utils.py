@@ -74,12 +74,19 @@ class Task:
         self.require_training = False if require_training is None else require_training
 
 
-def record_time(device: int, event_type: str, opt_type: str, timing_info: Dict[str, List[float]], verbose: bool = False):
+def record_time(
+    device: int, 
+    event_type: str, 
+    opt_type: str, 
+    timing_info: Dict[str, List[float]], 
+    verbose: bool = False,
+) -> float:
     # event_type can be 'start' or 'end'
     timestamp = time.time()
     timing_info[f"{device}_{event_type}"].append((timestamp, opt_type))
     if verbose:
         print(f"\t[CUDA {device}] Task {event_type} at time {timestamp}")
+    return timestamp
     
 
 def get_total_params(module: torch.nn.Module):
@@ -248,12 +255,13 @@ LABEL2METHOD = {
     "LaMix-MLF": "interval-MLF",
 }
 
-def plot_dual(lambda_=50, label1='NaiveMix', label2='Separate', label3=None, label4=None, 
-              figname=None, setting=None, num_nodes=2, legend=True, model='dialogpt-small', use_bubble=True,
+def plot_dual(lambda_=50, label1='NaiveMix', label2=None, label3=None, label4=None, label5=None,
+              figname=None, setting=None, load_balancing=None, num_nodes=2, legend=True, model='dialogpt-small', use_bubble=True,
               color1=sns.color_palette("deep")[0], 
               color2=sns.color_palette("deep")[1],):
     
-    res1, res2, res3, res4 = [], [], [], []
+    res1, res2, res3, res4, res5 = [], [], [], [], []
+    model_schedule = f'{model}_{load_balancing}' if load_balancing is not None else model
     res_dir = f"prof/{num_nodes}_node/lambda_{lambda_}"
     for retrain_rate in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
         if setting:
@@ -267,9 +275,10 @@ def plot_dual(lambda_=50, label1='NaiveMix', label2='Separate', label3=None, lab
             metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label1]}_poisson_{retrain_rate}.json"))
             metric["retrain_rate"] = retrain_rate
             res1.append(metric)
-            metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label2]}_poisson_{retrain_rate}.json"))
-            metric["retrain_rate"] = retrain_rate
-            res2.append(metric)
+            if label2:
+                metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label2]}_poisson_{retrain_rate}.json"))
+                metric["retrain_rate"] = retrain_rate
+                res2.append(metric)
             if label3:
                 metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label3]}_poisson_{retrain_rate}.json"))
                 metric["retrain_rate"] = retrain_rate
@@ -278,87 +287,103 @@ def plot_dual(lambda_=50, label1='NaiveMix', label2='Separate', label3=None, lab
                 metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label4]}_poisson_{retrain_rate}.json"))
                 metric["retrain_rate"] = retrain_rate
                 res4.append(metric)
+            if model_schedule != model:
+                metric = json.load(open(f"{res_dir}/{model}/metrics_{model_schedule}_{LABEL2METHOD[label1]}_poisson_{retrain_rate}.json"))
+                metric["retrain_rate"] = retrain_rate
+                res5.append(metric)
         
     res1 = pd.DataFrame(res1)
-    res2 = pd.DataFrame(res2)
+    res2 = pd.DataFrame(res2) if res2 else None
     res3 = pd.DataFrame(res3) if res3 else None
     res4 = pd.DataFrame(res4) if res4 else None
+    res5 = pd.DataFrame(res5) if res5 else None
 
     # Let's plot the metrics, x-axis is retrain_rate, y-axis is the metric value
     os.makedirs("figure", exist_ok=True) 
     sns.set_theme(style="ticks")
     fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
+    
+    ax2 = axes[0].twinx()
     # ax.yaxis.grid(True, linestyle='dotted', which='major', color='grey', alpha=0.5)
     line1, = axes[0].plot(res1["retrain_rate"], res1["loss"], label=label1, marker='v', color=color1)
-    line1_1, = axes[0].plot(res2["retrain_rate"], res2["loss"], label=label2, marker='v', color=color1, linestyle='--')
-    axes[0].set_ylabel("Eval loss", fontsize=14)
-    axes[0].tick_params(axis='y', colors=color1)
-    ax2 = axes[0].twinx()
     line2, = ax2.plot(res1["retrain_rate"], res1["response_time"] * 1000, label=label1, color=color2, marker='x')
-    line2_2, = ax2.plot(res2["retrain_rate"], res2["response_time"] * 1000, label=label2, color=color2, marker='x', linestyle='--')
+    lines = [line1, line2]
+    if res2 is not None:
+        line1_1, = axes[0].plot(res2["retrain_rate"], res2["loss"], label=label2, marker='v', color=color1, linestyle='--')
+        line2_2, = ax2.plot(res2["retrain_rate"], res2["response_time"] * 1000, label=label2, color=color2, marker='x', linestyle='--')
+        lines += [line1_1, line2_2]
     if res3 is not None:
         line1_2, = axes[0].plot(res3["retrain_rate"], res3["loss"], label=label3, marker='v', color=color1, linestyle='dotted')
-        line2_3, = ax2.plot(res3["retrain_rate"], res3["response_time"] * 1000, label=label3, color=color2, marker='x', linestyle='dotted')
+        line2_3, = ax2.plot(res3["retrain_rate"], res3["response_time"] * 1000, label=label3, marker='x', color=color2, linestyle='dotted')
+        lines += [line1_2, line2_3]
     if res4 is not None:
         line1_3, = axes[0].plot(res4["retrain_rate"], res4["loss"], label=label4, marker='v', color=color1, linestyle='-.')
-        line2_4, = ax2.plot(res4["retrain_rate"], res4["response_time"] * 1000, label=label4, color=color2, marker='x', linestyle='-.')
-        if res3 is not None:
-            lines = [line1, line2, line1_1, line2_2, line1_2, line2_3, line1_3, line2_4]
-        else:
-            lines = [line1, line2, line1_1, line2_2, line1_3, line2_4]
-    else:
-        if res3 is not None:
-            lines = [line1, line2, line1_1, line2_2, line1_2, line2_3]
-        else:
-            lines = [line1, line2, line1_1, line2_2]
-        
+        line2_4, = ax2.plot(res4["retrain_rate"], res4["response_time"] * 1000, label=label4, marker='x', color=color2, linestyle='-.')
+        lines += [line1_3, line2_4]
+    if res5 is not None:
+        line1_4, = axes[0].plot(res5["retrain_rate"], res5["loss"], label=label5, marker='v', color=color1, linestyle=(0, (1, 10)))
+        line2_5, = ax2.plot(res5["retrain_rate"], res5["response_time"] * 1000, label=label5, marker='x', color=color2, linestyle=(0, (1, 10)))
+        lines += [line1_4, line2_5]
+    
     ax2.set_ylabel("Response time (ms)", fontsize=14)
     ax2.tick_params(axis='y', colors=color2)
     labels = [line.get_label() for line in lines]
+    axes[0].set_ylabel("Eval loss", fontsize=14)
+    axes[0].tick_params(axis='y', colors=color1)
     axes[0].set_xlabel("Retraining rate", fontsize=14)
 
+    ax2 = axes[1].twinx()
     if use_bubble:
         line1, = axes[1].plot(res1["retrain_rate"], res1["bubble_rate"] * 100, label=label1, color=color1, marker='v')
-        line1_1, = axes[1].plot(res2["retrain_rate"], res2["bubble_rate"] * 100, label=label2, color=color1, marker='v', linestyle='--')
-        axes[1].set_ylabel("Bubble rate (%)", fontsize=14)
     else:
         line1, = axes[1].plot(res1["retrain_rate"], res1["idleness"] * 1000, label=label1, color=color1, marker='v')
-        line1_1, = axes[1].plot(res2["retrain_rate"], res2["idleness"] * 1000, label=label2, color=color1, marker='v', linestyle='--')
-        axes[1].set_ylabel("GPU idles (ms)", fontsize=14)
-    axes[1].tick_params(axis='y', colors=color1)
-    ax2 = axes[1].twinx()
     line2, = ax2.plot(res1["retrain_rate"], res1["end2end_latency"], label=label1, color=color2, marker='x')
-    line2_2, = ax2.plot(res2["retrain_rate"], res2["end2end_latency"], label=label2, color=color2, marker='x', linestyle='--')
+    lines = [line1, line2]
+    if res2 is not None:
+        if use_bubble:
+            line1_1, = axes[1].plot(res2["retrain_rate"], res2["bubble_rate"] * 100, label=label2, color=color1, marker='v', linestyle='--')
+        else:
+            line1_1, = axes[1].plot(res2["retrain_rate"], res2["idleness"] * 1000, label=label2, color=color1, marker='v', linestyle='--')
+        line2_2, = ax2.plot(res2["retrain_rate"], res2["end2end_latency"], label=label2, color=color2, marker='x', linestyle='--')
+        lines += [line1_1, line2_2]
     if res3 is not None:
         if use_bubble:
             line1_2, = axes[1].plot(res3["retrain_rate"], res3["bubble_rate"] * 100, label=label3, color=color1, marker='v', linestyle='dotted')
         else:
             line1_2, = axes[1].plot(res3["retrain_rate"], res3["idleness"] * 1000, label=label3, color=color1, marker='v', linestyle='dotted')
-        line2_3, = ax2.plot(res3["retrain_rate"], res3["end2end_latency"], label=label3, color=color2, marker='x', linestyle='dotted')
+        line2_3, = ax2.plot(res3["retrain_rate"], res3["end2end_latency"], label=label3, color=color2, marker='v', linestyle='dotted')
+        lines += [line1_2, line2_3]
     if res4 is not None:
         if use_bubble:
             line1_3, = axes[1].plot(res4["retrain_rate"], res4["bubble_rate"] * 100, label=label4, color=color1, marker='v', linestyle='-.')
         else:
             line1_3, = axes[1].plot(res4["retrain_rate"], res4["idleness"] * 1000, label=label4, color=color1, marker='v', linestyle='-.')
         line2_4, = ax2.plot(res4["retrain_rate"], res4["end2end_latency"], label=label4, color=color2, marker='x', linestyle='-.')
-        if res3 is not None:
-            lines = [line1, line2, line1_1, line2_2, line1_2, line2_3, line1_3, line2_4]
+        lines += [line1_3, line2_4]
+    if res5 is not None:
+        if use_bubble:
+            line1_4, = axes[1].plot(res5["retrain_rate"], res5["bubble_rate"] * 100, label=label5, color=color1, marker='v', linestyle=(0, (1, 10)))
         else:
-            lines = [line1, line2, line1_1, line2_2, line1_3, line2_4]
-    else:
-        if res3 is not None:
-            lines = [line1, line2, line1_1, line2_2, line1_2, line2_3]
-        else:
-            lines = [line1, line2, line1_1, line2_2]
+            line1_4, = axes[1].plot(res5["retrain_rate"], res5["idleness"] * 1000, label=label5, color=color1, marker='v', linestyle=(0, (1, 10)))
+        line2_5, = ax2.plot(res5["retrain_rate"], res5["end2end_latency"], label=label5, color=color2, marker='x', linestyle=(0, (1, 10)))
+        lines += [line1_4, line2_5]
+        
     ax2.set_ylabel("End2end latency (s)", fontsize=14)
     ax2.tick_params(axis='y', colors=color2)
     labels = [line.get_label() for line in lines]
     # Create a single legend for both lines together
+    if use_bubble:
+        axes[1].set_ylabel("Bubble rate (%)", fontsize=14)
+    else:
+        axes[1].set_ylabel("GPU idles (ms)", fontsize=14)
+    axes[1].tick_params(axis='y', colors=color1)
     axes[1].set_xlabel("Retraining rate", fontsize=14)
     if legend:
-        ncol = 2
+        ncol = 1
+        if res2 is not None: ncol += 1
         if res3 is not None: ncol += 1
         if res4 is not None: ncol += 1
+        if res5 is not None: ncol += 1
         fig.legend(lines, labels, loc='upper center', ncol=ncol, bbox_to_anchor=(0.5, 1.15), fontsize=11)
     plt.tight_layout()
     if figname:
@@ -368,3 +393,92 @@ def plot_dual(lambda_=50, label1='NaiveMix', label2='Separate', label3=None, lab
     plt.show()
        
 
+
+def plot_single(lambda_=50, label1='NaiveMix', label2=None, label3=None, label4=None, label5=None,
+                figname=None, setting=None, load_balancing=None, num_nodes=2, legend=True, model='dialogpt-small',
+                color1=sns.color_palette("deep")[0], 
+                color2=sns.color_palette("deep")[1],):
+    
+    res1, res2, res3, res4, res5 = [], [], [], [], []
+    model_schedule = f'{model}_{load_balancing}' if load_balancing is not None else model
+    res_dir = f"prof/{num_nodes}_node/lambda_{lambda_}"
+    for retrain_rate in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+        if setting:
+            metric = json.load(open(f"{res_dir}/dialogpt-small/metrics_dialogpt-small_{setting}_poisson_{retrain_rate}.json"))
+            metric["retrain_rate"] = retrain_rate
+            res1.append(metric)
+            metric = json.load(open(f"{res_dir}/dialogpt-medium/metrics_dialogpt-medium_{setting}_poisson_{retrain_rate}.json"))
+            metric["retrain_rate"] = retrain_rate
+            res2.append(metric)
+        else:
+            metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label1]}_poisson_{retrain_rate}.json"))
+            metric["retrain_rate"] = retrain_rate
+            res1.append(metric)
+            if label2:
+                metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label2]}_poisson_{retrain_rate}.json"))
+                metric["retrain_rate"] = retrain_rate
+                res2.append(metric)
+            if label3:
+                metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label3]}_poisson_{retrain_rate}.json"))
+                metric["retrain_rate"] = retrain_rate
+                res3.append(metric)
+            if label4:
+                metric = json.load(open(f"{res_dir}/{model}/metrics_{model}_{LABEL2METHOD[label4]}_poisson_{retrain_rate}.json"))
+                metric["retrain_rate"] = retrain_rate
+                res4.append(metric)
+            if model_schedule != model:
+                metric = json.load(open(f"{res_dir}/{model}/metrics_{model_schedule}_{LABEL2METHOD[label1]}_poisson_{retrain_rate}.json"))
+                metric["retrain_rate"] = retrain_rate
+                res5.append(metric)
+        
+    res1 = pd.DataFrame(res1)
+    res2 = pd.DataFrame(res2) if res2 else None
+    res3 = pd.DataFrame(res3) if res3 else None
+    res4 = pd.DataFrame(res4) if res4 else None
+    res5 = pd.DataFrame(res5) if res5 else None
+
+    # Let's plot the metrics, x-axis is retrain_rate, y-axis is the metric value
+    os.makedirs("figure", exist_ok=True) 
+    sns.set_theme(style="ticks")
+    fig, ax = plt.subplots(1, 1, figsize=(6.5, 3.5))
+    # ax.yaxis.grid(True, linestyle='dotted', which='major', color='grey', alpha=0.5)
+    ax.set_ylabel("Eval loss", fontsize=14)
+    ax.tick_params(axis='y', colors=color1)
+    ax2 = ax.twinx()
+    line1, = ax.plot(res1["retrain_rate"], res1["loss"], label=label1, marker='v', color=color1)
+    line2, = ax2.plot(res1["retrain_rate"], res1["end2end_latency"], label=label1, color=color2, marker='x')
+    lines = [line1, line2]
+    if res2 is not None:
+        line1_1, = ax.plot(res2["retrain_rate"], res2["loss"], label=label2, marker='v', color=color1, linestyle='--')
+        line2_2, = ax2.plot(res2["retrain_rate"], res2["end2end_latency"], label=label2, color=color2, marker='x', linestyle='--')
+        lines += [line1_1, line2_2]
+    if res3 is not None:
+        line1_2, = ax.plot(res3["retrain_rate"], res3["loss"], label=label3, marker='v', color=color1, linestyle='dotted')
+        line2_3, = ax2.plot(res3["retrain_rate"], res3["end2end_latency"], label=label3, color=color2, marker='x', linestyle='dotted')
+        lines += [line1_2, line2_3]
+    if res4 is not None:
+        line1_3, = ax.plot(res4["retrain_rate"], res4["loss"], label=label4, marker='v', color=color1, linestyle='-.')
+        line2_4, = ax2.plot(res4["retrain_rate"], res4["end2end_latency"], label=label4, color=color2, marker='x', linestyle='-.')
+        lines += [line1_3, line2_4]
+    if res5 is not None:
+        line1_4, = ax.plot(res5["retrain_rate"], res5["loss"], label=label5, color=color1, marker='v', linestyle=(0, (1, 10)))
+        line2_5, = ax2.plot(res5["retrain_rate"], res5["end2end_latency"], label=label5, color=color1, marker='x', linestyle=(0, (1, 10)))
+        lines += [line1_4, line2_5]
+        
+    ax2.set_ylabel("End2end latency (s)", fontsize=14)
+    ax2.tick_params(axis='y', colors=color2)
+    labels = [line.get_label() for line in lines]
+    ax.set_xlabel("Retraining rate", fontsize=14)
+    if legend:
+        ncol = 1
+        if res2 is not None: ncol += 1
+        if res3 is not None: ncol += 1
+        if res4 is not None: ncol += 1
+        if res5 is not None: ncol += 1
+        fig.legend(lines, labels, loc='upper center', ncol=ncol, bbox_to_anchor=(0.5, 1.15), fontsize=11)
+    plt.tight_layout()
+    if figname:
+        plt.savefig(f"figure/{figname}.pdf", bbox_inches='tight')
+    else:
+        plt.savefig("figure/single_dialogpt_retraining_lambda={lambda_}.pdf", bbox_inches='tight')
+    plt.show()

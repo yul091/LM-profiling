@@ -49,7 +49,7 @@ class DistributedLlama(DistributedLLM):
                 break
             
             task: Task = preloaded_tasks[taskID]
-            # assert task.task_id == taskID
+            assert task.task_id == taskID
             inputs = task.hiddens[stageID]
             
             if inputs is None:

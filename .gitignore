@@ -1,8 +1,8 @@
 prof
-prof_async
+prof_old
 figure
 # scripts
-logging
+# logging
 results
 wandb
-data
+# data

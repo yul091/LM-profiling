@@ -59,6 +59,7 @@ class DistributedLLM:
                 self.ckpt_path = f'{self.output_dir}/stages-{self.load_balancing}_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}'
             else:
                 self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}'
+        self.user_task_record = defaultdict(dict)
         
         # Reproducibility
         set_seed(args.seed)
@@ -220,7 +221,7 @@ class DistributedLLM:
         taskQueue: queue.Queue, 
     ):
         # Produce using the dataset
-        for taskID in range(len(self.distributed_preloaded_tasks[0])):
+        for taskID, task in enumerate(self.distributed_preloaded_tasks[0]):
             if self.workload == 'poisson':
                 time.sleep(random.expovariate(self.rate_lambda))
             elif self.workload == 'all':
@@ -231,6 +232,9 @@ class DistributedLLM:
             # print("Producing task {} with input query shape {}".format(taskID, self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape))
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(taskID)
+            # We record and calculate the response time for each user task (no retraining)
+            if not task.require_training:
+                self.user_task_record[taskID]['release'] = time.time()
             
         taskQueue.put(None)  # Signal the end of the dataset
         print("Producer finished producing tasks")
@@ -333,10 +337,17 @@ class DistributedLLM:
                 tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 record_time(device, 'end', 'forward_grad', timing_info)
             else:
-                record_time(device, 'start', 'forward', timing_info)
+                inference_start = record_time(device, 'start', 'forward', timing_info)
                 with torch.no_grad():
                     tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
-                record_time(device, 'end', 'forward', timing_info)
+                inference_end = record_time(device, 'end', 'forward', timing_info)
+                # Record the start and end time for each user task
+                if stageID == 0: # first stage
+                    self.user_task_record[task.task_id]['start'] = inference_start
+                if stageID == self.num_gpus_per_node - 1: # last stage
+                    self.user_task_record[task.task_id]['end'] = inference_end
+                    # self.user_task_record[task.task_id]['node'] = nodeID
+            
         except Exception as e:
             logging.error(f"[Node {nodeID} - stage {stageID} - device {device}] Forward error occurred: {e}")
             tuple_outputs = None
@@ -484,15 +495,32 @@ class DistributedLLM:
         bubble_rate = sum(total_idles) / sum(total_latencies) if sum(total_latencies) > 0 else 0
         for key, value in metrics.items():
             metrics[key] = sum(value) / len(value)
-        
+            
+        # Calculate response times
         metrics['num_tasks'] = self.total_tasks
         metrics['retrain_tasks'] = self.retraining_tasks
         metrics['actual_retrained_tasks'] = self._trained_tasks
+        metrics['user_tasks'] = len(self.user_task_record)
         metrics['bubble_rate'] = bubble_rate 
-        metrics['idleness'] = sum(total_idles) / len(total_idles)
-        metrics['response_time'] = sum(total_latencies) * 2 / (self.total_tasks * len(total_latencies))
+        metrics['idles'] = sum(total_idles) / len(total_idles)
         metrics['end2end_latency'] = global_max_time - global_min_time
         metrics['throughput'] = self.total_tasks / (global_max_time - global_min_time)
+        
+        if self.user_task_record:
+            total_response_time, total_wait_time, total_inference_time = 0, 0, 0
+            user_global_min_time, user_global_max_time = float('inf'), float('-inf')
+            for record_dict in self.user_task_record.values():
+                total_response_time += record_dict['end'] - record_dict['release']
+                total_wait_time += record_dict['start'] - record_dict['release']
+                total_inference_time += record_dict['end'] - record_dict['start']
+                user_global_min_time = min(user_global_min_time, record_dict['start'])
+                user_global_max_time = max(user_global_max_time, record_dict['end'])
+                
+            metrics['user_wait'] = total_wait_time / len(self.user_task_record)
+            metrics['user_inference'] = total_inference_time / len(self.user_task_record)
+            metrics['user_response'] = total_response_time / len(self.user_task_record)
+            metrics['user_end2end_latency'] = user_global_max_time - user_global_min_time
+            metrics['user_throughput'] = len(self.user_task_record) / (user_global_max_time - user_global_min_time)
             
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)
@@ -526,7 +554,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'isolated'], help='training setting')
     parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
-    parser.add_argument('--load_balancing', type=str, default=None, choices=['random', 'workload'], help='node level scheduling policy')
+    parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
