@@ -49,16 +49,32 @@ class DistributedLLM:
         self.workload = args.workload
         self.retraining_rate = args.retraining_rate  
         self.model_n = args.model_name
+        if self.setting == 'isolated':
+            self.isolated_split = args.isolated_split
+            setting = f"isolated-split{self.isolated_split}"
+            if self.isolated_split > 0:
+                self._test_nodes = list(range(int(self.num_nodes * self.isolated_split)))
+                self._train_nodes = list(range(int(self.num_nodes * self.isolated_split), self.num_nodes))
+            elif self.isolated_split == 0:
+                self._test_nodes = list(range(self.num_nodes - 1))
+                self._train_nodes = [self.num_nodes - 1]
+            else:
+                self._test_nodes = [0]
+                self._train_nodes = list(range(1, self.num_nodes))
+            print(f"** ISOLATED SYSTEM: Test nodes: {self._test_nodes}, Train nodes: {self._train_nodes} **")
+        else:
+            setting = self.setting
+        
         if self.priority is not None:
             if self.load_balancing is not None:
-                self.ckpt_path = f'{self.output_dir}/stages-{self.load_balancing}_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
+                self.ckpt_path = f'{self.output_dir}/stages-{self.load_balancing}_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
             else:
-                self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
+                self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
         else:
             if self.load_balancing is not None:
-                self.ckpt_path = f'{self.output_dir}/stages-{self.load_balancing}_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}'
+                self.ckpt_path = f'{self.output_dir}/stages-{self.load_balancing}_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
             else:
-                self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}'
+                self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
         self.user_task_record = defaultdict(dict)
         
         # Reproducibility
@@ -240,8 +256,9 @@ class DistributedLLM:
         print("Producer finished producing tasks")
         
         
-    def _assign_node(self, node_list: Optional[List[int]] = None):
-        node_list = node_list if node_list is not None else list(range(self.num_nodes))
+    def _assign_node(self, node_list: List[int]):
+        if len(node_list) == 1:
+            return node_list[0]
         if self.load_balancing is None or self.load_balancing == 'random':
             return random.choice(node_list)
         elif self.load_balancing == 'workload':
@@ -267,12 +284,14 @@ class DistributedLLM:
             if self.setting != 'isolated':
                 nodeID = self._assign_node(node_list=list(range(self.num_nodes)))
             else:
-                # If the task require training, we schedule it to the last node
+                # If the task require training, we schedule it to one of the training nodes
                 if self.distributed_preloaded_tasks[0][taskID].require_training:
-                    nodeID = self.num_nodes - 1
+                    # nodeID = self.num_nodes - 1
+                    nodeID = self._assign_node(node_list=self._train_nodes)
                 else:
-                    # Assign to another node (except the last one)
-                    nodeID = self._assign_node(node_list=list(range(self.num_nodes - 1)))
+                    # Assign to one of the test nodes
+                    # nodeID = self._assign_node(node_list=list(range(self.num_nodes - 1)))
+                    nodeID = self._assign_node(node_list=self._test_nodes)
 
             # Each node queue store task IDs
             if self.setting == 'interval':
@@ -286,7 +305,7 @@ class DistributedLLM:
                 self.distributed_nodes[nodeID].device_queues[0].put((priority, taskID))
             else:
                 self.distributed_nodes[nodeID].device_queues[0].put((taskID, taskID))
-            # print("Global scheduler scheduled task {} to node {}".format(taskID, nodeID))
+            # print("Global scheduler scheduled task {} (requre_training={}) to node {}".format(taskID, self.distributed_preloaded_tasks[0][taskID].require_training, nodeID))
     
     
     def _check_device_availability(self, device: int, threshold: float = 0.8):
@@ -337,16 +356,19 @@ class DistributedLLM:
                 tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 record_time(device, 'end', 'forward_grad', timing_info)
             else:
-                inference_start = record_time(device, 'start', 'forward', timing_info)
+                if stageID == 0: # first stage
+                    self.user_task_record[task.task_id]['start'] = record_time(device, 'start', 'forward', timing_info)
+                else:
+                    record_time(device, 'start', 'forward', timing_info)
+                    
                 with torch.no_grad():
                     tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
-                inference_end = record_time(device, 'end', 'forward', timing_info)
-                # Record the start and end time for each user task
-                if stageID == 0: # first stage
-                    self.user_task_record[task.task_id]['start'] = inference_start
+                
                 if stageID == self.num_gpus_per_node - 1: # last stage
-                    self.user_task_record[task.task_id]['end'] = inference_end
-                    # self.user_task_record[task.task_id]['node'] = nodeID
+                    self.user_task_record[task.task_id]['end'] = record_time(device, 'end', 'forward', timing_info)
+                else:
+                    record_time(device, 'end', 'forward', timing_info)
+                # self.user_task_record[task.task_id]['node'] = nodeID
             
         except Exception as e:
             logging.error(f"[Node {nodeID} - stage {stageID} - device {device}] Forward error occurred: {e}")
@@ -438,6 +460,11 @@ class DistributedLLM:
         
     def save_timing_info(self):
         os.makedirs(self.output_dir, exist_ok=True)
+        if self.setting == 'isolated':
+            setting = f"isolated-split{self.isolated_split}"
+        else:
+            setting = self.setting
+        
         for nodeID, timing_info in self.timing_infos.items():
             # # Remove the first start and end time for each GPU
             # gpus = list(set(int(key.split('_')[0]) for key in timing_info))
@@ -446,14 +473,14 @@ class DistributedLLM:
             #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
             if self.priority is not None:
                 if self.load_balancing is not None:
-                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
                 else:
-                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
             else:
                 if self.load_balancing is not None:
-                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
                 else:
-                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
         
@@ -463,6 +490,11 @@ class DistributedLLM:
         metrics: Optional[Dict[str, Union[float, int]]] = None,
     ):
         metrics = metrics if metrics is not None else self.metrics
+        if self.setting == 'isolated':
+            setting = f"isolated-split{self.isolated_split}"
+        else:
+            setting = self.setting
+            
         # Calculate metrics
         global_min_time, global_max_time = float('inf'), float('-inf')
         total_idles = []
@@ -478,9 +510,9 @@ class DistributedLLM:
                 starts = timing_info.get(f"{gpu_idx}_start", [])
                 ends = timing_info.get(f"{gpu_idx}_end", [])
                 if len(starts) == 1:
-                    idles = [0]
+                    idles = []
                 else:
-                    idles = [start - end for (start, start_label), (end, end_label) in zip(starts[1:], ends[:-1]) if (start_label == end_label and start > end)]
+                    idles = [start - end for (start, start_label), (end, end_label) in zip(starts[1:], ends[:-1]) if (start > end)]
                 total_idles.extend(idles)
                 
                 tasks = list(zip(starts, ends))
@@ -502,14 +534,15 @@ class DistributedLLM:
         metrics['actual_retrained_tasks'] = self._trained_tasks
         metrics['user_tasks'] = len(self.user_task_record)
         metrics['bubble_rate'] = bubble_rate 
-        metrics['idles'] = sum(total_idles) / len(total_idles)
+        metrics['idles'] = sum(total_idles)
+        metrics['avg_idles'] = sum(total_idles) / len(total_idles)
         metrics['end2end_latency'] = global_max_time - global_min_time
         metrics['throughput'] = self.total_tasks / (global_max_time - global_min_time)
         
         if self.user_task_record:
             total_response_time, total_wait_time, total_inference_time = 0, 0, 0
             user_global_min_time, user_global_max_time = float('inf'), float('-inf')
-            for record_dict in self.user_task_record.values():
+            for taskID, record_dict in self.user_task_record.items():
                 total_response_time += record_dict['end'] - record_dict['release']
                 total_wait_time += record_dict['start'] - record_dict['release']
                 total_inference_time += record_dict['end'] - record_dict['start']
@@ -526,14 +559,14 @@ class DistributedLLM:
         os.makedirs(self.output_dir, exist_ok=True)
         if self.priority is not None:
             if self.load_balancing is not None:
-                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}.json'
+                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}.json'
             else:
-                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}-{self.priority}_{self.workload}_{self.retraining_rate}.json'
+                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}.json'
         else:
             if self.load_balancing is not None:
-                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{self.setting}_{self.workload}_{self.retraining_rate}.json'
+                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{setting}_{self.workload}_{self.retraining_rate}.json'
             else:
-                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.setting}_{self.workload}_{self.retraining_rate}.json'
+                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}:\n{metrics}")
@@ -552,7 +585,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
-    parser.add_argument('--setting', type=str, default='active', choices=['active','interval', 'isolated'], help='training setting')
+    parser.add_argument('--setting', type=str, default='active', choices=['active','interval','isolated'], help='training setting')
+    parser.add_argument('--isolated_split', type=float, default=0, help='split ratio for isolated test and train nodes')
     parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
     parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
