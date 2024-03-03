@@ -92,13 +92,13 @@ class DistributedDialoGPT(DistributedLLM):
                 # loss = outputs.loss
                 loss = tuple_outputs[0]
                 # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
-                # self.metrics["loss"].append(loss.item())
+                self.metrics["loss"].append(loss.item())
                 
                 if task.require_training:
                     # Backprop on the last stage
                     try:
                         loss.backward()
-                        record_time(init_device, 'end', 'backward', timing_info)
+                        record_time(init_device, 'end', 'backward', taskID, timing_info)
                     except Exception as e:
                         # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                         pass
@@ -110,8 +110,8 @@ class DistributedDialoGPT(DistributedLLM):
                         self.distributed_schedulers[nodeID].step()
                         self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     except Exception as e:
-                        # logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
-                        pass
+                        logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
+                        # pass
                     print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                     
                     if (self.setting == 'isolated') and (self._trained_tasks % self.saving_steps == 0): 
@@ -120,13 +120,14 @@ class DistributedDialoGPT(DistributedLLM):
                         for j in range(self.num_gpus_per_node):
                             torch.save(self.distributed_stages[nodeID][j].state_dict(), f"{self.ckpt_path}_stage{j}.pt")
                         # For other nodes, load the parameters from the last node
-                        for i in range(self.num_nodes - 1):
+                        # for i in range(self.num_nodes - 1):
+                        for i in self._test_nodes:
                             print(f" *** Load checkpoint for Node {i} *** ")
                             for j in range(self.num_gpus_per_node):
                                 self.distributed_stages[i][j].load_state_dict(torch.load(f"{self.ckpt_path}_stage{j}.pt"))
                                 
-                else:
-                    self.metrics["loss"].append(loss.item()) # we only compute performance for inference-only tasks
+                # else:
+                #     self.metrics["loss"].append(loss.item()) # we only compute performance for inference-only tasks
                 #     task.hiddens.append(loss)
                 #     deviceQueue.put(taskID) # put it back to the queue
 
@@ -144,15 +145,17 @@ if __name__ == '__main__':
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
+    parser.add_argument('--save_length', action='store_true', help='save the length of each task')
     parser.add_argument('--setting', type=str, default='active', choices=['active', 'interval', 'isolated'], help='training setting')
     parser.add_argument('--isolated_split', type=float, default=0, help='split ratio for isolated test and train nodes')
-    parser.add_argument('--priority', type=str, default=None, choices=['MLF', 'LLF'], help='scheduling priority')
+    parser.add_argument('--priority', type=str, default='FIFO', choices=['FIFO', 'MLF', 'LLF'], help='scheduling priority')
     parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
     parser.add_argument('--rate_lambda', type=float, default=60, help='Average number of tasks produced per minute')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
+    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     

@@ -164,11 +164,13 @@ def get_stages(
 def stages_forward(
     stages: List[Union[GPTEndingStage, LlamaEndingStage]], 
     inputs: Dict[str, Union[torch.Tensor, Any]],
+    verbose: bool = False,
 ):
     labels = inputs.get('labels', None)
     labels = labels.to(stages[-1]._device) if labels is not None else None
     for i, stage in enumerate(stages):
-        print(f"Forward pass for stage {i} on device {stage._device}")
+        if verbose:
+            print(f"Forward pass for stage {i} on device {stage._device}")
         if i == 0:
             batch_inputs = _prepare_inputs(inputs, device=stage._device)
             outputs = stage(**batch_inputs)
@@ -223,10 +225,11 @@ def _prepare_decoding_inputs(
 def stages_decoding(
     stages: List[Union[GPTEndingStage, LlamaEndingStage]], 
     inputs: Dict[str, Union[torch.Tensor, Any]],
+    verbose: bool = False,
 ):
-    # For clm, we need to mask the sentence (-100) and add to the labels
+    # For CLM, we need to mask the sentence (-100) and add to the labels
     new_inputs = _prepare_decoding_inputs(inputs)
-    return stages_forward(stages, new_inputs)
+    return stages_forward(stages, new_inputs, verbose=verbose)
 
 
 

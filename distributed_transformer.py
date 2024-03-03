@@ -220,14 +220,14 @@ class DistributedTransformer:
             
             if task.require_training:
                 # This is a retraining task
-                record_time(device, 'start', 'forward_grad', timing_info)
+                record_time(device, 'start', 'forward_grad', task.task_id, timing_info)
                 output = stage(hidden)
-                record_time(device, 'end', 'forward_grad', timing_info)
+                record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
             else:
-                record_time(device, 'start', 'forward', timing_info)
+                record_time(device, 'start', 'forward', task.task_id, timing_info)
                 with torch.no_grad():
                     output = stage(hidden)
-                record_time(device, 'end', 'forward', timing_info)
+                record_time(device, 'end', 'forward', task.task_id, timing_info)
             
             if nextdeviceQueue is None:
                 # Backprop on the last stage

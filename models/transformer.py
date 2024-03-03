@@ -135,15 +135,11 @@ def get_transformer_stages(
 def stages_forward(
     stages: List[PipelineStage], 
     inputs: Tensor, 
-    # timing_info: dict, 
-    # init_device: int = 0,
 ):
     # Forward pass
     hidden = inputs.clone()
     for i, stage in enumerate(stages):
-        # record_time(device, 'start', 'forward', timing_info)
         hidden = stage(hidden.cuda(stage.device))
-        # record_time(device, 'end', 'forward', timing_info)
     return hidden
             
         

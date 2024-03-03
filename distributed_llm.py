@@ -49,6 +49,9 @@ class DistributedLLM:
         self.workload = args.workload
         self.retraining_rate = args.retraining_rate  
         self.model_n = args.model_name
+        self.save_length = args.save_length
+        self.length_distribution = args.length_distribution
+        
         if self.setting == 'isolated':
             self.isolated_split = args.isolated_split
             setting = f"isolated-split{self.isolated_split}"
@@ -64,6 +67,8 @@ class DistributedLLM:
             print(f"** ISOLATED SYSTEM: Test nodes: {self._test_nodes}, Train nodes: {self._train_nodes} **")
         else:
             setting = self.setting
+            self._train_nodes = list(range(self.num_nodes))
+            self._test_nodes = list(range(self.num_nodes))
         
         if self.priority is not None:
             if self.load_balancing is not None:
@@ -76,6 +81,7 @@ class DistributedLLM:
             else:
                 self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
         self.user_task_record = defaultdict(dict)
+        # self.train_task_record = defaultdict(dict)
         
         # Reproducibility
         set_seed(args.seed)
@@ -152,6 +158,12 @@ class DistributedLLM:
         print(f" ** Total tasks: {self.total_tasks}, retraining tasks: {self.retraining_tasks}, saving steps: {self.saving_steps} ** ")
         self._trained_tasks = 0
         
+        # Save task length distribution for further analysis
+        if self.save_length:
+            length_dict = {taskID: task.query['input_ids'].shape[1] for taskID, task in enumerate(self.distributed_preloaded_tasks[0])}
+            with open(f"{self.output_dir}/task_length_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}.json", 'w') as f:
+                json.dump(length_dict, f, indent=4)
+        
         # Stages, opimizer, and scheduler
         self.distributed_stages = {
             nodeID: get_stages(
@@ -212,7 +224,33 @@ class DistributedLLM:
         distributed_preloaded_tasks = defaultdict(list)
         total_tasks, retraining_tasks = 0, 0
         
+        sorted_data = []
         for i, batch in enumerate(dataloader):
+            seq_length = batch['input_ids'].shape[1]
+            sorted_data.append((seq_length, batch))
+            
+        if self.length_distribution == 'ascending':
+            sorted_data.sort(key=lambda x: x[0])
+        elif self.length_distribution == 'descending':
+            sorted_data.sort(key=lambda x: x[0], reverse=True)
+        elif self.length_distribution == 'bursty': # one short one long, ...
+            sorted_data.sort(key=lambda x: x[0])
+            mid_index = len(sorted_data) // 2
+            short_data, long_data = sorted_data[:mid_index], sorted_data[mid_index:]
+            # Rearrange sentences in groups of bptt
+            tmp = []
+            bptt = 1
+            for i in range(0, max(len(short_data), len(long_data)), 1):
+                tmp.extend(short_data[i:i+bptt])
+                tmp.extend(long_data[i:i+bptt])
+            sorted_data = tmp
+        elif self.length_distribution == 'random':
+            pass
+        else:
+            raise ValueError(f"Invalid length distribution: {self.length_distribution}")
+        
+        
+        for i, (_, batch) in enumerate(sorted_data):
             # 10% of the time, produce a task with feedback
             require_training = random.random() < retraining_rate
             total_tasks += 1
@@ -245,7 +283,7 @@ class DistributedLLM:
             else:
                 raise ValueError(f"Invalid workload type: {self.workload}")
             # 10% of the time, produce a task with feedback
-            # print("Producing task {} with input query shape {}".format(taskID, self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape))
+            # print("Producing task {} with input length {}".format(taskID, task.query['input_ids'].shape[1]))
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(taskID)
             # We record and calculate the response time for each user task (no retraining)
@@ -352,23 +390,23 @@ class DistributedLLM:
         try:
             self._wait_for_device_availability(device, threshold=self.memory_threshold)
             if task.require_training: # this is a retraining task
-                record_time(device, 'start', 'forward_grad', timing_info)
+                record_time(device, 'start', 'forward_grad', task.task_id, timing_info)
                 tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
-                record_time(device, 'end', 'forward_grad', timing_info)
+                record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
             else:
                 if stageID == 0: # first stage
-                    self.user_task_record[task.task_id]['start'] = record_time(device, 'start', 'forward', timing_info)
+                    self.user_task_record[task.task_id]['start'] = record_time(device, 'start', 'forward', task.task_id, timing_info)
                 else:
-                    record_time(device, 'start', 'forward', timing_info)
+                    record_time(device, 'start', 'forward', task.task_id, timing_info)
                     
                 with torch.no_grad():
                     tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 
                 if stageID == self.num_gpus_per_node - 1: # last stage
-                    self.user_task_record[task.task_id]['end'] = record_time(device, 'end', 'forward', timing_info)
+                    self.user_task_record[task.task_id]['end'] = record_time(device, 'end', 'forward', task.task_id, timing_info)
                 else:
-                    record_time(device, 'end', 'forward', timing_info)
-                # self.user_task_record[task.task_id]['node'] = nodeID
+                    record_time(device, 'end', 'forward', task.task_id, timing_info)
+                self.user_task_record[task.task_id]['node'] = nodeID
             
         except Exception as e:
             logging.error(f"[Node {nodeID} - stage {stageID} - device {device}] Forward error occurred: {e}")
@@ -471,16 +509,7 @@ class DistributedLLM:
             # for gpu_id in gpus:
             #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
             #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            if self.priority is not None:
-                if self.load_balancing is not None:
-                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
-                else:
-                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
-            else:
-                if self.load_balancing is not None:
-                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
-                else:
-                    stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}_node{nodeID}.json'
+            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}-{self.length_distribution}_{self.retraining_rate}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
         
@@ -500,7 +529,7 @@ class DistributedLLM:
         total_idles = []
         total_latencies = []
         for nodeID, node in self.distributed_nodes.items():
-            timing_info = self.timing_infos[nodeID]
+            timing_info = {k: [[t[0], t[1]] for t in v] for k, v in self.timing_infos[nodeID].items()}
             if not timing_info:
                 continue
             
@@ -512,7 +541,7 @@ class DistributedLLM:
                 if len(starts) == 1:
                     idles = []
                 else:
-                    idles = [start - end for (start, start_label), (end, end_label) in zip(starts[1:], ends[:-1]) if (start > end)]
+                    idles = [start - end for (start, _), (end, _) in zip(starts[1:], ends[:-1]) if (start > end)]
                 total_idles.extend(idles)
                 
                 tasks = list(zip(starts, ends))
@@ -557,16 +586,7 @@ class DistributedLLM:
             
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)
-        if self.priority is not None:
-            if self.load_balancing is not None:
-                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}.json'
-            else:
-                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}.json'
-        else:
-            if self.load_balancing is not None:
-                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{setting}_{self.workload}_{self.retraining_rate}.json'
-            else:
-                stats_f = f'{self.output_dir}/metrics_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}.json'
+        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}-{self.length_distribution}_{self.retraining_rate}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}:\n{metrics}")
@@ -585,15 +605,17 @@ if __name__ == '__main__':
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
+    parser.add_argument('--save_length', action='store_true', help='save the length of each task')
     parser.add_argument('--setting', type=str, default='active', choices=['active','interval','isolated'], help='training setting')
     parser.add_argument('--isolated_split', type=float, default=0, help='split ratio for isolated test and train nodes')
-    parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
+    parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority')
     parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
     parser.add_argument('--rate_lambda', type=float, default=5, help='Average number of tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
+    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     

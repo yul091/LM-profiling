@@ -92,7 +92,7 @@ class DistributedLlama(DistributedLLM):
                     # Backprop on the last stage
                     try:
                         loss.backward()
-                        record_time(init_device, 'end', 'backward', timing_info)
+                        record_time(init_device, 'end', 'backward', taskID, timing_info)
                     except Exception as e:
                         # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                         pass

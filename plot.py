@@ -15,6 +15,7 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     retraining_rate = args.retraining_rate
     model_name = args.model_name
     load_balancing = args.load_balancing
+    length_distribution = args.length_distribution
     if setting == 'isolated':
         isolated_split = args.isolated_split
         setting = f"isolated-split{isolated_split}"
@@ -25,16 +26,8 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     elif node is None:
         stats_f = f'{output_dir}/timing_info_{model_name}_{setting}.json'
     else:
-        if priority is not None:
-            if load_balancing is not None:
-                stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
-            else:
-                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
-        else:
-            if load_balancing is not None:
-                stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}_{workload}_{retraining_rate}_node{node}.json'
-            else:
-                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json'
+        stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_distribution}_{retraining_rate}_node{node}.json'
+
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
 
@@ -89,15 +82,6 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
         for start_label in latencies.keys():
             if start_label == 'backward' and gpu_id != num_gpus - 1:
                 continue
-            # print(f'\t{start_label} latency statistics: ' + 
-            #      f'mean {np.mean(latencies[start_label])}, ' +
-            #      f'var {np.var(latencies[start_label])}, ' +
-            #      f'median {np.median(latencies[start_label])}')
-        
-        # total_idles = sum(idles)
-        # print(f'\tTotal latency: {max_t - min_t}')
-        # print(f'\tTotal idle time: {total_idles}')
-        # print(f'\tRubble rate: {total_idles / (max_t - min_t)}')
 
     # Set plot labels and grid
     ax.set_xlabel('Time (s)')
@@ -126,9 +110,10 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default='dialogpt', help='model name')
     parser.add_argument('--setting', type=str, default='active', help='workload setting')
     parser.add_argument('--isolated_split', type=float, default=0, help='split ratio for isolated test and train nodes')
-    parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
+    parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority')
     parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
+    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
     parser.add_argument('--node', type=int, default=1, help='number of nodes for distributed systems')
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
     parser.add_argument('--test_asyncio', action='store_true')
@@ -142,23 +127,15 @@ if __name__ == '__main__':
     model_name = args.model_name
     retraining_rate = args.retraining_rate
     load_balancing = args.load_balancing
+    length_distribution = args.length_distribution
     if setting == 'isolated':
         isolated_split = args.isolated_split
         setting = f"isolated-split{isolated_split}"
     
-    
     for node in range(args.node):
         # Load timing information
-        if priority is not None:
-            if load_balancing is not None:
-                stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
-            else:
-                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}-{priority}_{workload}_{retraining_rate}_node{node}.json'
-        else:
-            if load_balancing is not None:
-                stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}_{workload}_{retraining_rate}_node{node}.json'
-            else:
-                stats_f = f'{output_dir}/timing_info_{model_name}_{setting}_{workload}_{retraining_rate}_node{node}.json'
+        stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_distribution}_{retraining_rate}_node{node}.json'
+
         with open(stats_f, 'r') as f:
             timing_info = json.load(f)
         if not timing_info:
@@ -176,13 +153,4 @@ if __name__ == '__main__':
         ax = axes[node] if args.node > 1 else axes
         plot_mix(args, ax, node, start_time)
     plt.tight_layout()
-    if priority is not None:
-        if load_balancing is not None:
-            plt.savefig(f"{output_dir}/{model_name}_{load_balancing}_{setting}-{priority}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300)
-        else:
-            plt.savefig(f"{output_dir}/{model_name}_{setting}-{priority}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300)
-    else:
-        if load_balancing is not None:
-            plt.savefig(f"{output_dir}/{model_name}_{load_balancing}_{setting}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300)
-        else:
-            plt.savefig(f"{output_dir}/{model_name}_{setting}_{workload}_{retraining_rate}.png", bbox_inches='tight', dpi=300) 
+    plt.savefig(f"{output_dir}/{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_distribution}_{retraining_rate}.png", bbox_inches='tight', dpi=300)

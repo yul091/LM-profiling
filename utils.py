@@ -78,12 +78,13 @@ def record_time(
     device: int, 
     event_type: str, 
     opt_type: str, 
+    taskID: int,
     timing_info: Dict[str, List[float]], 
     verbose: bool = False,
 ) -> float:
     # event_type can be 'start' or 'end'
     timestamp = time.time()
-    timing_info[f"{device}_{event_type}"].append((timestamp, opt_type))
+    timing_info[f"{device}_{event_type}"].append((timestamp, opt_type, taskID))
     if verbose:
         print(f"\t[CUDA {device}] Task {event_type} at time {timestamp}")
     return timestamp
