@@ -95,6 +95,8 @@ class DistributedDialoGPT(DistributedLLM):
                 self.metrics["loss"].append(loss.item())
                 
                 if task.require_training:
+                    # # Synchronize to ensure all previous operations on the GPU are completed
+                    # torch.cuda.synchronize(device)
                     # Backprop on the last stage
                     try:
                         loss.backward()

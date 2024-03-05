@@ -7,10 +7,10 @@ MEMORY_THRESHOLD=0.5
 SETTING=isolated
 for NUM_NODES in 4; do
     for MODEL_NAME in "DialoGPT-large"; do
-        for RATE_LAMBDA in 20; do
+        for RATE_LAMBDA in 50; do
             OUTPUT_DIR=prof/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
-            for RETRAIN_RATE in 1.0; do
-                for ISOLATED_SPLIT in 0; do
+            for RETRAIN_RATE in 0.2; do
+                for ISOLATED_SPLIT in -1.0; do
                     python distributed_dialogpt.py \
                         --model_name_or_path "microsoft/$MODEL_NAME" \
                         --model_name $MODEL_NAME \

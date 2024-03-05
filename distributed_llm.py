@@ -372,9 +372,14 @@ class DistributedLLM:
         - check_interval: How often to check the device status (in seconds).
         - threshold: The maximum allowed memory utilization ratio.
         """
+        wait_count = 0
         while not self._check_device_availability(device, threshold):
-            print(f"Waiting for device {device} to become available...")
+            # print(f"Waiting for device {device} to become available...")
             time.sleep(check_interval)
+            wait_count += 1
+            if wait_count > 100:
+                print(f"Device {device} is not available after waiting for {wait_count * check_interval} seconds")
+                break
 
             
     def forward(
