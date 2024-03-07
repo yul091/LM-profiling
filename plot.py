@@ -17,7 +17,7 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     load_balancing = args.load_balancing
     length_distribution = args.length_distribution
     if setting == 'isolated':
-        isolated_split = args.isolated_split
+        isolated_split = args.isolated_split if args.isolated_split is not None else retraining_rate
         setting = f"isolated-split{isolated_split}"
     
     # Load timing information
@@ -109,7 +109,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--model_name', type=str, default='dialogpt', help='model name')
     parser.add_argument('--setting', type=str, default='active', help='workload setting')
-    parser.add_argument('--isolated_split', type=float, default=0, help='split ratio for isolated test and train nodes')
+    parser.add_argument('--isolated_split', type=float, default=None, help='split ratio for isolated test and train nodes')
     parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority')
     parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
@@ -129,7 +129,7 @@ if __name__ == '__main__':
     load_balancing = args.load_balancing
     length_distribution = args.length_distribution
     if setting == 'isolated':
-        isolated_split = args.isolated_split
+        isolated_split = args.isolated_split if args.isolated_split is not None else retraining_rate
         setting = f"isolated-split{isolated_split}"
     
     for node in range(args.node):

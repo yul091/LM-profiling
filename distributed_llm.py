@@ -40,6 +40,8 @@ class DistributedLLM:
         self.setting = args.setting
         self.priority = args.priority
         self.num_nodes = args.num_nodes
+        if self.num_nodes < 2:
+            raise ValueError(f"At least 2 nodes are required! Current number of nodes: {self.num_nodes}")
         self.batch_size = args.batch_size
         self.rate_lambda = args.rate_lambda
         self.output_dir = args.output_dir
@@ -53,17 +55,13 @@ class DistributedLLM:
         self.length_distribution = args.length_distribution
         
         if self.setting == 'isolated':
-            self.isolated_split = args.isolated_split
+            self.isolated_split = args.isolated_split if args.isolated_split is not None else self.retraining_rate
             setting = f"isolated-split{self.isolated_split}"
-            if self.isolated_split > 0:
-                self._test_nodes = list(range(int(self.num_nodes * self.isolated_split)))
-                self._train_nodes = list(range(int(self.num_nodes * self.isolated_split), self.num_nodes))
-            elif self.isolated_split == 0:
-                self._test_nodes = list(range(self.num_nodes - 1))
-                self._train_nodes = [self.num_nodes - 1]
-            else:
-                self._test_nodes = [0]
-                self._train_nodes = list(range(1, self.num_nodes))
+            
+            num_train_nodes = max(1, int(self.num_nodes * self.isolated_split))
+            num_test_nodes = max(1, self.num_nodes - num_train_nodes)
+            self._test_nodes = list(range(num_test_nodes))
+            self._train_nodes = list(range(num_test_nodes, self.num_nodes))
             print(f"** ISOLATED SYSTEM: Test nodes: {self._test_nodes}, Train nodes: {self._train_nodes} **")
         else:
             setting = self.setting
@@ -623,7 +621,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--save_length', action='store_true', help='save the length of each task')
     parser.add_argument('--setting', type=str, default='active', choices=['active','interval','isolated'], help='training setting')
-    parser.add_argument('--isolated_split', type=float, default=0, help='split ratio for isolated test and train nodes')
+    parser.add_argument('--isolated_split', type=float, default=None, help='split ratio for isolated test and train nodes')
     parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority')
     parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
