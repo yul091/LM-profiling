@@ -17,8 +17,9 @@ from models import (
 
 # torch.autograd.set_detect_anomaly(True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
- 
 
+
+        
 class DistributedLlama(DistributedLLM):
     
     def __init__(self, args: argparse.Namespace):
@@ -89,6 +90,8 @@ class DistributedLlama(DistributedLLM):
                 self.metrics["loss"].append(loss.item())
                 
                 if task.require_training:
+                    # # Synchronize to ensure all previous operations on the GPU are completed
+                    # torch.cuda.synchronize(device)
                     # Backprop on the last stage
                     try:
                         loss.backward()
@@ -104,8 +107,8 @@ class DistributedLlama(DistributedLLM):
                         self.distributed_schedulers[nodeID].step()
                         self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     except Exception as e:
-                        # logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
-                        pass
+                        logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
+                        # pass
                     print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                     
                     if (self.setting == 'isolated') and (self._trained_tasks % self.saving_steps == 0): 
@@ -114,12 +117,14 @@ class DistributedLlama(DistributedLLM):
                         for j in range(self.num_gpus_per_node):
                             torch.save(self.distributed_stages[nodeID][j].state_dict(), f"{self.ckpt_path}_stage{j}.pt")
                         # For other nodes, load the parameters from the last node
-                        for i in range(self.num_nodes - 1):
+                        # for i in range(self.num_nodes - 1):
+                        for i in self._test_nodes:
                             print(f" *** Load checkpoint for Node {i} *** ")
                             for j in range(self.num_gpus_per_node):
                                 self.distributed_stages[i][j].load_state_dict(torch.load(f"{self.ckpt_path}_stage{j}.pt"))
                                 
                 # else:
+                #     self.metrics["loss"].append(loss.item()) # we only compute performance for inference-only tasks
                 #     task.hiddens.append(loss)
                 #     deviceQueue.put(taskID) # put it back to the queue
 
@@ -130,26 +135,27 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_name_or_path', type=str, default='data/Anthropic', help='dataset name')
-    parser.add_argument('--model_name_or_path', type=str, default='meta-llama/Llama-2-7b-chat-hf', help='model name or path')
-    parser.add_argument('--model_name', type=str, default='llama2-7b', help='model name')
+    parser.add_argument('--model_name_or_path', type=str, default='microsoft/DialoGPT-small', help='model name or path')
+    parser.add_argument('--model_name', type=str, default='dialogpt', help='model name')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--memory_threshold', type=float, default=0.8, help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
-    parser.add_argument('--setting', type=str, default='active', choices=['active','interval','isolated'], help='training setting')
+    parser.add_argument('--save_length', action='store_true', help='save the length of each task')
+    parser.add_argument('--setting', type=str, default='active', choices=['active', 'interval', 'isolated'], help='training setting')
     parser.add_argument('--isolated_split', type=float, default=0, help='split ratio for isolated test and train nodes')
-    parser.add_argument('--priority', type=str, default=None, help='scheduling priority')
+    parser.add_argument('--priority', type=str, default='FIFO', choices=['FIFO', 'MLF', 'LLF'], help='scheduling priority')
     parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
-    parser.add_argument('--rate_lambda', type=float, default=60, help='Average number of tasks produced per minute')
-    parser.add_argument('--workload', type=str, default='poisson', choices=['poisson','all'], help='workload arrival pattern')
+    parser.add_argument('--rate_lambda', type=float, default=None, help='Average number of tasks produced per minute')
+    parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
+    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     
     distributed_llm = DistributedLlama(args)
     distributed_llm.run()
-
     

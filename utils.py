@@ -60,6 +60,7 @@ class Task:
         self, 
         task_id: int, 
         query: Union[torch.Tensor, Dict[str, Any]], 
+        rate_lambda: float,
         feedback: Optional[torch.Tensor] = None, 
         node_id: Optional[int] = None, 
         num_gpus_per_node: Optional[int] = None,
@@ -67,6 +68,7 @@ class Task:
     ):
         self.task_id = task_id
         self.query = query
+        self.rate_lambda = rate_lambda
         num_gpus_per_node = num_gpus_per_node if num_gpus_per_node is not None else 1
         self.hiddens = [query] + [None for _ in range(num_gpus_per_node - 1)]
         self.feedback = feedback

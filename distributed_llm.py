@@ -249,6 +249,16 @@ class DistributedLLM:
         else:
             raise ValueError(f"Invalid length distribution: {self.length_distribution}")
         
+        if self.rate_lambda is None:
+            # Assign lambda 50, 30, 10 in the first 1/3, second 1/3, last 1/3 of the data
+            lambda_values = []
+            for i in range(len(sorted_data)):
+                if i < len(sorted_data) // 3:
+                    lambda_values.append(50)
+                elif i < 2 * len(sorted_data) // 3:
+                    lambda_values.append(30)
+                else:
+                    lambda_values.append(10)
         
         for i, (_, batch) in enumerate(sorted_data):
             # 10% of the time, produce a task with feedback
@@ -259,6 +269,7 @@ class DistributedLLM:
             for nodeID, node in distributed_nodes.items():
                 task = Task(
                     task_id=i,
+                    rate_lambda=lambda_values[i] if self.rate_lambda is None else self.rate_lambda,
                     query=_prepare_inputs(batch, device=node.init_device),
                     feedback=_prepare_inputs(batch['labels'], device=node.last_device),
                     node_id=nodeID,
@@ -277,7 +288,7 @@ class DistributedLLM:
         # Produce using the dataset
         for taskID, task in enumerate(self.distributed_preloaded_tasks[0]):
             if self.workload == 'poisson':
-                time.sleep(random.expovariate(self.rate_lambda))
+                time.sleep(random.expovariate(task.rate_lambda))
             elif self.workload == 'all':
                 time.sleep(0)
             else:
@@ -618,7 +629,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
-    parser.add_argument('--rate_lambda', type=float, default=5, help='Average number of tasks produced per second')
+    parser.add_argument('--rate_lambda', type=float, default=None, help='Average number of tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
     parser.add_argument('--output_dir', type=str, default='prof')
