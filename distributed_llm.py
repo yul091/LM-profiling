@@ -58,7 +58,7 @@ class DistributedLLM:
             self.isolated_split = args.isolated_split if args.isolated_split is not None else self.retraining_rate
             setting = f"isolated-split{self.isolated_split}"
             
-            num_train_nodes = max(1, int(self.num_nodes * self.isolated_split))
+            num_train_nodes = max(1, round(self.num_nodes * self.isolated_split))
             num_test_nodes = max(1, self.num_nodes - num_train_nodes)
             self._test_nodes = list(range(num_test_nodes))
             self._train_nodes = list(range(num_test_nodes, self.num_nodes))
