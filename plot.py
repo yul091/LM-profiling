@@ -16,6 +16,8 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     model_name = args.model_name
     load_balancing = args.load_balancing
     length_distribution = args.length_distribution
+    length_heterogeneity = f"_hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "_hetero_default"
+    active_selection = f"_active{args.active_selection}" if args.active_selection is not None else "_active_1.0"
     if setting == 'isolated':
         isolated_split = args.isolated_split if args.isolated_split is not None else retraining_rate
         setting = f"isolated-split{isolated_split}"
@@ -26,7 +28,7 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     elif node is None:
         stats_f = f'{output_dir}/timing_info_{model_name}_{setting}.json'
     else:
-        stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_distribution}_{retraining_rate}_node{node}.json'
+        stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
 
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
@@ -116,6 +118,8 @@ if __name__ == '__main__':
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
     parser.add_argument('--node', type=int, default=1, help='number of nodes for distributed systems')
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
+    parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
+    parser.add_argument('--active_selection', type=float, default=None, help='active selection ratio for training tasks')
     parser.add_argument('--test_asyncio', action='store_true')
     args = parser.parse_args()
     
@@ -128,13 +132,15 @@ if __name__ == '__main__':
     retraining_rate = args.retraining_rate
     load_balancing = args.load_balancing
     length_distribution = args.length_distribution
+    length_heterogeneity = f"_hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "_hetero_default"
+    active_selection = f"_active{args.active_selection}" if args.active_selection is not None else "_active_1.0"
     if setting == 'isolated':
         isolated_split = args.isolated_split if args.isolated_split is not None else retraining_rate
         setting = f"isolated-split{isolated_split}"
     
     for node in range(args.node):
         # Load timing information
-        stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_distribution}_{retraining_rate}_node{node}.json'
+        stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
 
         with open(stats_f, 'r') as f:
             timing_info = json.load(f)
@@ -153,4 +159,4 @@ if __name__ == '__main__':
         ax = axes[node] if args.node > 1 else axes
         plot_mix(args, ax, node, start_time)
     plt.tight_layout()
-    plt.savefig(f"{output_dir}/{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_distribution}_{retraining_rate}.png", bbox_inches='tight', dpi=300)
+    plt.savefig(f"{output_dir}/{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}.png", bbox_inches='tight', dpi=300)

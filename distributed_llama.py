@@ -154,6 +154,8 @@ if __name__ == '__main__':
     parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
+    parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
+    parser.add_argument('--active_selection', type=float, default=None, help='active selection ratio for training tasks')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     

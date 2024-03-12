@@ -3,11 +3,13 @@ import sys
 sys.dont_write_bytecode = True
 import pdb
 import time
+import math
 import json
 import queue
 import random
 import argparse
 import logging
+import numpy as np
 from tqdm import tqdm
 from typing import List, Dict, Optional, Any, Union, Tuple
 from collections import defaultdict
@@ -36,7 +38,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 class DistributedLLM:
 
     def __init__(self, args: argparse.Namespace):
-        n_samples = args.n_samples
+        self.n_samples = args.n_samples
         self.setting = args.setting
         self.priority = args.priority
         self.num_nodes = args.num_nodes
@@ -54,6 +56,8 @@ class DistributedLLM:
         self.model_n = args.model_name
         self.save_length = args.save_length
         self.length_distribution = args.length_distribution
+        self.length_heterogeneity = args.length_heterogeneity
+        self.active_selection = args.active_selection
         
         if self.setting == 'isolated':
             self.isolated_split = args.isolated_split if args.isolated_split is not None else self.retraining_rate
@@ -122,19 +126,13 @@ class DistributedLLM:
         
         # Load datasets and dataloaders
         datasets = load_dataset(self.dataset_name_or_path)
-        train_dataset = datasets['train']
+        # train_dataset = datasets['train']
         test_dataset = datasets['test']
-        if n_samples > 0:
-            n_samples = min(n_samples, len(train_dataset), len(test_dataset))
-            indices = random.sample(range(len(train_dataset)), n_samples)
-            train_dataset = train_dataset.select(indices)
-            indices = random.sample(range(len(test_dataset)), n_samples)
-            test_dataset = test_dataset.select(indices)
         
-        self.train_dataset = train_dataset.map(
-            self._tokenize_and_align_labels,
-            batched=True,
-        ).remove_columns(datasets['train'].column_names)
+        # self.train_dataset = train_dataset.map(
+        #     self._tokenize_and_align_labels,
+        #     batched=True,
+        # ).remove_columns(datasets['train'].column_names)
         self.test_dataset = test_dataset.map(
             self._tokenize_and_align_labels,
             batched=True,
@@ -207,6 +205,27 @@ class DistributedLLM:
         tokenized_inputs['labels'] = labels['input_ids']
         # tokenized_inputs['labels_attention_mask'] = labels['attention_mask']
         return tokenized_inputs
+    
+    
+    def _sample_subset_indices(self, numbers: List[int], K: int, mu: float, std: float) -> List[int]:
+        # Create an empty list to store the selected numbers
+        selected_numbers = []
+        numbers_set = set(numbers)
+
+        # We draw K samples from the normal distribution
+        for _ in range(K):
+            sample = np.random.normal(mu, std)
+            if sample in numbers_set:
+                # selected_numbers.append(sample)
+                # append the index of the sampled number
+                selected_numbers.append(numbers.index(sample))
+            else:
+                # Find the number in 'numbers' that is closest to the sampled number
+                closest_number = min(numbers_set, key=lambda x: abs(x - sample))
+                # selected_numbers.append(closest_number)
+                selected_numbers.append(numbers.index(closest_number))
+
+        return selected_numbers
 
         
     def get_preloaded_dataset(
@@ -248,16 +267,26 @@ class DistributedLLM:
         else:
             raise ValueError(f"Invalid length distribution: {self.length_distribution}")
         
-        # if self.rate_lambda is None:
-        #     # Assign lambda 50, 30, 10 in the first 1/3, second 1/3, last 1/3 of the data
-        #     lambda_values = []
-        #     for i in range(len(sorted_data)):
-        #         if i < len(sorted_data) // 3:
-        #             lambda_values.append(50)
-        #         elif i < 2 * len(sorted_data) // 3:
-        #             lambda_values.append(30)
-        #         else:
-        #             lambda_values.append(10)
+        # Do sampling according to the length distribution
+        lengths = [x[0] for x in sorted_data]
+        mean, std = np.mean(lengths), np.std(lengths)
+        print(" ** Original data length distribution: mean={}, std={} **".format(mean, std))
+        
+        if self.n_samples > 0:
+            n_samples = min(math.ceil(self.n_samples / self.batch_size), len(sorted_data))
+            if self.length_heterogeneity is None:
+                sorted_data = random.sample(sorted_data, n_samples)
+            else:
+                indices = self._sample_subset_indices(lengths, n_samples, mean, self.length_heterogeneity)
+                sorted_data = [sorted_data[i] for i in indices]
+            # indices = random.sample(range(len(train_dataset)), n_samples)
+            # train_dataset = train_dataset.select(indices)
+            # indices = random.sample(range(len(test_dataset)), n_samples)
+            # test_dataset = test_dataset.select(indices)
+            lengths = [x[0] for x in sorted_data]
+            mean, std = np.mean(lengths), np.std(lengths)
+            print(f" ** Sampled {len(sorted_data)} data points: mean={mean}, std={std} **")
+            
         
         for i, (_, batch) in enumerate(sorted_data):
             # 10% of the time, produce a task with feedback
@@ -519,13 +548,15 @@ class DistributedLLM:
         else:
             setting = self.setting
         
+        length_heterogeneity = f"_hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "_hetero_default"
+        active_selection = f"_active{self.active_selection}" if self.active_selection is not None else "_active_1.0"
         for nodeID, timing_info in self.timing_infos.items():
             # # Remove the first start and end time for each GPU
             # gpus = list(set(int(key.split('_')[0]) for key in timing_info))
             # for gpu_id in gpus:
             #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
             #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}-{self.length_distribution}_{self.retraining_rate}_node{nodeID}.json'
+            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
         
@@ -602,7 +633,9 @@ class DistributedLLM:
             
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)
-        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}-{self.length_distribution}_{self.retraining_rate}.json'
+        length_heterogeneity = f"_hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "_hetero_default"
+        active_selection = f"_active{self.active_selection}" if self.active_selection is not None else "_active_1.0"
+        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}:\n{metrics}")
@@ -633,6 +666,8 @@ if __name__ == '__main__':
     parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
+    parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
+    parser.add_argument('--active_selection', type=float, default=None, help='active selection ratio for training tasks')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     

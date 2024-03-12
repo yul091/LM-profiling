@@ -2,6 +2,7 @@ import os
 import sys
 sys.dont_write_bytecode = True
 import queue
+import random
 import argparse
 import pdb
 from typing import List, Dict, Optional, Any, Union
@@ -98,23 +99,29 @@ class DistributedDialoGPT(DistributedLLM):
                     # # Synchronize to ensure all previous operations on the GPU are completed
                     # torch.cuda.synchronize(device)
                     # Backprop on the last stage
-                    try:
-                        loss.backward()
-                        record_time(init_device, 'end', 'backward', taskID, timing_info)
-                    except Exception as e:
-                        # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
-                        pass
-                    self._trained_tasks += 1
+                    do_backward = True
+                    if self.active_selection is not None:
+                        do_backward = random.random() < self.active_selection
                     
-                    # Optimization
-                    try:
-                        self.distributed_optimizers[nodeID].step()
-                        self.distributed_schedulers[nodeID].step()
-                        self.distributed_optimizers[nodeID].zero_grad() # clear gradients
-                    except Exception as e:
-                        logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
-                        # pass
-                    print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                    if do_backward:
+                        try:
+                            loss.backward()
+                            record_time(init_device, 'end', 'backward', taskID, timing_info)
+                        except Exception as e:
+                            # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
+                            pass
+                        self._trained_tasks += 1
+                        
+                        # Optimization
+                        try:
+                            self.distributed_optimizers[nodeID].step()
+                            self.distributed_schedulers[nodeID].step()
+                        except Exception as e:
+                            logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
+                            # pass
+                        print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                    
+                    self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     
                     if (self.setting == 'isolated') and (self._trained_tasks % self.saving_steps == 0): 
                         # Save the parameters of stages in the last node and load them in other nodes
@@ -159,6 +166,8 @@ if __name__ == '__main__':
     parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
+    parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
+    parser.add_argument('--active_selection', type=float, default=None, help='active selection ratio for training tasks')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     
