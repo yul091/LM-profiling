@@ -133,10 +133,30 @@ class DistributedLLM:
         #     self._tokenize_and_align_labels,
         #     batched=True,
         # ).remove_columns(datasets['train'].column_names)
-        self.test_dataset = test_dataset.map(
+        test_dataset = test_dataset.map(
             self._tokenize_and_align_labels,
             batched=True,
         ).remove_columns(datasets['train'].column_names)
+        
+        # Do sampling according to the length distribution
+        input_lengths = [len(x) for x in test_dataset['input_ids']]
+        self.mean_length, self.std_length, self.medium_length, self.min_length, self.max_length = np.mean(input_lengths), np.std(input_lengths), np.median(input_lengths), min(input_lengths), max(input_lengths)
+        print(" ** Original data length distribution: mean={}, std={}, medium={}, min={}, max={} **".format(
+            self.mean_length, self.std_length, self.medium_length, self.min_length, self.max_length))
+        if self.n_samples > 0:
+            n_samples = min(self.n_samples, len(input_lengths))
+            if self.length_heterogeneity is None:
+                indices = random.sample(range(len(input_lengths)), n_samples)
+                test_dataset = test_dataset.select(indices)
+            else:
+                indices = self._sample_subset_indices(input_lengths, n_samples, self.mean_length, self.length_heterogeneity)
+                test_dataset = test_dataset.select(indices)
+  
+            subset_lengths = [len(x) for x in test_dataset['input_ids']]
+            self.mean_length, self.std_length, self.medium_length, self.min_length, self.max_length = np.mean(subset_lengths), np.std(subset_lengths), np.median(subset_lengths), min(subset_lengths), max(subset_lengths)
+            print(f" ** Sampled {len(subset_lengths)} data points: mean={self.mean_length}, std={self.std_length}, medium={self.medium_length}, min={self.min_length}, max={self.max_length} **")
+        
+        self.test_dataset = test_dataset
     
         # self.train_dataloader = self.get_dataloader(dataset=self.train_dataset)
         self.test_dataloader = DataLoader(
@@ -207,25 +227,33 @@ class DistributedLLM:
         return tokenized_inputs
     
     
-    def _sample_subset_indices(self, numbers: List[int], K: int, mu: float, std: float) -> List[int]:
+    def _sample_subset_indices(self, input_lengths: List[int], K: int, mu: float, std: float) -> List[int]:
         # Create an empty list to store the selected numbers
-        selected_numbers = []
-        numbers_set = set(numbers)
+        selected_ids = set()
+        lengths_dict = {} # {length: [idx1, idx2, ...]}
+        for idx, length in enumerate(input_lengths):
+            if length not in lengths_dict:
+                lengths_dict[length] = [idx]
+            else:
+                lengths_dict[length].append(idx)
 
         # We draw K samples from the normal distribution
         for _ in range(K):
             sample = np.random.normal(mu, std)
-            if sample in numbers_set:
-                # selected_numbers.append(sample)
-                # append the index of the sampled number
-                selected_numbers.append(numbers.index(sample))
+            if sample in lengths_dict:
+                selected_ids.add(lengths_dict[sample][0])
+                lengths_dict[sample].pop(0) # pop the selected index
+                if len(lengths_dict[sample]) == 0:
+                    del lengths_dict[sample]
             else:
                 # Find the number in 'numbers' that is closest to the sampled number
-                closest_number = min(numbers_set, key=lambda x: abs(x - sample))
-                # selected_numbers.append(closest_number)
-                selected_numbers.append(numbers.index(closest_number))
-
-        return selected_numbers
+                closest_number = min(list(lengths_dict.keys()), key=lambda x: abs(x - sample))
+                selected_ids.add(lengths_dict[closest_number][0])
+                lengths_dict[closest_number].pop(0)
+                if len(lengths_dict[closest_number]) == 0:
+                    del lengths_dict[closest_number]
+            
+        return selected_ids
 
         
     def get_preloaded_dataset(
@@ -242,53 +270,34 @@ class DistributedLLM:
         distributed_preloaded_tasks = defaultdict(list)
         total_tasks, retraining_tasks = 0, 0
         
-        sorted_data = []
+        selected_data = []
         for i, batch in enumerate(dataloader):
             seq_length = batch['input_ids'].shape[1]
-            sorted_data.append((seq_length, batch))
+            selected_data.append((seq_length, batch))
             
+        # Define the order of arrival input sequence length
         if self.length_distribution == 'ascending':
-            sorted_data.sort(key=lambda x: x[0])
+            selected_data.sort(key=lambda x: x[0])
         elif self.length_distribution == 'descending':
-            sorted_data.sort(key=lambda x: x[0], reverse=True)
+            selected_data.sort(key=lambda x: x[0], reverse=True)
         elif self.length_distribution == 'bursty': # one short one long, ...
-            sorted_data.sort(key=lambda x: x[0])
-            mid_index = len(sorted_data) // 2
-            short_data, long_data = sorted_data[:mid_index], sorted_data[mid_index:]
+            selected_data.sort(key=lambda x: x[0])
+            mid_index = len(selected_data) // 2
+            short_data, long_data = selected_data[:mid_index], selected_data[mid_index:]
             # Rearrange sentences in groups of bptt
             tmp = []
             bptt = 1
             for i in range(0, max(len(short_data), len(long_data)), 1):
                 tmp.extend(short_data[i:i+bptt])
                 tmp.extend(long_data[i:i+bptt])
-            sorted_data = tmp
+            selected_data = tmp
         elif self.length_distribution == 'random':
             pass
         else:
             raise ValueError(f"Invalid length distribution: {self.length_distribution}")
-        
-        # Do sampling according to the length distribution
-        lengths = [x[0] for x in sorted_data]
-        mean, std = np.mean(lengths), np.std(lengths)
-        print(" ** Original data length distribution: mean={}, std={} **".format(mean, std))
-        
-        if self.n_samples > 0:
-            n_samples = min(math.ceil(self.n_samples / self.batch_size), len(sorted_data))
-            if self.length_heterogeneity is None:
-                sorted_data = random.sample(sorted_data, n_samples)
-            else:
-                indices = self._sample_subset_indices(lengths, n_samples, mean, self.length_heterogeneity)
-                sorted_data = [sorted_data[i] for i in indices]
-            # indices = random.sample(range(len(train_dataset)), n_samples)
-            # train_dataset = train_dataset.select(indices)
-            # indices = random.sample(range(len(test_dataset)), n_samples)
-            # test_dataset = test_dataset.select(indices)
-            lengths = [x[0] for x in sorted_data]
-            mean, std = np.mean(lengths), np.std(lengths)
-            print(f" ** Sampled {len(sorted_data)} data points: mean={mean}, std={std} **")
             
-        
-        for i, (_, batch) in enumerate(sorted_data):
+        # Create preloaded tasks with each one on a specific CUDA device
+        for i, (_, batch) in enumerate(selected_data):
             # 10% of the time, produce a task with feedback
             require_training = random.random() < retraining_rate
             total_tasks += 1
@@ -602,32 +611,48 @@ class DistributedLLM:
                     
         bubble_rate = sum(total_idles) / sum(total_latencies) if sum(total_latencies) > 0 else 0
         for key, value in metrics.items():
+            if key == 'loss':
+                losses = value
             metrics[key] = sum(value) / len(value)
-            
+        
+        metrics['losses'] = losses
         # Calculate response times
         metrics['num_tasks'] = self.total_tasks
         metrics['retrain_tasks'] = self.retraining_tasks
         metrics['actual_retrained_tasks'] = self._trained_tasks
         metrics['user_tasks'] = len(self.user_task_record)
         metrics['bubble_rate'] = bubble_rate 
-        metrics['idles'] = sum(total_idles)
-        metrics['avg_idles'] = sum(total_idles) / len(total_idles)
+        metrics['idles'] = total_idles
+        metrics['idles_sum'] = sum(total_idles)
+        metrics['idles_avg'] = sum(total_idles) / len(total_idles)
         metrics['end2end_latency'] = global_max_time - global_min_time
         metrics['throughput'] = self.total_tasks / (global_max_time - global_min_time)
+        metrics['length_statistics'] = {
+            'mean': self.mean_length,
+            'std': self.std_length,
+            'medium': self.medium_length,
+            'min': self.min_length,
+            'max': self.max_length,
+        }
         
         if self.user_task_record:
-            total_response_time, total_wait_time, total_inference_time = 0, 0, 0
+            # total_response_time, total_wait_time, total_inference_time = 0, 0, 0
+            response_times, wait_times, latencies = [], [], []
             user_global_min_time, user_global_max_time = float('inf'), float('-inf')
             for taskID, record_dict in self.user_task_record.items():
-                total_response_time += record_dict['end'] - record_dict['release']
-                total_wait_time += record_dict['start'] - record_dict['release']
-                total_inference_time += record_dict['end'] - record_dict['start']
+                # total_response_time += record_dict['end'] - record_dict['release']
+                # total_wait_time += record_dict['start'] - record_dict['release']
+                # total_inference_time += record_dict['end'] - record_dict['start']
                 user_global_min_time = min(user_global_min_time, record_dict['start'])
                 user_global_max_time = max(user_global_max_time, record_dict['end'])
+                response_times.append(record_dict['end'] - record_dict['release'])
+                wait_times.append(record_dict['start'] - record_dict['release'])
+                latencies.append(record_dict['end'] - record_dict['start'])
                 
-            metrics['user_wait'] = total_wait_time / len(self.user_task_record)
-            metrics['user_inference'] = total_inference_time / len(self.user_task_record)
-            metrics['user_response'] = total_response_time / len(self.user_task_record)
+            metrics['user_wait_avg'] = sum(wait_times) / len(self.user_task_record)
+            metrics['user_inference_avg'] = sum(latencies) / len(self.user_task_record)
+            metrics['user_response_avg'] = sum(response_times) / len(self.user_task_record)
+            metrics['user_responses'] = response_times
             metrics['user_end2end_latency'] = user_global_max_time - user_global_min_time
             metrics['user_throughput'] = len(self.user_task_record) / (user_global_max_time - user_global_min_time)
             
@@ -638,7 +663,7 @@ class DistributedLLM:
         stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
-        print(f"Metrics saved to {stats_f}:\n{metrics}")
+        print(f"Metrics saved to {stats_f}")
 
     
     
@@ -649,25 +674,32 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_name_or_path', type=str, default='data/Anthropic', help='dataset name')
     parser.add_argument('--model_name_or_path', type=str, help='model name or path')
     parser.add_argument('--model_name', type=str, default='dummy', help='model name')
-    parser.add_argument('--memory_threshold', type=float, default=0.8, help='threshold for maximum memory allocation in each GPU device')
+    parser.add_argument('--memory_threshold', type=float, default=0.5, 
+                        help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--save_length', action='store_true', help='save the length of each task')
-    parser.add_argument('--setting', type=str, default='active', choices=['active','interval','isolated'], help='training setting')
-    parser.add_argument('--isolated_split', type=float, default=None, help='split ratio for isolated test and train nodes')
-    parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority')
-    parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
+    parser.add_argument('--setting', type=str, default='active', choices=['active','interval','isolated'], 
+                        help='training setting')
+    parser.add_argument('--isolated_split', type=float, default=None, 
+                        help='split ratio for isolated test & train nodes. If not provided, the retraining rate is used.')
+    parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority, default: FIFO')
+    parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], 
+                        help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
-    parser.add_argument('--retraining_rate', type=float, default=0.1)
+    parser.add_argument('--retraining_rate', type=float, default=0.1, help='proportion of training tasks')
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
-    parser.add_argument('--train_lambda', type=int, default=50, help='Average number of training tasks produced per second')
+    parser.add_argument('--train_lambda', type=int, default=10, help='Average number of training tasks produced per second')
     parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
-    parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
-    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
-    parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=float, default=None, help='active selection ratio for training tasks')
+    parser.add_argument('--workload', type=str, default='poisson', help='workload arrival pattern')
+    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], 
+                        help='distribution of input sequence length')
+    parser.add_argument('--length_heterogeneity', type=int, default=None, 
+                        help='standard deviation of the length distribution of the sampled subset')
+    parser.add_argument('--active_selection', type=float, default=None, 
+                        help='active selection ratio for training tasks')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     

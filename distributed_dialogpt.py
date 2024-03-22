@@ -147,27 +147,34 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_name_or_path', type=str, default='data/Anthropic', help='dataset name')
-    parser.add_argument('--model_name_or_path', type=str, default='microsoft/DialoGPT-small', help='model name or path')
-    parser.add_argument('--model_name', type=str, default='dialogpt', help='model name')
+    parser.add_argument('--model_name_or_path', type=str, help='model name', default='microsoft/DialoGPT-large')
+    parser.add_argument('--model_name', type=str, default='dummy', help='model name')
+    parser.add_argument('--memory_threshold', type=float, default=0.5, 
+                        help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
-    parser.add_argument('--memory_threshold', type=float, default=0.8, help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--save_length', action='store_true', help='save the length of each task')
-    parser.add_argument('--setting', type=str, default='active', choices=['active', 'interval', 'isolated'], help='training setting')
-    parser.add_argument('--isolated_split', type=float, default=None, help='split ratio for isolated test and train nodes')
-    parser.add_argument('--priority', type=str, default='FIFO', choices=['FIFO', 'MLF', 'LLF'], help='scheduling priority')
-    parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
+    parser.add_argument('--setting', type=str, default='active', choices=['active','interval','isolated'], 
+                        help='training setting')
+    parser.add_argument('--isolated_split', type=float, default=None, 
+                        help='split ratio for isolated test & train nodes. If not provided, the retraining rate is used.')
+    parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority, default: FIFO')
+    parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], 
+                        help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
-    parser.add_argument('--retraining_rate', type=float, default=0.1)
+    parser.add_argument('--retraining_rate', type=float, default=0.1, help='proportion of training tasks')
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
-    parser.add_argument('--train_lambda', type=int, default=50, help='Average number of training tasks produced per second')
+    parser.add_argument('--train_lambda', type=int, default=10, help='Average number of training tasks produced per second')
     parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
-    parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
-    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
-    parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=float, default=None, help='active selection ratio for training tasks')
+    parser.add_argument('--workload', type=str, default='poisson', help='workload arrival pattern')
+    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], 
+                        help='distribution of input sequence length')
+    parser.add_argument('--length_heterogeneity', type=int, default=None, 
+                        help='standard deviation of the length distribution of the sampled subset')
+    parser.add_argument('--active_selection', type=float, default=None, 
+                        help='active selection ratio for training tasks')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     
