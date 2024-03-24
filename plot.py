@@ -1,5 +1,6 @@
 import os
 import json
+from typing import Union
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
@@ -119,7 +120,7 @@ if __name__ == '__main__':
     parser.add_argument('--node', type=int, default=1, help='number of nodes for distributed systems')
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
     parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=float, default=None, help='active selection ratio for training tasks')
+    parser.add_argument('--active_selection', type=str, default=None, help='active selection ratio for training tasks')
     parser.add_argument('--test_asyncio', action='store_true')
     args = parser.parse_args()
     

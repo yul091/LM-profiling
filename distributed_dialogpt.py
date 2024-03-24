@@ -52,6 +52,7 @@ class DistributedDialoGPT(DistributedLLM):
                 break
             
             task: Task = preloaded_tasks[taskID]
+            input_length = task.query['input_ids'].shape[1]
             assert task.task_id == taskID
             inputs = task.hiddens[stageID]
             
@@ -101,7 +102,15 @@ class DistributedDialoGPT(DistributedLLM):
                     # Backprop on the last stage
                     do_backward = True
                     if self.active_selection is not None:
-                        do_backward = random.random() < self.active_selection
+                        if self.active_selection == 'adaptive':
+                            do_backward = self.selective_algorithm(
+                                input_length,
+                                training_step=self._training_step,
+                                trained_task_lengths=self._trained_task_lengths,
+                                total_training_tasks=self.retraining_tasks,
+                            )
+                        else:
+                            do_backward = random.random() < float(self.active_selection)
                     
                     if do_backward:
                         try:
@@ -110,7 +119,7 @@ class DistributedDialoGPT(DistributedLLM):
                         except Exception as e:
                             # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                             pass
-                        self._trained_tasks += 1
+                        self._trained_task_lengths.append(input_length)
                         
                         # Optimization
                         try:
@@ -123,7 +132,7 @@ class DistributedDialoGPT(DistributedLLM):
                     
                     self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     
-                    if (self.setting == 'isolated') and (self._trained_tasks % self.saving_steps == 0): 
+                    if (self.setting == 'isolated') and (len(self._trained_task_lengths) % self.saving_steps == 0): 
                         # Save the parameters of stages in the last node and load them in other nodes
                         print(f" *** Save checkpoint {self.ckpt_path} *** ")
                         for j in range(self.num_gpus_per_node):
@@ -134,7 +143,9 @@ class DistributedDialoGPT(DistributedLLM):
                             print(f" *** Load checkpoint for Node {i} *** ")
                             for j in range(self.num_gpus_per_node):
                                 self.distributed_stages[i][j].load_state_dict(torch.load(f"{self.ckpt_path}_stage{j}.pt"))
-                                
+                    
+                    self._training_step += 1   
+                             
                 # else:
                 #     self.metrics["loss"].append(loss.item()) # we only compute performance for inference-only tasks
                 #     task.hiddens.append(loss)
@@ -173,7 +184,7 @@ if __name__ == '__main__':
                         help='distribution of input sequence length')
     parser.add_argument('--length_heterogeneity', type=int, default=None, 
                         help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=float, default=None, 
+    parser.add_argument('--active_selection', type=str, default=None, 
                         help='active selection ratio for training tasks')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()

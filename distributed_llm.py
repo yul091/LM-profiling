@@ -3,7 +3,7 @@ import sys
 sys.dont_write_bytecode = True
 import pdb
 import time
-import math
+import scipy
 import json
 import queue
 import random
@@ -173,7 +173,8 @@ class DistributedLLM:
         )
         self.saving_steps = max(min(100, self.retraining_tasks // 2), 1)
         print(f" ** Total tasks: {self.total_tasks}, retraining tasks: {self.retraining_tasks}, saving steps: {self.saving_steps} ** ")
-        self._trained_tasks = 0
+        self._training_step = 0
+        self._trained_task_lengths = []
         
         # Save task length distribution for further analysis
         if self.save_length:
@@ -468,6 +469,33 @@ class DistributedLLM:
         
         return tuple_outputs
     
+    
+    def selective_algorithm(
+        self, 
+        task_length: int,
+        training_step: Optional[int] = None,
+        trained_task_lengths: Optional[List[int]] = None,
+        total_training_tasks: Optional[int] = None,
+    ):
+        training_step = training_step if training_step is not None else self._training_step
+        trained_task_lengths = trained_task_lengths if trained_task_lengths is not None else self._trained_task_lengths
+        total_training_tasks = total_training_tasks if total_training_tasks is not None else self.retraining_tasks
+        
+        if not trained_task_lengths:
+            return True
+        length_mean, length_std = np.mean(trained_task_lengths), np.std(trained_task_lengths)
+        if length_std == 0:
+            return True
+        # Gaussian probability based on task length
+        P_l = (1 / (length_std * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - length_mean) / length_std) ** 2)
+        # P_L = scipy.stats.norm(length_mean, length_std).pdf(task_length) # scipy probability density function
+        # Adjusting probability based on training progress
+        P_adjusted = (P_l + (1 - (training_step / total_training_tasks))) / 2
+        print("Task length: {}, prev mean: {:.4f}, prev std: {:.4f}, Gaussian P: {:.4f} -> P_adjusted: {:.4f}".format(task_length, length_mean, length_std, P_l, P_adjusted))
+        
+        # Decide whether to train on this task
+        return P_adjusted > np.random.random()
+    
 
     def device_inference(
         self,
@@ -619,7 +647,7 @@ class DistributedLLM:
         # Calculate response times
         metrics['num_tasks'] = self.total_tasks
         metrics['retrain_tasks'] = self.retraining_tasks
-        metrics['actual_retrained_tasks'] = self._trained_tasks
+        metrics['actual_retrained_tasks'] = len(self._trained_task_lengths)
         metrics['user_tasks'] = len(self.user_task_record)
         metrics['bubble_rate'] = bubble_rate 
         metrics['idles'] = total_idles
@@ -698,7 +726,7 @@ if __name__ == '__main__':
                         help='distribution of input sequence length')
     parser.add_argument('--length_heterogeneity', type=int, default=None, 
                         help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=float, default=None, 
+    parser.add_argument('--active_selection', type=str, default=None,
                         help='active selection ratio for training tasks')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()

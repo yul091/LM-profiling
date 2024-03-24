@@ -2,7 +2,6 @@ NUM_SAMPLES=1000
 BATCH_SIZE=3
 WORKLOAD=poisson
 MEMORY_THRESHOLD=0.5
-# LOAD_BALANCING=workload
 
 for NUM_NODES in 2 4; do
     for MODEL_NAME in "DialoGPT-small" "DialoGPT-medium" "DialoGPT-large"; do
@@ -67,4 +66,7 @@ for NUM_NODES in 2 4; do
         done
     done
 done
+
+
+
 

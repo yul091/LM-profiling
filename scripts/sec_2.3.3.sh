@@ -5,10 +5,34 @@ MEMORY_THRESHOLD=0.5
 
 for NUM_NODES in 2 4; do
     for MODEL_NAME in "DialoGPT-small" "DialoGPT-medium" "DialoGPT-large"; do
-        for RATE_LAMBDA in 10 20 30; do
+        for RATE_LAMBDA in 10 30; do
             OUTPUT_DIR=prof/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
             for RETRAIN_RATE in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0; do
-                for SETTING in active isolated; do
+                for SETTING in active; do
+                    python distributed_dialogpt.py \
+                        --model_name_or_path "microsoft/$MODEL_NAME" \
+                        --model_name $MODEL_NAME \
+                        --num_nodes $NUM_NODES \
+                        --n_samples $NUM_SAMPLES \
+                        --test_lambda $RATE_LAMBDA \
+                        --train_lambda $RATE_LAMBDA \
+                        --active_selection 'adaptive' \
+                        --workload $WORKLOAD \
+                        --setting $SETTING \
+                        --retraining_rate $RETRAIN_RATE \
+                        --output_dir $OUTPUT_DIR \
+                        --batch_size $BATCH_SIZE \
+                        --memory_threshold $MEMORY_THRESHOLD
+
+                    python plot.py \
+                        --node $NUM_NODES \
+                        --model_name $MODEL_NAME \
+                        --setting $SETTING \
+                        --workload $WORKLOAD \
+                        --active_selection 'adaptive' \
+                        --retraining_rate $RETRAIN_RATE \
+                        --output_dir $OUTPUT_DIR
+
                     for ACTIVE_SELCTION in 0.2 0.4 0.6 0.8; do
                         python distributed_dialogpt.py \
                             --model_name_or_path "microsoft/$MODEL_NAME" \
