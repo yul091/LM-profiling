@@ -100,8 +100,9 @@ class DistributedDialoGPT(DistributedLLM):
                     # # Synchronize to ensure all previous operations on the GPU are completed
                     # torch.cuda.synchronize(device)
                     # Backprop on the last stage
-                    do_backward = True
-                    if self.active_selection is not None:
+                    if self.active_selection is None:
+                        do_backward = True
+                    else:
                         if self.active_selection == 'adaptive':
                             do_backward = self.selective_algorithm(
                                 input_length,

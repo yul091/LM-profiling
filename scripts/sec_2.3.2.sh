@@ -3,13 +3,14 @@ BATCH_SIZE=3
 WORKLOAD=poisson
 MEMORY_THRESHOLD=0.5
 
-for NUM_NODES in 2 4; do
-    for MODEL_NAME in "DialoGPT-small" "DialoGPT-medium" "DialoGPT-large"; do
-        for RATE_LAMBDA in 10 20 30; do
+# "DialoGPT-small" "DialoGPT-medium" "DialoGPT-large"
+export CUDA_VISIBLE_DEVICES=0,1,2,3 # Use 0, 1, 2, 3 as CUDA device IDs
+for NUM_NODES in 1; do
+    for MODEL_NAME in "DialoGPT-large"; do
+        for RATE_LAMBDA in 10 30; do
             OUTPUT_DIR=prof/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
             for RETRAIN_RATE in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0; do
-                for SETTING in active isolated; do
-                    # for LENGTH_VAR in 0 200; do
+                for SETTING in active; do
                     python distributed_dialogpt.py \
                         --model_name_or_path "microsoft/$MODEL_NAME" \
                         --model_name $MODEL_NAME \

@@ -42,8 +42,8 @@ class DistributedLLM:
         self.setting = args.setting
         self.priority = args.priority
         self.num_nodes = args.num_nodes
-        if self.num_nodes < 2:
-            raise ValueError(f"At least 2 nodes are required! Current number of nodes: {self.num_nodes}")
+        # if self.num_nodes < 2:
+        #     raise ValueError(f"At least 2 nodes are required! Current number of nodes: {self.num_nodes}")
         self.batch_size = args.batch_size
         self.train_lambda = args.train_lambda
         self.test_lambda = args.test_lambda
@@ -473,28 +473,31 @@ class DistributedLLM:
     def selective_algorithm(
         self, 
         task_length: int,
-        training_step: Optional[int] = None,
-        trained_task_lengths: Optional[List[int]] = None,
-        total_training_tasks: Optional[int] = None,
+        training_step: int,
+        trained_task_lengths: List[int],
+        total_training_tasks: int,
     ):
-        training_step = training_step if training_step is not None else self._training_step
-        trained_task_lengths = trained_task_lengths if trained_task_lengths is not None else self._trained_task_lengths
-        total_training_tasks = total_training_tasks if total_training_tasks is not None else self.retraining_tasks
+        # print("Selective algorithm will be implemented!")
+        # if not trained_task_lengths:
+        #     return True
+        # length_mean, length_std = np.mean(trained_task_lengths), np.std(trained_task_lengths)
+        # if length_std == 0:
+        #     return True
+        try:
+            # Gaussian probability based on task length
+            # P_l = (1 / (self.std_length * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - self.mean_length) / self.std_length) ** 2)
+            P_l = scipy.stats.norm(self.mean_length, self.std_length).pdf(task_length) # scipy probability density function
+            # Adjusting probability based on training progress
+            P_adjusted = 0.1 * P_l + 0.9 * (1 - (training_step / total_training_tasks))
+            # P_adjusted = 1 - (training_step / total_training_tasks)
+            print("Task length: {}, Gaussian P: {:.4f} -> P_adjusted: {:.4f}".format(task_length, P_l, P_adjusted))
+            # print("Task length: {}, P_adjusted: {:.4f}".format(task_length, P_adjusted))
+            do_backward = P_adjusted > np.random.random()
+        except Exception as e:
+            print(f"Error in selective algorithm: {e}")
+            do_backward = True
         
-        if not trained_task_lengths:
-            return True
-        length_mean, length_std = np.mean(trained_task_lengths), np.std(trained_task_lengths)
-        if length_std == 0:
-            return True
-        # Gaussian probability based on task length
-        P_l = (1 / (length_std * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - length_mean) / length_std) ** 2)
-        # P_L = scipy.stats.norm(length_mean, length_std).pdf(task_length) # scipy probability density function
-        # Adjusting probability based on training progress
-        P_adjusted = (P_l + (1 - (training_step / total_training_tasks))) / 2
-        print("Task length: {}, prev mean: {:.4f}, prev std: {:.4f}, Gaussian P: {:.4f} -> P_adjusted: {:.4f}".format(task_length, length_mean, length_std, P_l, P_adjusted))
-        
-        # Decide whether to train on this task
-        return P_adjusted > np.random.random()
+        return do_backward
     
 
     def device_inference(
@@ -672,7 +675,10 @@ class DistributedLLM:
                 # total_wait_time += record_dict['start'] - record_dict['release']
                 # total_inference_time += record_dict['end'] - record_dict['start']
                 user_global_min_time = min(user_global_min_time, record_dict['start'])
-                user_global_max_time = max(user_global_max_time, record_dict['end'])
+                try:
+                    user_global_max_time = max(user_global_max_time, record_dict['end'])
+                except:
+                    print(f"Error in {taskID} dict: {record_dict}")
                 response_times.append(record_dict['end'] - record_dict['release'])
                 wait_times.append(record_dict['start'] - record_dict['release'])
                 latencies.append(record_dict['end'] - record_dict['start'])
