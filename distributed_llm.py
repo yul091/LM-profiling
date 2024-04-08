@@ -42,13 +42,11 @@ class DistributedLLM:
         self.setting = args.setting
         self.priority = args.priority
         self.num_nodes = args.num_nodes
-        # if self.num_nodes < 2:
-        #     raise ValueError(f"At least 2 nodes are required! Current number of nodes: {self.num_nodes}")
         self.batch_size = args.batch_size
         self.train_lambda = args.train_lambda
         self.test_lambda = args.test_lambda
         self.output_dir = args.output_dir
-        self.load_balancing = args.load_balancing
+        self.task_assignment = args.task_assignment
         self.dataset_name_or_path = args.dataset_name_or_path
         self.lr = args.lr
         self.workload = args.workload
@@ -74,15 +72,9 @@ class DistributedLLM:
             self._test_nodes = list(range(self.num_nodes))
         
         if self.priority is not None:
-            if self.load_balancing is not None:
-                self.ckpt_path = f'{self.output_dir}/stages-{self.load_balancing}_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
-            else:
-                self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
+            self.ckpt_path = f'{self.output_dir}/stages-{self.task_assignment}_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
         else:
-            if self.load_balancing is not None:
-                self.ckpt_path = f'{self.output_dir}/stages-{self.load_balancing}_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
-            else:
-                self.ckpt_path = f'{self.output_dir}/stages_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
+            self.ckpt_path = f'{self.output_dir}/stages-{self.task_assignment}_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
         self.user_task_record = defaultdict(dict)
         # self.train_task_record = defaultdict(dict)
         
@@ -344,16 +336,18 @@ class DistributedLLM:
         print("Producer finished producing tasks")
         
         
-    def _assign_node(self, node_list: List[int]):
+    def _assign_node(self, node_list: List[int], taskID: int):
         if len(node_list) == 1:
             return node_list[0]
-        if self.load_balancing is None or self.load_balancing == 'random':
+        if self.task_assignment == 'random': # Random assignment
             return random.choice(node_list)
-        elif self.load_balancing == 'workload':
+        elif self.task_assignment == 'rr': # Round-robin
+            return node_list[taskID % len(node_list)]
+        elif self.task_assignment == 'workload':
             # Choose the node with the least workload (number of tasks in the first device queue)
             return min(node_list, key=lambda nodeID: self.distributed_nodes[nodeID].device_queues[0].qsize())
         else:
-            raise ValueError(f"Invalid load balancing type: {self.load_balancing}")
+            raise ValueError(f"Invalid task assignment method: {self.task_assignment}")
         
 
     def globalScheduler(
@@ -370,16 +364,12 @@ class DistributedLLM:
                     node.device_queues[0].put((float('inf'), float('inf'))) # for priority_queue, use a large number to signal the end
                 break
             if self.setting != 'isolated':
-                nodeID = self._assign_node(node_list=list(range(self.num_nodes)))
+                nodeID = self._assign_node(node_list=list(range(self.num_nodes)), taskID=taskID)
             else:
-                # If the task require training, we schedule it to one of the training nodes
                 if self.distributed_preloaded_tasks[0][taskID].require_training:
-                    # nodeID = self.num_nodes - 1
-                    nodeID = self._assign_node(node_list=self._train_nodes)
+                    nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID) # assign to one of the training nodes
                 else:
-                    # Assign to one of the test nodes
-                    # nodeID = self._assign_node(node_list=list(range(self.num_nodes - 1)))
-                    nodeID = self._assign_node(node_list=self._test_nodes)
+                    nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID) # assign to one of the test nodes
 
             # Each node queue store task IDs
             if self.setting == 'interval':
@@ -596,7 +586,7 @@ class DistributedLLM:
             # for gpu_id in gpus:
             #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
             #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
+            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
         
@@ -675,10 +665,7 @@ class DistributedLLM:
                 # total_wait_time += record_dict['start'] - record_dict['release']
                 # total_inference_time += record_dict['end'] - record_dict['start']
                 user_global_min_time = min(user_global_min_time, record_dict['start'])
-                try:
-                    user_global_max_time = max(user_global_max_time, record_dict['end'])
-                except:
-                    print(f"Error in {taskID} dict: {record_dict}")
+                user_global_max_time = max(user_global_max_time, record_dict['end'])
                 response_times.append(record_dict['end'] - record_dict['release'])
                 wait_times.append(record_dict['start'] - record_dict['release'])
                 latencies.append(record_dict['end'] - record_dict['start'])
@@ -694,7 +681,7 @@ class DistributedLLM:
         os.makedirs(self.output_dir, exist_ok=True)
         length_heterogeneity = f"_hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "_hetero_default"
         active_selection = f"_active{self.active_selection}" if self.active_selection is not None else "_active_1.0"
-        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.load_balancing}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}.json'
+        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}")
@@ -720,7 +707,7 @@ if __name__ == '__main__':
     parser.add_argument('--isolated_split', type=float, default=None, 
                         help='split ratio for isolated test & train nodes. If not provided, the retraining rate is used.')
     parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority, default: FIFO')
-    parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], 
+    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload'], 
                         help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='proportion of training tasks')

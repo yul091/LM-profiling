@@ -146,7 +146,8 @@ if __name__ == '__main__':
     parser.add_argument('--setting', type=str, default='active', choices=['active', 'interval', 'isolated'], help='training setting')
     parser.add_argument('--isolated_split', type=float, default=None, help='split ratio for isolated test and train nodes')
     parser.add_argument('--priority', type=str, default='FIFO', choices=['FIFO', 'MLF', 'LLF'], help='scheduling priority')
-    parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
+    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload'], 
+                        help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
