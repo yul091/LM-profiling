@@ -75,8 +75,19 @@ class DistributedLLM:
             self.ckpt_path = f'{self.output_dir}/stages-{self.task_assignment}_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
         else:
             self.ckpt_path = f'{self.output_dir}/stages-{self.task_assignment}_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
-        self.user_task_record = defaultdict(dict)
-        # self.train_task_record = defaultdict(dict)
+
+        self.task_arrival = defaultdict(dict)
+        self.task_trace = defaultdict(lambda: defaultdict(dict))
+        self.train_trace = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+        self.all_trace = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+        self.eta = None
+        self.BT = None # backward latency
+        self.alpha = args.alpha
+        self.epsilon = args.epsilon
+        self.forward_start = torch.cuda.Event(enable_timing=True)
+        self.forward_end = torch.cuda.Event(enable_timing=True)
+        self.backward_start = torch.cuda.Event(enable_timing=True)
+        self.backward_end = torch.cuda.Event(enable_timing=True)
         
         # Reproducibility
         set_seed(args.seed)
@@ -330,10 +341,66 @@ class DistributedLLM:
             taskQueue.put(taskID)
             # We record and calculate the response time for each user task (no retraining)
             if not task.require_training:
-                self.user_task_record[taskID]['release'] = time.time()
+                self.task_arrival[taskID]['release'] = time.time()
             
         taskQueue.put(None)  # Signal the end of the dataset
         print("Producer finished producing tasks")
+        
+        
+    def _compute_reward(self, nodeID: int, taskID: int):
+        """
+        Predict the execution traces for the incoming task and compute the reward (bubble rate & response time).
+        """
+        length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1]
+        require_training = self.distributed_preloaded_tasks[nodeID][taskID].require_training
+        fb = self.task_arrival[taskID]['release']
+        br, bi, init_id, finished_ids = 0, 0, 0, []
+        previous_taskIDs = list(self.all_trace[nodeID].keys())
+        previous_train_taskIDs = list(self.train_trace[nodeID].keys())
+        eta = self.eta if self.eta is not None else 0.02
+        BT = self.BT if self.BT is not None else 0.05
+            
+        # Get/Estimate previous forward execution traces
+        if previous_taskIDs:
+            last_taskID = previous_taskIDs[-1]
+        else:
+            last_taskID = None
+            
+        for stageID in range(self.num_gpus_per_node):
+            pfe = self.all_trace[nodeID][last_taskID][stageID]['fe'] if last_taskID is not None else fb
+            fb = max(pfe, fb)
+            fe = fb + eta * length ** 2
+            
+            for i in range(init_id, len(previous_train_taskIDs)):
+                ptID = previous_train_taskIDs[i]
+                if fe <= self.train_trace[nodeID][ptID][stageID]['bb']:
+                    br += eta * length ** 2
+                    break
+                fb = max(fb, self.train_trace[nodeID][ptID][stageID]['be']) # forward starts at least at the end of the backward
+                fe = fb + eta * length ** 2
+                if stageID == 0: # this training task is finished
+                    finished_ids.append(ptID)
+                    
+            # Write the forward and backward execution traces
+            self.task_trace[nodeID][stageID]['fb'] = fb
+            self.task_trace[nodeID][stageID]['fe'] = fe
+            if require_training:
+                self.task_trace[nodeID][stageID]['bb'] = fe + (self.num_gpus_per_node - 1 - stageID) * (BT + self.eta * length ** 2)
+                self.task_trace[nodeID][stageID]['be'] = self.task_trace[nodeID][stageID]['bb'] + BT
+                    
+            bi += max(fb - pfe - (i - init_id) * BT, 0) # update bubble increase
+            init_id = i + 1 # update the initial training check index for the next stage
+        
+        # Clear the finished training tasks
+        for ptID in finished_ids:
+            self.train_trace[nodeID].pop(ptID)
+            self.all_trace[nodeID].pop(ptID)
+                    
+        # Compute reward (bubble profit and response time)
+        response = fe - self.task_arrival[taskID]['release']
+        reward = self.alpha * (br - bi) / ((1 - require_training) * response + self.epsilon)
+        return reward
+            
         
         
     def _assign_node(self, node_list: List[int], taskID: int):
@@ -344,8 +411,14 @@ class DistributedLLM:
         elif self.task_assignment == 'rr': # Round-robin
             return node_list[taskID % len(node_list)]
         elif self.task_assignment == 'workload':
-            # Choose the node with the least workload (number of tasks in the first device queue)
-            return min(node_list, key=lambda nodeID: self.distributed_nodes[nodeID].device_queues[0].qsize())
+            # # Choose the node with the least workload (number of tasks in the first device queue)
+            # return min(node_list, key=lambda nodeID: self.distributed_nodes[nodeID].device_queues[0].qsize())
+            reward_list = []
+            for nodeID in node_list:
+                reward = self._compute_reward(nodeID, taskID)
+                reward_list.append(reward)
+            return node_list[np.argmax(reward_list)]
+            
         else:
             raise ValueError(f"Invalid task assignment method: {self.task_assignment}")
         
@@ -363,6 +436,9 @@ class DistributedLLM:
                     # node.device_queues[0].put(None)
                     node.device_queues[0].put((float('inf'), float('inf'))) # for priority_queue, use a large number to signal the end
                 break
+            
+            # Task assignment
+            assign_start = time.time()
             if self.setting != 'isolated':
                 nodeID = self._assign_node(node_list=list(range(self.num_nodes)), taskID=taskID)
             else:
@@ -370,6 +446,15 @@ class DistributedLLM:
                     nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID) # assign to one of the training nodes
                 else:
                     nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID) # assign to one of the test nodes
+                    
+            # Update train trace and all trace with the task trace
+            if self.task_assignment == 'workload':
+                for stageID in range(self.num_gpus_per_node):
+                    self.all_trace[nodeID][taskID][stageID] = self.task_trace[nodeID][stageID]
+                    if self.distributed_preloaded_tasks[nodeID][taskID].require_training:
+                        self.train_trace[nodeID][taskID][stageID] = self.task_trace[nodeID][stageID]
+                        
+            self.metrics['node_assignment'].append(time.time() - assign_start)
 
             # Each node queue store task IDs
             if self.setting == 'interval':
@@ -432,26 +517,36 @@ class DistributedLLM:
         timing_info: Dict[str, List[float]],
     ) -> Tuple[torch.Tensor, ...]:
         
+        # if stageID == 0:
+        #     self.task_trace[nodeID].clear() # clear the current task trace
         try:
             self._wait_for_device_availability(device, threshold=self.memory_threshold)
+            if self.eta is None:
+                self.forward_start.record()
             if task.require_training: # this is a retraining task
-                record_time(device, 'start', 'forward_grad', task.task_id, timing_info)
+                fb = record_time(device, 'start', 'forward_grad', task.task_id, timing_info)
+                self.train_trace[nodeID][task.task_id][stageID]['fb'] = fb
+                self.task_trace[nodeID][stageID]['fb'] = fb
+                self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb
                 tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
-                record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
+                fe = record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
+                self.task_trace[nodeID][stageID]['fe'] = fe
+                self.train_trace[nodeID][task.task_id][stageID]['fe'] = fe
+                self.all_trace[nodeID][task.task_id][stageID]['fe'] = fe
             else:
-                if stageID == 0: # first stage
-                    self.user_task_record[task.task_id]['start'] = record_time(device, 'start', 'forward', task.task_id, timing_info)
-                else:
-                    record_time(device, 'start', 'forward', task.task_id, timing_info)
-                    
+                fb = record_time(device, 'start', 'forward', task.task_id, timing_info)
+                self.task_trace[nodeID][stageID]['fb'] = fb
+                self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb
                 with torch.no_grad():
                     tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
-                
-                if stageID == self.num_gpus_per_node - 1: # last stage
-                    self.user_task_record[task.task_id]['end'] = record_time(device, 'end', 'forward', task.task_id, timing_info)
-                else:
-                    record_time(device, 'end', 'forward', task.task_id, timing_info)
-                self.user_task_record[task.task_id]['node'] = nodeID
+                fe = record_time(device, 'end', 'forward', task.task_id, timing_info)
+                self.task_trace[nodeID][stageID]['fe'] = fe
+                self.all_trace[nodeID][task.task_id][stageID]['fe'] = fe
+            if self.eta is None:
+                self.forward_end.record()
+                torch.cuda.synchronize()
+                # Profile forward time (seconds) per stage
+                self.eta = self.forward_start.elapsed_time(self.forward_end) / (task.query['input_ids'].shape[1] ** 2 * 1e3)
             
         except Exception as e:
             logging.error(f"[Node {nodeID} - stage {stageID} - device {device}] Forward error occurred: {e}")
@@ -714,6 +809,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
     parser.add_argument('--train_lambda', type=int, default=10, help='Average number of training tasks produced per second')
     parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
+    parser.add_argument('--alpha', type=float, default=1, help='bubble profit coefficient')
+    parser.add_argument('--epsilon', type=float, default=1e-5, help='small value to avoid division by zero')
     parser.add_argument('--workload', type=str, default='poisson', help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], 
                         help='distribution of input sequence length')

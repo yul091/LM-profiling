@@ -4,7 +4,7 @@ sys.dont_write_bytecode = True
 import queue
 import random
 import argparse
-import pdb
+import time
 from typing import List, Dict, Optional, Any, Union
 import torch
 import logging
@@ -37,8 +37,8 @@ class DistributedDialoGPT(DistributedLLM):
         nextdeviceQueue: Optional[Union[queue.Queue, queue.PriorityQueue]] = None,
         init_device: Optional[int] = None,
     ):
-        device = self.distributed_nodes[nodeID].init_device + stageID
         init_device = init_device if init_device is not None else self.distributed_nodes[nodeID].init_device
+        device = init_device + stageID
         
         while True:
             priority, taskID = deviceQueue.get()
@@ -114,9 +114,25 @@ class DistributedDialoGPT(DistributedLLM):
                             do_backward = random.random() < float(self.active_selection)
                     
                     if do_backward:
+                        bb = time.time()
+                        self.task_trace[nodeID][self.num_gpus_per_node-1]['bb'] = bb
+                        self.train_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb
+                        self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb
                         try:
+                            if self.BT is None:
+                                self.backward_start.record()
                             loss.backward()
-                            record_time(init_device, 'end', 'backward', taskID, timing_info)
+                            be = record_time(init_device, 'end', 'backward', taskID, timing_info)
+                            if self.BT is None:
+                                self.backward_end.record()
+                                torch.cuda.synchronize()
+                                # Profiling backward time (seconds) per stage
+                                self.BT = self.backward_start.elapsed_time(self.backward_end) / (self.num_gpus_per_node * 1e3)
+                                
+                            self.task_trace[nodeID][0]['be'] = be
+                            self.train_trace[nodeID][taskID][0]['be'] = be   
+                            self.all_trace[nodeID][taskID][0]['be'] = be      
+                            
                         except Exception as e:
                             # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                             pass
@@ -178,6 +194,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='proportion of training tasks')
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
+    parser.add_argument('--alpha', type=float, default=1, help='bubble profit coefficient')
+    parser.add_argument('--epsilon', type=float, default=1e-5, help='small value to avoid division by zero')
     parser.add_argument('--train_lambda', type=int, default=10, help='Average number of training tasks produced per second')
     parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', help='workload arrival pattern')

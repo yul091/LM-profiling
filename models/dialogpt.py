@@ -66,7 +66,7 @@ class GPTStartingStage(GPT2PreTrainedModel):
         device: int, 
         layer_ids: List[int], 
         pretrained_model: GPT2LMHeadModel,
-        timing_info: dict = None,
+        timing_info: Optional[dict] = None,
     ):
         # Explicitly initialize LlamaModel with its expected arguments
         super().__init__(config)
@@ -85,9 +85,11 @@ class GPTStartingStage(GPT2PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
         self.gradient_checkpointing = False
+        # self._backward_start = None # record the start time of backward pass
         
         self._device = device
-        self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
+        if timing_info is not None:
+            self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
         self.to(device)
 
     def get_input_embeddings(self):
@@ -109,13 +111,14 @@ class GPTStartingStage(GPT2PreTrainedModel):
         module: nn.Module, 
         grad_input: Tuple[torch.Tensor], 
         grad_output: Tuple[torch.Tensor], 
-        timing_info: dict = None,
+        timing_info: dict,
     ):
         # print(f"Backward pass started for {module}")
         start_time = time.time()
         if f"{self._device+1}_start" in timing_info:
             timing_info[f"{self._device+1}_end"].append((start_time, "backward"))
         timing_info[f"{self._device}_start"].append((start_time, "backward"))
+        # self._backward_start = start_time
 
     def forward(
         self,
@@ -294,7 +297,7 @@ class GPTIntermediateStage(GPT2PreTrainedModel):
         device: int, 
         layer_ids: List[int], 
         pretrained_model: GPT2LMHeadModel,
-        timing_info: dict = None,
+        timing_info: Optional[dict] = None,
     ):
         super().__init__(config)
         self.h = nn.ModuleList([
@@ -304,9 +307,11 @@ class GPTIntermediateStage(GPT2PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
         self.gradient_checkpointing = False
+        # self._backward_start = None # record the start time of backward pass
         
         self._device = device
-        self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
+        if timing_info is not None:
+            self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
         self.to(device)
 
         
@@ -323,13 +328,14 @@ class GPTIntermediateStage(GPT2PreTrainedModel):
         module: nn.Module, 
         grad_input: Tuple[torch.Tensor], 
         grad_output: Tuple[torch.Tensor], 
-        timing_info: dict = None,
+        timing_info: dict,
     ):
         # print(f"Backward pass started for {module}")
         start_time = time.time()
         if f"{self._device+1}_start" in timing_info:
             timing_info[f"{self._device+1}_end"].append((start_time, "backward"))
         timing_info[f"{self._device}_start"].append((start_time, "backward"))
+        # self._backward_start = start_time
         
     
     def forward(
@@ -428,7 +434,7 @@ class GPTEndingStage(GPT2PreTrainedModel):
         device: int, 
         layer_ids: List[int], 
         pretrained_model: GPT2LMHeadModel,
-        timing_info: dict = None,
+        timing_info: Optional[dict] = None,
     ):
         super().__init__(config)
         self.h = nn.ModuleList([
@@ -441,9 +447,11 @@ class GPTEndingStage(GPT2PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
         self.gradient_checkpointing = False
+        # self._backward_start = None # record the start time of backward pass
         
         self._device = device
-        self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
+        if timing_info is not None:
+            self.register_full_backward_hook(partial(self.backward_hook, timing_info=timing_info))
         self.to(device)
         
             
@@ -452,13 +460,14 @@ class GPTEndingStage(GPT2PreTrainedModel):
         module: nn.Module, 
         grad_input: Tuple[torch.Tensor], 
         grad_output: Tuple[torch.Tensor], 
-        timing_info: dict = None,
+        timing_info: dict,
     ):
         # print(f"Backward pass started for {module}")
         start_time = time.time()
         if f"{self._device+1}_start" in timing_info:
             timing_info[f"{self._device+1}_end"].append((start_time, "backward"))
         timing_info[f"{self._device}_start"].append((start_time, "backward"))
+        # self._backward_start = start_time
         
     def get_output_embeddings(self):
         return self.lm_head

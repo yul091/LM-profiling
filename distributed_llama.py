@@ -150,6 +150,8 @@ if __name__ == '__main__':
                         help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1)
+    parser.add_argument('--alpha', type=float, default=1, help='bubble profit coefficient')
+    parser.add_argument('--epsilon', type=float, default=1e-5, help='small value to avoid division by zero')
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
     parser.add_argument('--train_lambda', type=int, default=50, help='Average number of training tasks produced per second')
     parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
