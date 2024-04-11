@@ -79,6 +79,7 @@ class DistributedLLM:
         self.task_arrival = defaultdict(dict)
         self.task_trace = defaultdict(lambda: defaultdict(dict))
         self.train_trace = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+        self.user_task_record = defaultdict(dict)
         self.all_trace = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
         self.eta = None
         self.BT = None # backward latency
@@ -340,8 +341,10 @@ class DistributedLLM:
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(taskID)
             # We record and calculate the response time for each user task (no retraining)
+            release = time.time()
             if not task.require_training:
-                self.task_arrival[taskID]['release'] = time.time()
+                self.user_task_record[taskID]['release'] = release
+            self.task_arrival[taskID]['release'] = release
             
         taskQueue.put(None)  # Signal the end of the dataset
         print("Producer finished producing tasks")
@@ -370,6 +373,7 @@ class DistributedLLM:
             pfe = self.all_trace[nodeID][last_taskID][stageID]['fe'] if last_taskID is not None else fb
             fb = max(pfe, fb)
             fe = fb + eta * length ** 2
+            i = init_id
             
             for i in range(init_id, len(previous_train_taskIDs)):
                 ptID = previous_train_taskIDs[i]
@@ -385,7 +389,7 @@ class DistributedLLM:
             self.task_trace[nodeID][stageID]['fb'] = fb
             self.task_trace[nodeID][stageID]['fe'] = fe
             if require_training:
-                self.task_trace[nodeID][stageID]['bb'] = fe + (self.num_gpus_per_node - 1 - stageID) * (BT + self.eta * length ** 2)
+                self.task_trace[nodeID][stageID]['bb'] = fe + (self.num_gpus_per_node - 1 - stageID) * (BT + eta * length ** 2)
                 self.task_trace[nodeID][stageID]['be'] = self.task_trace[nodeID][stageID]['bb'] + BT
                     
             bi += max(fb - pfe - (i - init_id) * BT, 0) # update bubble increase
@@ -415,7 +419,13 @@ class DistributedLLM:
             # return min(node_list, key=lambda nodeID: self.distributed_nodes[nodeID].device_queues[0].qsize())
             reward_list = []
             for nodeID in node_list:
-                reward = self._compute_reward(nodeID, taskID)
+                try:
+                    reward = self._compute_reward(nodeID, taskID)
+                except Exception as e:
+                    reward = random.random()
+                    logging.error(f"[node {nodeID} | task {taskID}] Reward calculation error occurred: {e}")
+                    
+                # print(f"Reward {reward} is computed for task {taskID} on node {nodeID}")
                 reward_list.append(reward)
             return node_list[np.argmax(reward_list)]
             
@@ -439,20 +449,20 @@ class DistributedLLM:
             
             # Task assignment
             assign_start = time.time()
+            require_training = self.distributed_preloaded_tasks[0][taskID].require_training
             if self.setting != 'isolated':
                 nodeID = self._assign_node(node_list=list(range(self.num_nodes)), taskID=taskID)
             else:
-                if self.distributed_preloaded_tasks[0][taskID].require_training:
+                if require_training:
                     nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID) # assign to one of the training nodes
                 else:
                     nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID) # assign to one of the test nodes
                     
             # Update train trace and all trace with the task trace
             if self.task_assignment == 'workload':
-                for stageID in range(self.num_gpus_per_node):
-                    self.all_trace[nodeID][taskID][stageID] = self.task_trace[nodeID][stageID]
-                    if self.distributed_preloaded_tasks[nodeID][taskID].require_training:
-                        self.train_trace[nodeID][taskID][stageID] = self.task_trace[nodeID][stageID]
+                self.all_trace[nodeID][taskID] = self.task_trace[nodeID].copy()
+                if require_training:
+                    self.train_trace[nodeID][taskID] = self.task_trace[nodeID].copy()
                         
             self.metrics['node_assignment'].append(time.time() - assign_start)
 
@@ -525,23 +535,39 @@ class DistributedLLM:
                 self.forward_start.record()
             if task.require_training: # this is a retraining task
                 fb = record_time(device, 'start', 'forward_grad', task.task_id, timing_info)
-                self.train_trace[nodeID][task.task_id][stageID]['fb'] = fb
                 self.task_trace[nodeID][stageID]['fb'] = fb
-                self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb
+                if task.task_id in self.train_trace[nodeID]: # this training task has been completely recorded
+                    self.train_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
+                    self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
+
                 tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 fe = record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
+                
                 self.task_trace[nodeID][stageID]['fe'] = fe
-                self.train_trace[nodeID][task.task_id][stageID]['fe'] = fe
-                self.all_trace[nodeID][task.task_id][stageID]['fe'] = fe
-            else:
+                if task.task_id in self.train_trace[nodeID]: # this training task has been completely recorded
+                    self.train_trace[nodeID][task.task_id][stageID]['fe'] = fe # update the already recorded task
+                    self.all_trace[nodeID][task.task_id][stageID]['fe'] = fe # update the already recorded task
+           
+            else: # this is a user (test) task
                 fb = record_time(device, 'start', 'forward', task.task_id, timing_info)
                 self.task_trace[nodeID][stageID]['fb'] = fb
-                self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb
+                if task.task_id in self.all_trace[nodeID]: # this task has been completely recorded
+                    self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
+                    
+                if stageID == 0: # first stage
+                    self.user_task_record[task.task_id]['start'] = fb
+                    
                 with torch.no_grad():
                     tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 fe = record_time(device, 'end', 'forward', task.task_id, timing_info)
+                
                 self.task_trace[nodeID][stageID]['fe'] = fe
-                self.all_trace[nodeID][task.task_id][stageID]['fe'] = fe
+                if task.task_id in self.all_trace[nodeID]: # this task has been completely recorded
+                    self.all_trace[nodeID][task.task_id][stageID]['fe'] = fe # update the already recorded task
+                
+                if stageID == self.num_gpus_per_node - 1: # last stage
+                    self.user_task_record[task.task_id]['end'] = fe
+                    
             if self.eta is None:
                 self.forward_end.record()
                 torch.cuda.synchronize()
@@ -731,14 +757,12 @@ class DistributedLLM:
                 losses = value
             metrics[key] = sum(value) / len(value)
         
-        metrics['losses'] = losses
         # Calculate response times
         metrics['num_tasks'] = self.total_tasks
         metrics['retrain_tasks'] = self.retraining_tasks
         metrics['actual_retrained_tasks'] = len(self._trained_task_lengths)
         metrics['user_tasks'] = len(self.user_task_record)
         metrics['bubble_rate'] = bubble_rate 
-        metrics['idles'] = total_idles
         metrics['idles_sum'] = sum(total_idles)
         metrics['idles_avg'] = sum(total_idles) / len(total_idles)
         metrics['end2end_latency'] = global_max_time - global_min_time
@@ -768,10 +792,13 @@ class DistributedLLM:
             metrics['user_wait_avg'] = sum(wait_times) / len(self.user_task_record)
             metrics['user_inference_avg'] = sum(latencies) / len(self.user_task_record)
             metrics['user_response_avg'] = sum(response_times) / len(self.user_task_record)
-            metrics['user_responses'] = response_times
             metrics['user_end2end_latency'] = user_global_max_time - user_global_min_time
             metrics['user_throughput'] = len(self.user_task_record) / (user_global_max_time - user_global_min_time)
+            metrics['user_responses'] = response_times # list
             
+        metrics['idles'] = total_idles # list
+        metrics['losses'] = losses # list    
+        
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)
         length_heterogeneity = f"_hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "_hetero_default"

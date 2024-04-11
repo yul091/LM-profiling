@@ -15,7 +15,7 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     workload = args.workload
     retraining_rate = args.retraining_rate
     model_name = args.model_name
-    load_balancing = args.load_balancing
+    task_assignment = args.task_assignment
     length_distribution = args.length_distribution
     length_heterogeneity = f"_hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "_hetero_default"
     active_selection = f"_active{args.active_selection}" if args.active_selection is not None else "_active_1.0"
@@ -29,7 +29,7 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     elif node is None:
         stats_f = f'{output_dir}/timing_info_{model_name}_{setting}.json'
     else:
-        stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
+        stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
 
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
@@ -114,7 +114,8 @@ if __name__ == '__main__':
     parser.add_argument('--setting', type=str, default='active', help='workload setting')
     parser.add_argument('--isolated_split', type=float, default=None, help='split ratio for isolated test and train nodes')
     parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority')
-    parser.add_argument('--load_balancing', type=str, default='random', choices=['random', 'workload'], help='node level scheduling policy')
+    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload'], 
+                        help='node level scheduling policy')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
     parser.add_argument('--node', type=int, default=1, help='number of nodes for distributed systems')
@@ -131,7 +132,7 @@ if __name__ == '__main__':
     workload = args.workload
     model_name = args.model_name
     retraining_rate = args.retraining_rate
-    load_balancing = args.load_balancing
+    task_assignment = args.task_assignment
     length_distribution = args.length_distribution
     length_heterogeneity = f"_hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "_hetero_default"
     active_selection = f"_active{args.active_selection}" if args.active_selection is not None else "_active_1.0"
@@ -141,7 +142,7 @@ if __name__ == '__main__':
     
     for node in range(args.node):
         # Load timing information
-        stats_f = f'{output_dir}/timing_info_{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
+        stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
 
         with open(stats_f, 'r') as f:
             timing_info = json.load(f)
@@ -160,4 +161,4 @@ if __name__ == '__main__':
         ax = axes[node] if args.node > 1 else axes
         plot_mix(args, ax, node, start_time)
     plt.tight_layout()
-    plt.savefig(f"{output_dir}/{model_name}_{load_balancing}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}.png", bbox_inches='tight', dpi=300)
+    plt.savefig(f"{output_dir}/{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}.png", bbox_inches='tight', dpi=300)

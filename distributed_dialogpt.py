@@ -116,8 +116,10 @@ class DistributedDialoGPT(DistributedLLM):
                     if do_backward:
                         bb = time.time()
                         self.task_trace[nodeID][self.num_gpus_per_node-1]['bb'] = bb
-                        self.train_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb
-                        self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb
+                        if taskID in self.train_trace[nodeID]:
+                            self.train_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
+                            self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
+                        
                         try:
                             if self.BT is None:
                                 self.backward_start.record()
@@ -128,14 +130,15 @@ class DistributedDialoGPT(DistributedLLM):
                                 torch.cuda.synchronize()
                                 # Profiling backward time (seconds) per stage
                                 self.BT = self.backward_start.elapsed_time(self.backward_end) / (self.num_gpus_per_node * 1e3)
-                                
-                            self.task_trace[nodeID][0]['be'] = be
-                            self.train_trace[nodeID][taskID][0]['be'] = be   
-                            self.all_trace[nodeID][taskID][0]['be'] = be      
-                            
                         except Exception as e:
                             # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                             pass
+                        
+                        self.task_trace[nodeID][0]['be'] = be
+                        if taskID in self.train_trace[nodeID]:
+                            self.train_trace[nodeID][taskID][0]['be'] = be   
+                            self.all_trace[nodeID][taskID][0]['be'] = be
+                          
                         self._trained_task_lengths.append(input_length)
                         
                         # Optimization
