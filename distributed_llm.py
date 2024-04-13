@@ -14,6 +14,7 @@ from tqdm import tqdm
 from typing import List, Dict, Optional, Any, Union, Tuple
 from collections import defaultdict
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datasets import load_dataset
@@ -56,6 +57,10 @@ class DistributedLLM:
         self.length_distribution = args.length_distribution
         self.length_heterogeneity = args.length_heterogeneity
         self.active_selection = args.active_selection
+        self.eta = None # forward coefficient
+        self.BT = None # backward latency
+        self.alpha = args.alpha
+        self.epsilon = args.epsilon
         
         if self.setting == 'isolated':
             self.isolated_split = args.isolated_split if args.isolated_split is not None else self.retraining_rate
@@ -71,20 +76,19 @@ class DistributedLLM:
             self._train_nodes = list(range(self.num_nodes))
             self._test_nodes = list(range(self.num_nodes))
         
+        task_assignment = f"{self.task_assignment}(alpha={self.alpha})" if self.task_assignment == 'workload' else self.task_assignment
         if self.priority is not None:
-            self.ckpt_path = f'{self.output_dir}/stages-{self.task_assignment}_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
+            self.ckpt_path = f'{self.output_dir}/stages-{task_assignment}_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
         else:
-            self.ckpt_path = f'{self.output_dir}/stages-{self.task_assignment}_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
+            self.ckpt_path = f'{self.output_dir}/stages-{task_assignment}_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
 
         self.task_arrival = defaultdict(dict)
         self.task_trace = defaultdict(lambda: defaultdict(dict))
         self.train_trace = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
         self.user_task_record = defaultdict(dict)
         self.all_trace = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
-        self.eta = None
-        self.BT = None # backward latency
-        self.alpha = args.alpha
-        self.epsilon = args.epsilon
+        self.node_allocation = defaultdict(list)
+        self.node_accumulated_bubble = defaultdict(int)
         self.forward_start = torch.cuda.Event(enable_timing=True)
         self.forward_end = torch.cuda.Event(enable_timing=True)
         self.backward_start = torch.cuda.Event(enable_timing=True)
@@ -350,7 +354,7 @@ class DistributedLLM:
         print("Producer finished producing tasks")
         
         
-    def _compute_reward(self, nodeID: int, taskID: int):
+    def _compute_rewards(self, nodeID: int, taskID: int):
         """
         Predict the execution traces for the incoming task and compute the reward (bubble rate & response time).
         """
@@ -391,9 +395,12 @@ class DistributedLLM:
             if require_training:
                 self.task_trace[nodeID][stageID]['bb'] = fe + (self.num_gpus_per_node - 1 - stageID) * (BT + eta * length ** 2)
                 self.task_trace[nodeID][stageID]['be'] = self.task_trace[nodeID][stageID]['bb'] + BT
-                    
+      
             bi += max(fb - pfe - (i - init_id) * BT, 0) # update bubble increase
             init_id = i + 1 # update the initial training check index for the next stage
+            
+        if require_training:
+            bi += self.num_gpus_per_node * (self.num_gpus_per_node - 1) * (BT + eta * length ** 2) / 2  # S(S-1)(F+B)/2
         
         # Clear the finished training tasks
         for ptID in finished_ids:
@@ -401,9 +408,16 @@ class DistributedLLM:
             self.all_trace[nodeID].pop(ptID)
                     
         # Compute reward (bubble profit and response time)
-        response = fe - self.task_arrival[taskID]['release']
-        reward = self.alpha * (br - bi) / ((1 - require_training) * response + self.epsilon)
-        return reward
+        # response = fe - self.task_arrival[taskID]['release']
+        # reward = self.alpha * (br - bi) / (response + self.epsilon)
+        if len(self.node_allocation[nodeID]) > 0: # this node is not empty
+            reward = (self.node_accumulated_bubble[nodeID] + bi) / (len(self.node_allocation[nodeID]) + 1)
+        else:
+            reward = 10000 # we prefer to assign a task to the empty node
+        # reward = br - bi # only consider bubble rate
+        # blank = self.node_accumulated_bubble[nodeID] + bi
+        # return blank, br, bi
+        return reward, br, bi
             
         
         
@@ -417,17 +431,25 @@ class DistributedLLM:
         elif self.task_assignment == 'workload':
             # # Choose the node with the least workload (number of tasks in the first device queue)
             # return min(node_list, key=lambda nodeID: self.distributed_nodes[nodeID].device_queues[0].qsize())
-            reward_list = []
+            reward_list, bi_list, br_list = [], [], []
             for nodeID in node_list:
-                try:
-                    reward = self._compute_reward(nodeID, taskID)
-                except Exception as e:
-                    reward = random.random()
-                    logging.error(f"[node {nodeID} | task {taskID}] Reward calculation error occurred: {e}")
-                    
-                # print(f"Reward {reward} is computed for task {taskID} on node {nodeID}")
+                # try:
+                reward, br, bi = self._compute_rewards(nodeID, taskID)
+                # except Exception as e:
+                #     reward = random.random()
+                #     logging.error(f"[node {nodeID} | task {taskID}] Bubble calculation error occurred: {e}")
+                # reward = self._compute_rewards(nodeID, taskID)
                 reward_list.append(reward)
-            return node_list[np.argmax(reward_list)]
+                br_list.append(br)
+                bi_list.append(bi)
+                
+            # best_index = np.argmax(reward_list) # assign task to the node with the highest reward (lowest average utilization)
+            # Instead of greedy, let's use sampling with probability proportional to the reward
+            reward_list = F.softmax(torch.FloatTensor(reward_list), dim=0).numpy()  
+            best_index = np.random.choice(range(len(reward_list)), p=reward_list)
+            nodeID = node_list[best_index]
+            self.node_accumulated_bubble[nodeID] += bi_list[best_index] - br_list[best_index]
+            return nodeID 
             
         else:
             raise ValueError(f"Invalid task assignment method: {self.task_assignment}")
@@ -478,6 +500,9 @@ class DistributedLLM:
                 self.distributed_nodes[nodeID].device_queues[0].put((priority, taskID))
             else:
                 self.distributed_nodes[nodeID].device_queues[0].put((taskID, taskID))
+            
+            # Record the node allocation 
+            self.node_allocation[nodeID].append({'taskID': taskID, 'type': 'training' if require_training else 'test', 'length': self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1]})
             # print("Global scheduler scheduled task {} (requre_training={}) to node {}".format(taskID, self.distributed_preloaded_tasks[0][taskID].require_training, nodeID))
     
     
@@ -541,6 +566,7 @@ class DistributedLLM:
                     self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
 
                 tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
+                # torch.cuda.synchronize() # synchronize the device
                 fe = record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
                 
                 self.task_trace[nodeID][stageID]['fe'] = fe
@@ -559,6 +585,7 @@ class DistributedLLM:
                     
                 with torch.no_grad():
                     tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
+                # torch.cuda.synchronize() # synchronize the device
                 fe = record_time(device, 'end', 'forward', task.task_id, timing_info)
                 
                 self.task_trace[nodeID][stageID]['fe'] = fe
@@ -699,15 +726,16 @@ class DistributedLLM:
         else:
             setting = self.setting
         
-        length_heterogeneity = f"_hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "_hetero_default"
-        active_selection = f"_active{self.active_selection}" if self.active_selection is not None else "_active_1.0"
+        length_heterogeneity = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
+        active_selection = f"active{self.active_selection}" if self.active_selection is not None else "active_1.0"
+        task_assignment = f"{self.task_assignment}(alpha={self.alpha})" if self.task_assignment == 'workload' else self.task_assignment
         for nodeID, timing_info in self.timing_infos.items():
             # # Remove the first start and end time for each GPU
             # gpus = list(set(int(key.split('_')[0]) for key in timing_info))
             # for gpu_id in gpus:
             #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
             #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
+            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
         
@@ -726,11 +754,15 @@ class DistributedLLM:
         global_min_time, global_max_time = float('inf'), float('-inf')
         total_idles = []
         total_latencies = []
+        node_idles = defaultdict(list)
+        node_latencies = defaultdict(list)
+        node_timelines = {}
         for nodeID, node in self.distributed_nodes.items():
             timing_info = {k: [[t[0], t[1]] for t in v] for k, v in self.timing_infos[nodeID].items()}
             if not timing_info:
                 continue
             
+            node_min_time, node_max_time = float('inf'), float('-inf')
             for gpu_id in range(self.num_gpus_per_node):
                 min_t, max_t = float('inf'), float('-inf')
                 gpu_idx = node.init_device + gpu_id
@@ -741,6 +773,7 @@ class DistributedLLM:
                 else:
                     idles = [start - end for (start, _), (end, _) in zip(starts[1:], ends[:-1]) if (start > end)]
                 total_idles.extend(idles)
+                node_idles[nodeID].extend(idles)
                 
                 tasks = list(zip(starts, ends))
                 for i, ((start, start_label), (end, _)) in enumerate(tasks):
@@ -748,8 +781,12 @@ class DistributedLLM:
                     min_t = min(min_t, start)
                     max_t = max(max_t, end)
                 total_latencies.append(max_t - min_t)
+                node_latencies[nodeID].append(max_t - min_t)
                 global_min_time = min(global_min_time, min_t)
                 global_max_time = max(global_max_time, max_t)
+                node_min_time = min(node_min_time, min_t)
+                node_max_time = max(node_max_time, max_t)
+                node_timelines[nodeID] = (node_min_time, node_max_time)
                     
         bubble_rate = sum(total_idles) / sum(total_latencies) if sum(total_latencies) > 0 else 0
         for key, value in metrics.items():
@@ -763,10 +800,21 @@ class DistributedLLM:
         metrics['actual_retrained_tasks'] = len(self._trained_task_lengths)
         metrics['user_tasks'] = len(self.user_task_record)
         metrics['bubble_rate'] = bubble_rate 
-        metrics['idles_sum'] = sum(total_idles)
-        metrics['idles_avg'] = sum(total_idles) / len(total_idles)
         metrics['end2end_latency'] = global_max_time - global_min_time
         metrics['throughput'] = self.total_tasks / (global_max_time - global_min_time)
+        metrics['num_tasks (node)'] = {nodeID: len(self.node_allocation[nodeID]) for nodeID in self.node_allocation}
+        metrics['retrain_tasks (node)'] = {nodeID: len([task for task in self.node_allocation[nodeID] if task['type'] == 'training']) for nodeID in self.node_allocation}
+        metrics['user_tasks (node)'] = {nodeID: len([task for task in self.node_allocation[nodeID] if task['type'] == 'test']) for nodeID in self.node_allocation}
+        metrics['bubble_rate (node)'] = {
+            nodeID: sum(idles) / sum(latencies) if sum(latencies) > 0 else 0 
+            for nodeID, idles, latencies in zip(node_idles.keys(), node_idles.values(), node_latencies.values())
+        }
+        metrics['end2end_latency (node)'] = {nodeID: node_timelines[nodeID][1] - node_timelines[nodeID][0] for nodeID in node_timelines}
+        metrics['throughput (node)'] = {nodeID: len(self.node_allocation[nodeID]) / (node_timelines[nodeID][1] - node_timelines[nodeID][0]) for nodeID in node_timelines}
+        metrics['idles_sum'] = sum(total_idles)
+        metrics['idles_sum (node)'] = {nodeID: sum(idles) for nodeID, idles in node_idles.items()}
+        metrics['idles_avg'] = sum(total_idles) / len(total_idles)
+        metrics['idles_avg (node)'] = {nodeID: sum(idles) / len(idles) if len(idles) > 0 else 0 for nodeID, idles in node_idles.items()}
         metrics['length_statistics'] = {
             'mean': self.mean_length,
             'std': self.std_length,
@@ -801,9 +849,10 @@ class DistributedLLM:
         
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)
-        length_heterogeneity = f"_hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "_hetero_default"
-        active_selection = f"_active{self.active_selection}" if self.active_selection is not None else "_active_1.0"
-        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}.json'
+        length_heterogeneity = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
+        active_selection = f"active{self.active_selection}" if self.active_selection is not None else "active_1.0"
+        task_assignment = f"{self.task_assignment}(alpha={self.alpha})" if self.task_assignment == 'workload' else self.task_assignment
+        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}")
