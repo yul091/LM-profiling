@@ -11,7 +11,8 @@ for NUM_NODES in 4 2; do
         for RATE_LAMBDA in 10 20 30 40 50; do
             OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
             for RETRAIN_RATE in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0; do
-                for TASK_ASSIGNMENT in "workload"; do
+                # for TASK_ASSIGNMENT in "workload" "random" "rr" "util"; do
+                for TASK_ASSIGNMENT in "util"; do
                     python distributed_dialogpt.py \
                         --model_name_or_path "microsoft/$MODEL_NAME" \
                         --model_name $MODEL_NAME \

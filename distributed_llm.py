@@ -11,6 +11,8 @@ import argparse
 import logging
 import numpy as np
 from tqdm import tqdm
+import GPUtil
+from GPUtil import GPU
 from typing import List, Dict, Optional, Any, Union, Tuple
 from collections import defaultdict
 import torch
@@ -450,6 +452,9 @@ class DistributedLLM:
             nodeID = node_list[best_index]
             self.node_accumulated_bubble[nodeID] += bi_list[best_index] - br_list[best_index]
             return nodeID 
+        elif self.task_assignment == 'util':
+            # Choose the node with the least average utilization across all its GPUs
+            return min(node_list, key=lambda nodeID: np.mean([torch.cuda.memory_allocated(device) for device in self.distributed_nodes[nodeID].device_ids]))
             
         else:
             raise ValueError(f"Invalid task assignment method: {self.task_assignment}")
@@ -472,13 +477,17 @@ class DistributedLLM:
             # Task assignment
             assign_start = time.time()
             require_training = self.distributed_preloaded_tasks[0][taskID].require_training
-            if self.setting != 'isolated':
-                nodeID = self._assign_node(node_list=list(range(self.num_nodes)), taskID=taskID)
-            else:
-                if require_training:
-                    nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID) # assign to one of the training nodes
+            try:
+                if self.setting != 'isolated':
+                    nodeID = self._assign_node(node_list=list(range(self.num_nodes)), taskID=taskID)
                 else:
-                    nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID) # assign to one of the test nodes
+                    if require_training:
+                        nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID) # assign to one of the training nodes
+                    else:
+                        nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID) # assign to one of the test nodes
+            except Exception as e:
+                logging.error(f"[Task {taskID}] Node assignment error occurred: {e}")
+                nodeID = random.choice(list(range(self.num_nodes)))
                     
             # Update train trace and all trace with the task trace
             if self.task_assignment == 'workload':
@@ -878,7 +887,7 @@ if __name__ == '__main__':
     parser.add_argument('--isolated_split', type=float, default=None, 
                         help='split ratio for isolated test & train nodes. If not provided, the retraining rate is used.')
     parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority, default: FIFO')
-    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload'], 
+    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload', 'util'], 
                         help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='proportion of training tasks')

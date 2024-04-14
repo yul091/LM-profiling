@@ -192,7 +192,7 @@ if __name__ == '__main__':
     parser.add_argument('--isolated_split', type=float, default=None, 
                         help='split ratio for isolated test & train nodes. If not provided, the retraining rate is used.')
     parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority, default: FIFO')
-    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload'], 
+    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload', 'util'], 
                         help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='proportion of training tasks')

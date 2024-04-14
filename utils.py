@@ -53,6 +53,7 @@ class Node:
         self.device_queues = [queue.PriorityQueue() for _ in range(num_gpus_per_node)]
         self.init_device = init_device if init_device is not None else 0
         self.last_device = init_device + num_gpus_per_node - 1
+        self.device_ids = list(range(init_device, init_device + num_gpus_per_node))
         
         
 class Task:

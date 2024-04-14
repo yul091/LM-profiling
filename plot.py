@@ -115,7 +115,7 @@ if __name__ == '__main__':
     parser.add_argument('--setting', type=str, default='active', help='workload setting')
     parser.add_argument('--isolated_split', type=float, default=None, help='split ratio for isolated test and train nodes')
     parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority')
-    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload'], 
+    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload', 'util'], 
                         help='node level scheduling policy')
     parser.add_argument('--alpha', type=float, default=1, help='bubble profit coefficient')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')

@@ -12,4 +12,5 @@ seaborn
 portalocker
 torchdata
 torchtext
+gputil
 fschat[model_worker,webui]
