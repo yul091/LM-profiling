@@ -15,8 +15,8 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     workload = args.workload
     retraining_rate = args.retraining_rate
     model_name = args.model_name
-    # task_assignment = args.task_assignment
-    task_assignment = f"{args.task_assignment}(alpha={args.alpha})" if args.task_assignment == 'workload' else args.task_assignment
+    task_assignment = args.task_assignment
+    # task_assignment = f"{args.task_assignment}(a={args.alpha}|b={args.beta})" if args.task_assignment == 'workload' else args.task_assignment
     length_distribution = args.length_distribution
     length_heterogeneity = f"hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "hetero_default"
     active_selection = f"active{args.active_selection}" if args.active_selection is not None else "active_1.0"
@@ -117,7 +117,8 @@ if __name__ == '__main__':
     parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority')
     parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload', 'util'], 
                         help='node level scheduling policy')
-    parser.add_argument('--alpha', type=float, default=1, help='bubble profit coefficient')
+    parser.add_argument('--alpha', type=float, default=1, help='response time coefficient')
+    parser.add_argument('--beta', type=float, default=1, help='length heterogeneity coefficient')
     parser.add_argument('--workload', type=str, choices=['poisson', 'all'], default='poisson', help='workload type')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
     parser.add_argument('--node', type=int, default=1, help='number of nodes for distributed systems')
@@ -134,8 +135,8 @@ if __name__ == '__main__':
     workload = args.workload
     model_name = args.model_name
     retraining_rate = args.retraining_rate
-    # task_assignment = args.task_assignment
-    task_assignment = f"{args.task_assignment}(alpha={args.alpha})" if args.task_assignment == 'workload' else args.task_assignment
+    task_assignment = args.task_assignment
+    # task_assignment = f"{args.task_assignment}(a={args.alpha}|b={args.beta})" if args.task_assignment == 'workload' else args.task_assignment
     length_distribution = args.length_distribution
     length_heterogeneity = f"hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "hetero_default"
     active_selection = f"active{args.active_selection}" if args.active_selection is not None else "active_1.0"

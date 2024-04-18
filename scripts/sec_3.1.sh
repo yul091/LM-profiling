@@ -2,17 +2,22 @@ NUM_SAMPLES=1000
 BATCH_SIZE=3
 WORKLOAD=poisson
 MEMORY_THRESHOLD=0.5
-SETTING=active
+SETTING=active # "active" "isolated"
+# TASK_ASSIGNMENT=workload # "workload" "random" "rr" "util"
+# LENGTH_DIST=ascending # "ascending" "bursty" "random"
 BASE_DIR=prof_3.1
+MODEL_NAME="DialoGPT-large"
+EPSILON=0.05
+ALPHA=1.0
+BETA=0.1
 
-
-for NUM_NODES in 4 2; do
-    for MODEL_NAME in "DialoGPT-large"; do
-        for RATE_LAMBDA in 10 20 30 40 50; do
+for NUM_NODES in 4; do
+    # for MODEL_NAME in "DialoGPT-large"; do
+    for LENGTH_DIST in "random"; do
+        for RATE_LAMBDA in 1; do
             OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
-            for RETRAIN_RATE in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0; do
-                # for TASK_ASSIGNMENT in "workload" "random" "rr" "util"; do
-                for TASK_ASSIGNMENT in "util"; do
+            for RETRAIN_RATE in 0.05 0.1 0.15 0.2 0.25 0.3; do
+                for TASK_ASSIGNMENT in "random" "rr" "util"; do
                     python distributed_dialogpt.py \
                         --model_name_or_path "microsoft/$MODEL_NAME" \
                         --model_name $MODEL_NAME \
@@ -26,6 +31,11 @@ for NUM_NODES in 4 2; do
                         --task_assignment $TASK_ASSIGNMENT \
                         --output_dir $OUTPUT_DIR \
                         --batch_size $BATCH_SIZE \
+                        --alpha $ALPHA \
+                        --beta $BETA \
+                        --epsilon $EPSILON \
+                        --length_heterogeneity 200 \
+                        --length_distribution $LENGTH_DIST \
                         --memory_threshold $MEMORY_THRESHOLD
 
                     python plot.py \
@@ -35,6 +45,10 @@ for NUM_NODES in 4 2; do
                         --workload $WORKLOAD \
                         --task_assignment $TASK_ASSIGNMENT \
                         --retraining_rate $RETRAIN_RATE \
+                        --length_heterogeneity 200 \
+                        --length_distribution $LENGTH_DIST \
+                        --alpha $ALPHA \
+                        --beta $BETA \
                         --output_dir $OUTPUT_DIR
                 done
             done

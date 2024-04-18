@@ -62,6 +62,7 @@ class DistributedLLM:
         self.eta = None # forward coefficient
         self.BT = None # backward latency
         self.alpha = args.alpha
+        self.beta = args.beta
         self.epsilon = args.epsilon
         
         if self.setting == 'isolated':
@@ -78,11 +79,11 @@ class DistributedLLM:
             self._train_nodes = list(range(self.num_nodes))
             self._test_nodes = list(range(self.num_nodes))
         
-        task_assignment = f"{self.task_assignment}(alpha={self.alpha})" if self.task_assignment == 'workload' else self.task_assignment
+        # task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta})" if self.task_assignment == 'workload' else self.task_assignment
         if self.priority is not None:
-            self.ckpt_path = f'{self.output_dir}/stages-{task_assignment}_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
+            self.ckpt_path = f'{self.output_dir}/stages-{self.task_assignment}_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
         else:
-            self.ckpt_path = f'{self.output_dir}/stages-{task_assignment}_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
+            self.ckpt_path = f'{self.output_dir}/stages-{self.task_assignment}_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}'
 
         self.task_arrival = defaultdict(dict)
         self.task_trace = defaultdict(lambda: defaultdict(dict))
@@ -366,14 +367,16 @@ class DistributedLLM:
         br, bi, init_id, finished_ids = 0, 0, 0, []
         previous_taskIDs = list(self.all_trace[nodeID].keys())
         previous_train_taskIDs = list(self.train_trace[nodeID].keys())
-        eta = self.eta if self.eta is not None else 0.02
-        BT = self.BT if self.BT is not None else 0.05
+        eta = self.eta if self.eta is not None else 0.002
+        BT = self.BT if self.BT is not None else 0.005
             
         # Get/Estimate previous forward execution traces
         if previous_taskIDs:
             last_taskID = previous_taskIDs[-1]
+            arrival_gap = self.task_arrival[taskID]['release'] - self.task_arrival[last_taskID]['release']
         else:
             last_taskID = None
+            arrival_gap = 0
             
         for stageID in range(self.num_gpus_per_node):
             pfe = self.all_trace[nodeID][last_taskID][stageID]['fe'] if last_taskID is not None else fb
@@ -384,7 +387,7 @@ class DistributedLLM:
             for i in range(init_id, len(previous_train_taskIDs)):
                 ptID = previous_train_taskIDs[i]
                 if fe <= self.train_trace[nodeID][ptID][stageID]['bb']:
-                    br += eta * length ** 2
+                    br += eta * length ** 2 # update BR
                     break
                 fb = max(fb, self.train_trace[nodeID][ptID][stageID]['be']) # forward starts at least at the end of the backward
                 fe = fb + eta * length ** 2
@@ -394,15 +397,16 @@ class DistributedLLM:
             # Write the forward and backward execution traces
             self.task_trace[nodeID][stageID]['fb'] = fb
             self.task_trace[nodeID][stageID]['fe'] = fe
-            if require_training:
-                self.task_trace[nodeID][stageID]['bb'] = fe + (self.num_gpus_per_node - 1 - stageID) * (BT + eta * length ** 2)
-                self.task_trace[nodeID][stageID]['be'] = self.task_trace[nodeID][stageID]['bb'] + BT
-      
-            bi += max(fb - pfe - (i - init_id) * BT, 0) # update bubble increase
+            bi += max(fb - pfe - (i - init_id) * BT, 0) # update BI
             init_id = i + 1 # update the initial training check index for the next stage
-            
+        
         if require_training:
-            bi += self.num_gpus_per_node * (self.num_gpus_per_node - 1) * (BT + eta * length ** 2) / 2  # S(S-1)(F+B)/2
+            bb = fe # backward starts at the end of the forward
+            for stageID in range(self.num_gpus_per_node-1, -1, -1):
+                self.task_trace[nodeID][stageID]['bb'] = bb
+                self.task_trace[nodeID][stageID]['be'] = bb + BT
+                # bi += max(bb - self.task_trace[nodeID][stageID]['fe'], 0) # update BI
+                bb += BT
         
         # Clear the finished training tasks
         for ptID in finished_ids:
@@ -410,16 +414,32 @@ class DistributedLLM:
             self.all_trace[nodeID].pop(ptID)
                     
         # Compute reward (bubble profit and response time)
-        # response = fe - self.task_arrival[taskID]['release']
-        # reward = self.alpha * (br - bi) / (response + self.epsilon)
-        if len(self.node_allocation[nodeID]) > 0: # this node is not empty
-            reward = (self.node_accumulated_bubble[nodeID] + bi) / (len(self.node_allocation[nodeID]) + 1)
-        else:
-            reward = 10000 # we prefer to assign a task to the empty node
+        response = fe - self.task_arrival[taskID]['release']
+        LH = self.calculate_node_LH(nodeID, length) if self.beta != 0 else 0
+        # if arrival_gap is not None:
+        #     reward = (br - bi / (1000 * arrival_gap)) / (self.alpha * response + self.beta * LH + self.epsilon)
+        # else:
+        #     reward = (br - bi) / (self.alpha * response + self.beta * LH + self.epsilon)
+        # Normalize BI by the arrival gap
+        # original_bi = bi
+        # bi = max(1/self.test_lambda - eta * length ** 2 - self.epsilon, 0)
+        # if last_taskID is None: # the first task
+        #     fbi = 0
+        # else:
+            # fbi = max(bi/self.num_gpus_per_node - arrival_gap - self.epsilon, 0)
+        fbi = max(self.epsilon, bi/self.num_gpus_per_node - arrival_gap)
+        reward = (br - fbi) / (self.alpha * response + self.beta * LH + self.epsilon)
+        # reward = br / (self.alpha * response + self.beta * LH + self.epsilon)
+        print(f"[Node {nodeID} | Task {taskID} | reward {reward:.2f}]: epsilon {self.epsilon} - BI {bi:.2f} (BI/N - |a - a0|: {bi/self.num_gpus_per_node - arrival_gap:.2f}) - BR {br:.2f} - Response {response:.2f} - LH {LH:.2f}")
+        # reward = br / (self.alpha * response + self.beta * LH + self.epsilon)
+        # if len(self.node_allocation[nodeID]) > 0: # this node is not empty
+        #     reward = (self.node_accumulated_bubble[nodeID] + bi) / (len(self.node_allocation[nodeID]) + 1)
+        # else:
+        #     reward = 10000 # we prefer to assign a task to the empty node
         # reward = br - bi # only consider bubble rate
         # blank = self.node_accumulated_bubble[nodeID] + bi
-        # return blank, br, bi
-        return reward, br, bi
+        # return reward, br, bi
+        return reward
             
         
         
@@ -435,26 +455,32 @@ class DistributedLLM:
             # return min(node_list, key=lambda nodeID: self.distributed_nodes[nodeID].device_queues[0].qsize())
             reward_list, bi_list, br_list = [], [], []
             for nodeID in node_list:
-                # try:
-                reward, br, bi = self._compute_rewards(nodeID, taskID)
-                # except Exception as e:
-                #     reward = random.random()
-                #     logging.error(f"[node {nodeID} | task {taskID}] Bubble calculation error occurred: {e}")
+                try:
+                    reward = self._compute_rewards(nodeID, taskID)
+                except Exception as e:
+                    reward = random.random()
+                    logging.error(f"[node {nodeID} | task {taskID}] Bubble calculation error occurred: {e}")
                 # reward = self._compute_rewards(nodeID, taskID)
                 reward_list.append(reward)
-                br_list.append(br)
-                bi_list.append(bi)
-                
-            # best_index = np.argmax(reward_list) # assign task to the node with the highest reward (lowest average utilization)
-            # Instead of greedy, let's use sampling with probability proportional to the reward
-            reward_list = F.softmax(torch.FloatTensor(reward_list), dim=0).numpy()  
-            best_index = np.random.choice(range(len(reward_list)), p=reward_list)
+                # br_list.append(br)
+                # bi_list.append(bi)
+            
+            # Greedy: assign task to the node with the highest reward (lowest average utilization)
+            best_index = np.argmax(reward_list) 
+            # make it more smart, if some reward values are the same, randomly choose one
+            # best_index = np.random.choice(np.where(reward_list == np.max(reward_list))[0])
+            # # Instead of greedy, let's use sampling with probability proportional to the reward
+            # reward_list = F.softmax(torch.FloatTensor(reward_list), dim=0).numpy()  
+            # best_index = np.random.choice(range(len(reward_list)), p=reward_list)
             nodeID = node_list[best_index]
-            self.node_accumulated_bubble[nodeID] += bi_list[best_index] - br_list[best_index]
+            # self.node_accumulated_bubble[nodeID] += bi_list[best_index] - br_list[best_index]
             return nodeID 
+        
         elif self.task_assignment == 'util':
             # Choose the node with the least average utilization across all its GPUs
-            return min(node_list, key=lambda nodeID: np.mean([torch.cuda.memory_allocated(device) for device in self.distributed_nodes[nodeID].device_ids]))
+            gpus: List[GPU] = GPUtil.getGPUs()
+            return min(node_list, key=lambda nodeID: np.mean([gpus[device].memoryUtil for device in self.distributed_nodes[nodeID].device_ids]))
+            # return min(node_list, key=lambda nodeID: np.mean([torch.cuda.memory_allocated(device) for device in self.distributed_nodes[nodeID].device_ids]))
             
         else:
             raise ValueError(f"Invalid task assignment method: {self.task_assignment}")
@@ -617,6 +643,22 @@ class DistributedLLM:
         return tuple_outputs
     
     
+    def calculate_node_LH(
+        self, 
+        nodeID: int,
+        task_length: int,
+        window_size: int = 10,
+    ):
+        history_lengths = [task['length'] for task in self.node_allocation[nodeID][-window_size:]]
+        if len(history_lengths) == 0:
+            return 0
+        mean, std = np.mean(history_lengths), np.std(history_lengths)
+        if std == 0:
+            return 0
+        # Gaussian probability based on task length as length heterogeneity
+        return scipy.stats.norm(mean, std).pdf(task_length)
+        
+    
     def selective_algorithm(
         self, 
         task_length: int,
@@ -737,14 +779,14 @@ class DistributedLLM:
         
         length_heterogeneity = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
         active_selection = f"active{self.active_selection}" if self.active_selection is not None else "active_1.0"
-        task_assignment = f"{self.task_assignment}(alpha={self.alpha})" if self.task_assignment == 'workload' else self.task_assignment
+        # task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta})" if self.task_assignment == 'workload' else self.task_assignment
         for nodeID, timing_info in self.timing_infos.items():
             # # Remove the first start and end time for each GPU
             # gpus = list(set(int(key.split('_')[0]) for key in timing_info))
             # for gpu_id in gpus:
             #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
             #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
+            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{self.task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
         
@@ -860,8 +902,8 @@ class DistributedLLM:
         os.makedirs(self.output_dir, exist_ok=True)
         length_heterogeneity = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
         active_selection = f"active{self.active_selection}" if self.active_selection is not None else "active_1.0"
-        task_assignment = f"{self.task_assignment}(alpha={self.alpha})" if self.task_assignment == 'workload' else self.task_assignment
-        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}.json'
+        # task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta})" if self.task_assignment == 'workload' else self.task_assignment
+        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{self.task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}")
@@ -894,8 +936,9 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
     parser.add_argument('--train_lambda', type=int, default=10, help='Average number of training tasks produced per second')
     parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
-    parser.add_argument('--alpha', type=float, default=1, help='bubble profit coefficient')
-    parser.add_argument('--epsilon', type=float, default=1e-5, help='small value to avoid division by zero')
+    parser.add_argument('--alpha', type=float, default=1, help='response time coefficient')
+    parser.add_argument('--beta', type=float, default=1, help='length heterogeneity coefficient')
+    parser.add_argument('--epsilon', type=float, default=1e-6, help='small value to avoid division by zero')
     parser.add_argument('--workload', type=str, default='poisson', help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], 
                         help='distribution of input sequence length')
