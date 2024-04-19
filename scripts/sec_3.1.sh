@@ -10,14 +10,16 @@ MODEL_NAME="DialoGPT-large"
 EPSILON=0.05
 ALPHA=1.0
 BETA=0.1
+LENGTH_HETEROGENEITY=200
 
 for NUM_NODES in 4; do
     # for MODEL_NAME in "DialoGPT-large"; do
     for LENGTH_DIST in "random"; do
-        for RATE_LAMBDA in 1; do
+        for RATE_LAMBDA in 1 5 10 15 20 25 30; do
             OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
-            for RETRAIN_RATE in 0.05 0.1 0.15 0.2 0.25 0.3; do
-                for TASK_ASSIGNMENT in "random" "rr" "util"; do
+            for RETRAIN_RATE in 0.01 0.05 0.1 0.15 0.2 0.25 0.3; do
+                # for LENGTH_HETEROGENEITY in 0 10 50 100 200; do
+                for TASK_ASSIGNMENT in "random" "rr" "util" "workload"; do
                     python distributed_dialogpt.py \
                         --model_name_or_path "microsoft/$MODEL_NAME" \
                         --model_name $MODEL_NAME \
@@ -34,7 +36,7 @@ for NUM_NODES in 4; do
                         --alpha $ALPHA \
                         --beta $BETA \
                         --epsilon $EPSILON \
-                        --length_heterogeneity 200 \
+                        --length_heterogeneity $LENGTH_HETEROGENEITY \
                         --length_distribution $LENGTH_DIST \
                         --memory_threshold $MEMORY_THRESHOLD
 
@@ -45,11 +47,12 @@ for NUM_NODES in 4; do
                         --workload $WORKLOAD \
                         --task_assignment $TASK_ASSIGNMENT \
                         --retraining_rate $RETRAIN_RATE \
-                        --length_heterogeneity 200 \
+                        --length_heterogeneity $LENGTH_HETEROGENEITY \
                         --length_distribution $LENGTH_DIST \
                         --alpha $ALPHA \
                         --beta $BETA \
                         --output_dir $OUTPUT_DIR
+                    # done
                 done
             done
         done

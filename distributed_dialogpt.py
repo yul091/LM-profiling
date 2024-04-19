@@ -96,59 +96,59 @@ class DistributedDialoGPT(DistributedLLM):
                 # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())
                 
-                if task.require_training:
+                if task.do_backward:
                     # # Synchronize to ensure all previous operations on the GPU are completed
                     # torch.cuda.synchronize(device)
                     # Backprop on the last stage
-                    if self.active_selection is None:
-                        do_backward = True
-                    else:
-                        if self.active_selection == 'adaptive':
-                            do_backward = self.selective_algorithm(
-                                input_length,
-                                training_step=self._training_step,
-                                trained_task_lengths=self._trained_task_lengths,
-                                total_training_tasks=self.retraining_tasks,
-                            )
-                        else:
-                            do_backward = random.random() < float(self.active_selection)
+                    # if self.active_selection is None:
+                    #     do_backward = True
+                    # else:
+                    #     if self.active_selection == 'adaptive':
+                    #         do_backward = self.selective_algorithm(
+                    #             input_length,
+                    #             training_step=self._training_step,
+                    #             trained_task_lengths=self._trained_task_lengths,
+                    #             total_training_tasks=self.retraining_tasks,
+                    #         )
+                    #     else:
+                    #         do_backward = random.random() < float(self.active_selection)
                     
-                    if do_backward:
-                        bb = time.time()
-                        self.task_trace[nodeID][self.num_gpus_per_node-1]['bb'] = bb
-                        if taskID in self.train_trace[nodeID]:
-                            self.train_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
-                            self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
+                    # if do_backward:
+                    bb = time.time()
+                    self.task_trace[nodeID][self.num_gpus_per_node-1]['bb'] = bb
+                    if taskID in self.train_trace[nodeID]:
+                        self.train_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
+                        self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
+                    
+                    try:
+                        if self.BT is None:
+                            self.backward_start.record()
+                        loss.backward()
+                        be = record_time(init_device, 'end', 'backward', taskID, timing_info)
+                        if self.BT is None:
+                            self.backward_end.record()
+                            torch.cuda.synchronize()
+                            # Profiling backward time (seconds) per stage
+                            self.BT = self.backward_start.elapsed_time(self.backward_end) / (self.num_gpus_per_node * 1e3)
+                    except Exception as e:
+                        # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
+                        pass
+                    
+                    self.task_trace[nodeID][0]['be'] = be
+                    if taskID in self.train_trace[nodeID]:
+                        self.train_trace[nodeID][taskID][0]['be'] = be   
+                        self.all_trace[nodeID][taskID][0]['be'] = be
                         
-                        try:
-                            if self.BT is None:
-                                self.backward_start.record()
-                            loss.backward()
-                            be = record_time(init_device, 'end', 'backward', taskID, timing_info)
-                            if self.BT is None:
-                                self.backward_end.record()
-                                torch.cuda.synchronize()
-                                # Profiling backward time (seconds) per stage
-                                self.BT = self.backward_start.elapsed_time(self.backward_end) / (self.num_gpus_per_node * 1e3)
-                        except Exception as e:
-                            # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
-                            pass
-                        
-                        self.task_trace[nodeID][0]['be'] = be
-                        if taskID in self.train_trace[nodeID]:
-                            self.train_trace[nodeID][taskID][0]['be'] = be   
-                            self.all_trace[nodeID][taskID][0]['be'] = be
-                          
-                        self._trained_task_lengths.append(input_length)
-                        
-                        # Optimization
-                        try:
-                            self.distributed_optimizers[nodeID].step()
-                            self.distributed_schedulers[nodeID].step()
-                        except Exception as e:
-                            logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
-                            # pass
-                        print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                    self._trained_task_lengths.append(input_length)
+                    
+                    # Optimization
+                    try:
+                        self.distributed_optimizers[nodeID].step()
+                        self.distributed_schedulers[nodeID].step()
+                    except Exception as e:
+                        logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
+                        # pass
+                    print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                     
                     self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     

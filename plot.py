@@ -19,7 +19,7 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     # task_assignment = f"{args.task_assignment}(a={args.alpha}|b={args.beta})" if args.task_assignment == 'workload' else args.task_assignment
     length_distribution = args.length_distribution
     length_heterogeneity = f"hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "hetero_default"
-    active_selection = f"active{args.active_selection}" if args.active_selection is not None else "active_1.0"
+    active_selection = f"active_{args.active_selection}" if args.active_selection is not None else "active_1.0"
     if setting == 'isolated':
         isolated_split = args.isolated_split if args.isolated_split is not None else retraining_rate
         setting = f"isolated-split{isolated_split}"
@@ -139,7 +139,7 @@ if __name__ == '__main__':
     # task_assignment = f"{args.task_assignment}(a={args.alpha}|b={args.beta})" if args.task_assignment == 'workload' else args.task_assignment
     length_distribution = args.length_distribution
     length_heterogeneity = f"hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "hetero_default"
-    active_selection = f"active{args.active_selection}" if args.active_selection is not None else "active_1.0"
+    active_selection = f"active_{args.active_selection}" if args.active_selection is not None else "active_1.0"
     if setting == 'isolated':
         isolated_split = args.isolated_split if args.isolated_split is not None else retraining_rate
         setting = f"isolated-split{isolated_split}"

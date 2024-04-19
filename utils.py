@@ -75,6 +75,8 @@ class Task:
         self.feedback = feedback
         self.node_id = node_id if node_id is not None else 0
         self.require_training = False if require_training is None else require_training
+        # Define do_backward for selective training: initially set to require_training
+        self.do_backward = False if require_training is None else require_training
 
 
 def record_time(
