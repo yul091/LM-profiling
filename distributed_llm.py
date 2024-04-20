@@ -516,21 +516,24 @@ class DistributedLLM:
     def _assign_node(self, node_list: List[int], taskID: int):
         if len(node_list) == 1:
             return node_list[0]
-        if self.task_assignment == 'random': # Random assignment
+        if 'random' in self.task_assignment: # Random assignment
             return random.choice(node_list)
-        elif self.task_assignment == 'rr': # Round-robin
+        elif 'rr' in self.task_assignment: # Round-robin
             return node_list[taskID % len(node_list)]
+        elif 'util' in self.task_assignment: # LUF: choose the node with the least average utilization across all its GPUs
+            gpus: List[GPU] = GPUtil.getGPUs()
+            return min(node_list, key=lambda nodeID: np.mean([gpus[device].memoryUtil for device in self.distributed_nodes[nodeID].device_ids]))
+            # return min(node_list, key=lambda nodeID: np.mean([torch.cuda.memory_allocated(device) for device in self.distributed_nodes[nodeID].device_ids]))
         elif self.task_assignment == 'workload':
             # # Choose the node with the least workload (number of tasks in the first device queue)
             # return min(node_list, key=lambda nodeID: self.distributed_nodes[nodeID].device_queues[0].qsize())
-            reward_list, bi_list, br_list = [], [], []
+            reward_list = []
             for nodeID in node_list:
                 try:
                     reward = self._compute_rewards(nodeID, taskID)
                 except Exception as e:
                     reward = random.random()
                     logging.error(f"[node {nodeID} | task {taskID}] Bubble calculation error occurred: {e}")
-                # reward = self._compute_rewards(nodeID, taskID)
                 reward_list.append(reward)
                 # br_list.append(br)
                 # bi_list.append(bi)
@@ -545,13 +548,6 @@ class DistributedLLM:
             nodeID = node_list[best_index]
             # self.node_accumulated_bubble[nodeID] += bi_list[best_index] - br_list[best_index]
             return nodeID 
-        
-        elif self.task_assignment == 'util':
-            # Choose the node with the least average utilization across all its GPUs
-            gpus: List[GPU] = GPUtil.getGPUs()
-            return min(node_list, key=lambda nodeID: np.mean([gpus[device].memoryUtil for device in self.distributed_nodes[nodeID].device_ids]))
-            # return min(node_list, key=lambda nodeID: np.mean([torch.cuda.memory_allocated(device) for device in self.distributed_nodes[nodeID].device_ids]))
-            
         else:
             raise ValueError(f"Invalid task assignment method: {self.task_assignment}")
         
