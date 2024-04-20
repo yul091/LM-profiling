@@ -64,20 +64,31 @@ class DistributedLLM:
         self.alpha = args.alpha
         self.beta = args.beta
         self.epsilon = args.epsilon
-        
+            
+        # If dynamic method has decided the number of nodes, use that for 'rr+', 'random+', 'util+'
         if self.setting == 'isolated':
             self.isolated_split = args.isolated_split if args.isolated_split is not None else self.retraining_rate
             setting = f"isolated-split{self.isolated_split}"
-            
-            num_train_nodes = max(1, round(self.num_nodes * self.isolated_split))
-            num_test_nodes = max(1, self.num_nodes - num_train_nodes)
-            self._test_nodes = list(range(num_test_nodes))
-            self._train_nodes = list(range(num_test_nodes, self.num_nodes))
-            print(f"** ISOLATED SYSTEM: Test nodes: {self._test_nodes}, Train nodes: {self._train_nodes} **")
         else:
             setting = self.setting
-            self._train_nodes = list(range(self.num_nodes))
-            self._test_nodes = list(range(self.num_nodes))
+        lh = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
+        asl = f"active_{self.active_selection}" if self.active_selection is not None else "active_1.0"
+        stats_f = f'{self.output_dir}/metrics_{self.model_n}_workload_{setting}-{self.priority}_{self.workload}-{lh}-{self.length_distribution}_{self.retraining_rate}-{asl}.json'
+        self.used_nodes = self.num_nodes
+        if os.path.exists(stats_f) and self.task_assignment in ['rr+', 'random+', 'util+']:
+            workload_res = json.load(open(stats_f))
+            self.used_nodes = sum(x > 0 for x in workload_res["num_tasks (node)"].values())
+            print(f"\n ** TASK ASSIGNMENT: {self.task_assignment} | Number of used nodes: {self.used_nodes} (out of {args.num_nodes}) **\n")
+            
+        if self.setting == 'isolated':
+            num_train_nodes = max(1, round(self.used_nodes * self.isolated_split))
+            num_test_nodes = max(1, self.used_nodes - num_train_nodes)
+            self._test_nodes = list(range(num_test_nodes))
+            self._train_nodes = list(range(num_test_nodes, self.used_nodes))
+            print(f"** ISOLATED SYSTEM: Test nodes: {self._test_nodes}, Train nodes: {self._train_nodes} **")
+        else:
+            self._train_nodes = list(range(self.used_nodes))
+            self._test_nodes = list(range(self.used_nodes))
         
         # task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta})" if self.task_assignment == 'workload' else self.task_assignment
         if self.priority is not None:
@@ -381,11 +392,6 @@ class DistributedLLM:
         total_training_tasks: int,
     ):
         # print("Selective algorithm will be implemented!")
-        # if not trained_task_lengths:
-        #     return True
-        # length_mean, length_std = np.mean(trained_task_lengths), np.std(trained_task_lengths)
-        # if length_std == 0:
-        #     return True
         LH = self._compute_LH(nodeID, task_length)
         
         if self.active_selection is None:
@@ -568,7 +574,7 @@ class DistributedLLM:
             assign_start = time.time()
             try:
                 if self.setting != 'isolated':
-                    nodeID = self._assign_node(node_list=list(range(self.num_nodes)), taskID=taskID)
+                    nodeID = self._assign_node(node_list=list(range(self.used_nodes)), taskID=taskID)
                 else:
                     if self.distributed_preloaded_tasks[0][taskID].require_training:
                         nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID) # assign to one of the training nodes
@@ -576,7 +582,7 @@ class DistributedLLM:
                         nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID) # assign to one of the test nodes
             except Exception as e:
                 logging.error(f"[Task {taskID}] Node assignment error occurred: {e}")
-                nodeID = random.choice(list(range(self.num_nodes)))
+                nodeID = random.choice(list(range(self.used_nodes)))
                     
             # Update train trace and all trace with the task trace
             if self.task_assignment == 'workload':
@@ -958,7 +964,7 @@ if __name__ == '__main__':
     parser.add_argument('--isolated_split', type=float, default=None, 
                         help='split ratio for isolated test & train nodes. If not provided, the retraining rate is used.')
     parser.add_argument('--priority', type=str, default='FIFO', help='scheduling priority, default: FIFO')
-    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload', 'util'], 
+    parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload', 'util', 'rr+', 'random+', 'util+'], 
                         help='node level scheduling policy')
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='proportion of training tasks')
