@@ -10,6 +10,7 @@ import random
 import argparse
 import logging
 import numpy as np
+import subprocess
 from tqdm import tqdm
 import GPUtil
 from GPUtil import GPU
@@ -188,7 +189,7 @@ class DistributedLLM:
         )
         
         # Preloaded dataset
-        self.distributed_preloaded_tasks, self.total_tasks, self.retraining_tasks = self.get_preloaded_dataset(
+        self.distributed_preloaded_tasks, self.total_tasks, self.retraining_tasks, retraining_taskIDs = self.get_preloaded_dataset(
             self.distributed_nodes, 
             self.test_dataloader, 
             retraining_rate=self.retraining_rate,
@@ -197,6 +198,21 @@ class DistributedLLM:
         print(f" ** Total tasks: {self.total_tasks}, retraining tasks: {self.retraining_tasks}, saving steps: {self.saving_steps} ** ")
         self._training_step = 0
         self._trained_task_lengths = []
+        
+        if self.active_selection in ['random', 'first', 'last']:
+            adapt_f = f'{self.output_dir}/metrics_{self.model_n}_{self.task_assignment}_{setting}-{self.priority}_{self.workload}-{lh}-{self.length_distribution}_{self.retraining_rate}-active_adaptive.json'
+            if os.path.exists(adapt_f):
+                adapt_res = json.load(open(adapt_f))
+                actual_trained_tasks = adapt_res['actual_retrained_tasks']
+                print(f"\n ** Actual tasks to be trained: {actual_trained_tasks} (according to adaptive) **\n")
+                if self.active_selection == 'random':
+                    self.backward_taskIDs = set(random.sample(retraining_taskIDs, k=actual_trained_tasks))
+                elif self.active_selection == 'first':
+                    self.backward_taskIDs = set(retraining_taskIDs[:actual_trained_tasks])
+                else:
+                    self.backward_taskIDs = set(retraining_taskIDs[-actual_trained_tasks:])
+            else:
+                self.backward_taskIDs = set(retraining_taskIDs)
         
         # Save task length distribution for further analysis
         if self.save_length:
@@ -291,7 +307,7 @@ class DistributedLLM:
         dataloader = dataloader if dataloader is not None else self.test_dataloader
         retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
         distributed_preloaded_tasks = defaultdict(list)
-        total_tasks, retraining_tasks = 0, 0
+        total_tasks, retraining_tasks, retraining_taskIDs = 0, 0, []
         
         selected_data = []
         for i, batch in enumerate(dataloader):
@@ -324,7 +340,9 @@ class DistributedLLM:
             # 10% of the time, produce a task with feedback
             require_training = random.random() < retraining_rate
             total_tasks += 1
-            retraining_tasks += 1 if require_training else 0
+            if require_training:
+                retraining_tasks += 1 
+                retraining_taskIDs.append(i)
                 
             for nodeID, node in distributed_nodes.items():
                 task = Task(
@@ -339,7 +357,7 @@ class DistributedLLM:
                 )
                 distributed_preloaded_tasks[nodeID].append(task)
         
-        return distributed_preloaded_tasks, total_tasks, retraining_tasks
+        return distributed_preloaded_tasks, total_tasks, retraining_tasks, retraining_taskIDs
 
 
     def producer(
@@ -386,6 +404,7 @@ class DistributedLLM:
     
     def _check_do_backward(
         self, 
+        taskID: int,
         task_length: int,
         training_step: int,
         nodeID: int,
@@ -400,8 +419,12 @@ class DistributedLLM:
             if self.active_selection == 'adaptive':
                 P_adjusted = 0.1 * LH + 0.9 * (1 - (training_step / total_training_tasks))
                 do_backward = P_adjusted > random.random()
+            elif self.active_selection in ['random', 'first', 'last']:
+                do_backward = taskID in self.backward_taskIDs
             else:
-                do_backward = random.random() < float(self.active_selection)
+                raise ValueError(f"Invalid active selection type: {self.active_selection}!")
+            # else:
+            #     do_backward = random.random() < float(self.active_selection)
             # try:
             #     # Gaussian probability based on task length
             #     # LH = (1 / (self.std_length * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - self.mean_length) / self.std_length) ** 2)
@@ -426,7 +449,7 @@ class DistributedLLM:
         """
         length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1]
         if self.distributed_preloaded_tasks[nodeID][taskID].require_training:
-            do_backward, LH = self._check_do_backward(length, self._training_step, nodeID, self.retraining_tasks)
+            do_backward, LH = self._check_do_backward(taskID, length, self._training_step, nodeID, self.retraining_tasks)
         else:
             do_backward, LH = False, self._compute_LH(nodeID, length)
         # Update do_backward flag
@@ -521,9 +544,11 @@ class DistributedLLM:
         elif 'rr' in self.task_assignment: # Round-robin
             return node_list[taskID % len(node_list)]
         elif 'util' in self.task_assignment: # LUF: choose the node with the least average utilization across all its GPUs
+            # gputils = self._get_gpu_utilization()
+            # return min(node_list, key=lambda nodeID: gputils[nodeID])
             gpus: List[GPU] = GPUtil.getGPUs()
             return min(node_list, key=lambda nodeID: np.mean([gpus[device].memoryUtil for device in self.distributed_nodes[nodeID].device_ids]))
-            # return min(node_list, key=lambda nodeID: np.mean([torch.cuda.memory_allocated(device) for device in self.distributed_nodes[nodeID].device_ids]))
+            # # return min(node_list, key=lambda nodeID: np.mean([torch.cuda.memory_allocated(device) for device in self.distributed_nodes[nodeID].device_ids]))
         elif self.task_assignment == 'workload':
             # # Choose the node with the least workload (number of tasks in the first device queue)
             # return min(node_list, key=lambda nodeID: self.distributed_nodes[nodeID].device_queues[0].qsize())
@@ -626,6 +651,16 @@ class DistributedLLM:
         available_ratio = available_memory / self.device_total_memory
         # Check if the available memory ratio is above the threshold
         return available_ratio > (1 - threshold)
+    
+    
+
+    # def _get_gpu_utilization(self):
+    #     result = subprocess.run(
+    #         ['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
+    #         capture_output=True, text=True
+    #     )
+    #     gputils = [float(x) for x in result.stdout.strip().split('\n')]
+    #     return gputils
     
     
     def _wait_for_device_availability(self, device: int, check_interval: float = 0.1, threshold: float = 0.8):
@@ -975,7 +1010,7 @@ if __name__ == '__main__':
                         help='distribution of input sequence length')
     parser.add_argument('--length_heterogeneity', type=int, default=None, 
                         help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=str, default=None,
+    parser.add_argument('--active_selection', type=str, default=None, choices=['adaptive', 'random', 'first', 'last'],
                         help='active selection ratio for training tasks')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()

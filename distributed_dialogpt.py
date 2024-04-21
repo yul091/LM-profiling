@@ -207,7 +207,7 @@ if __name__ == '__main__':
                         help='distribution of input sequence length')
     parser.add_argument('--length_heterogeneity', type=int, default=None, 
                         help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=str, default=None, 
+    parser.add_argument('--active_selection', type=str, default=None, choices=['adaptive', 'random', 'first', 'last'],
                         help='active selection ratio for training tasks')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()

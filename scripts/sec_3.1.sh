@@ -15,7 +15,7 @@ LENGTH_HETEROGENEITY=200
 for NUM_NODES in 4; do
     # for MODEL_NAME in "DialoGPT-large"; do
     for LENGTH_DIST in "random"; do
-        for RATE_LAMBDA in 1 5 10 15 20 25 30; do
+        for RATE_LAMBDA in 30 25 20 15 10 5 1; do
             OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
             for RETRAIN_RATE in 0.01 0.05 0.1 0.15 0.2 0.25 0.3; do
                 # for LENGTH_HETEROGENEITY in 0 10 50 100 200; do
