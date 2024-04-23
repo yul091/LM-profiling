@@ -86,12 +86,16 @@ class DistributedLLM:
             setting = f"isolated-split{self.isolated_split}"
         else:
             setting = self.setting
-        lh = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
-        asl = f"active_{self.active_selection}" if self.active_selection is not None else "active_1.0"
-        task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta}|tau={self.epsilon})" if (self.task_assignment == 'workload' or '+' in self.task_assignment) else self.task_assignment
-        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{lh}-{self.length_distribution}_{self.retraining_rate}-{asl}.json'
+            
         self.used_nodes = self.num_nodes
-        if os.path.exists(stats_f) and self.task_assignment in ['rr+', 'random+', 'util+']:
+        if '+' in self.task_assignment: # strong baselines (e.g., rr+, random+, util+)
+            lh = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
+            asl = f"active_{self.active_selection}" if self.active_selection is not None else "active_1.0"
+            task_assignment = f"workload(a={self.alpha}|b={self.beta}|tau={self.epsilon})"
+            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{lh}-{self.length_distribution}_{self.retraining_rate}-{asl}.json'
+            
+            if not os.path.exists(stats_f):
+                raise ValueError(f'Cannot find dynamic result: {stats_f}')
             workload_res = json.load(open(stats_f))
             self.used_nodes = sum(x > 0 for x in workload_res["num_tasks (node)"].values())
             print(f"\n ** TASK ASSIGNMENT: {self.task_assignment} | Number of used nodes: {self.used_nodes} (out of {args.num_nodes}) **\n")
