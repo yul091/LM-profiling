@@ -121,15 +121,16 @@ class DistributedDialoGPT(DistributedLLM):
                         self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
                     
                     try:
-                        if self.BT is None:
-                            self.backward_start.record()
+                        # if self.RECORD_MODE:
+                        #     self.backward_start.record()
                         loss.backward()
                         be = record_time(init_device, 'end', 'backward', taskID, timing_info)
-                        if self.BT is None:
-                            self.backward_end.record()
-                            torch.cuda.synchronize()
+                        if self.RECORD_MODE:
+                            # self.backward_end.record()
+                            # torch.cuda.synchronize()
                             # Profiling backward time (seconds) per stage
-                            self.BT = self.backward_start.elapsed_time(self.backward_end) / (self.num_gpus_per_node * 1e3)
+                            # self.BT = self.backward_start.elapsed_time(self.backward_end) / (self.num_gpus_per_node * 1e3)
+                            self.record_dict['BTs'].append((be - bb) / self.num_gpus_per_node)
                     except Exception as e:
                         # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                         pass
@@ -209,6 +210,7 @@ if __name__ == '__main__':
                         help='standard deviation of the length distribution of the sampled subset')
     parser.add_argument('--active_selection', type=str, default=None, choices=['adaptive', 'random', 'first', 'last'],
                         help='active selection ratio for training tasks')
+    parser.add_argument('--profile_dir', type=str, default='profile', help='directory to save profiling results')
     parser.add_argument('--output_dir', type=str, default='prof')
     args = parser.parse_args()
     

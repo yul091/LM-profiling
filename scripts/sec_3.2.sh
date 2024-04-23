@@ -4,23 +4,24 @@ WORKLOAD=poisson
 MEMORY_THRESHOLD=0.5
 SETTING=active # "active" "isolated"
 TASK_ASSIGNMENT=workload # "workload" "random" "rr" "util"
-# LENGTH_DIST=ascending # "ascending" "bursty" "random"
+LENGTH_DIST=random # "ascending" "bursty" "random"
+LENGTH_HETEROGENEITY=200
 BASE_DIR=prof_3.1
 MODEL_NAME="DialoGPT-large"
 EPSILON=0.05
 ALPHA=1.0
 BETA=0.1
-LENGTH_HETEROGENEITY=200
 
 for NUM_NODES in 4; do
     # for MODEL_NAME in "DialoGPT-large"; do
-    for LENGTH_DIST in "random"; do
-        for RATE_LAMBDA in 30 25 20 15 10 5 1; do
-            OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
-            for RETRAIN_RATE in 0.01 0.05 0.1 0.15 0.2 0.25 0.3; do
-                # for LENGTH_HETEROGENEITY in 0 10 50 100 200; do
-                # for TASK_ASSIGNMENT in "random" "rr" "util" "workload"; do
-                for ACTIVE_SELECTION in 'random' 'first' 'last'; do
+    # for LENGTH_DIST in "random"; do
+    for RATE_LAMBDA in 30 25 20 15 10 5 1; do
+        OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
+        for RETRAIN_RATE in 0.01 0.05 0.1 0.15 0.2 0.25 0.3; do
+            # for LENGTH_HETEROGENEITY in 0 10 50 100 200; do
+            # for TASK_ASSIGNMENT in "random" "rr" "util" "workload"; do
+            for EPSILON in  0.001 0.005 0.01 0.05 0.1 0.5; do
+                for ACTIVE_SELECTION in 'adaptive' 'random' 'first' 'last'; do
                     python distributed_dialogpt.py \
                         --model_name_or_path "microsoft/$MODEL_NAME" \
                         --model_name $MODEL_NAME \
@@ -54,8 +55,8 @@ for NUM_NODES in 4; do
                         --active_selection $ACTIVE_SELECTION \
                         --alpha $ALPHA \
                         --beta $BETA \
+                        --epsilon $EPSILON \
                         --output_dir $OUTPUT_DIR
-                    # done
                 done
             done
         done

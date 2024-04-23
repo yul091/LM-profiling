@@ -161,6 +161,7 @@ if __name__ == '__main__':
     parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
     parser.add_argument('--active_selection', type=float, default=None, choices=['adaptive', 'random', 'first', 'last'], help='active selection ratio for training tasks')
     parser.add_argument('--output_dir', type=str, default='prof')
+    parser.add_argument('--profile_dir', type=str, default='profile', help='directory to save profiling results')
     args = parser.parse_args()
     
     distributed_llm = DistributedLlama(args)
