@@ -41,7 +41,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 
 class DistributedLLM:
 
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, experimentID: int = 0):
         self.n_samples = args.n_samples
         self.setting = args.setting
         self.priority = args.priority
@@ -61,24 +61,32 @@ class DistributedLLM:
         self.length_heterogeneity = args.length_heterogeneity
         self.active_selection = args.active_selection
         self.profile_dir = args.profile_dir
+        self.experimentID = experimentID
+        self.run_mode = args.run_mode
         # Reproducibility
         set_seed(args.seed)
         
         os.makedirs(self.profile_dir, exist_ok=True)
         self.profile_file = f"{self.profile_dir}/{self.model_n}_lambda={self.test_lambda}_nodes={self.num_nodes}.json"
-        self.RECORD_MODE = False
+        self.RECORD_MODE = False if self.run_mode == 'online' else True
         if self.profile_file is None or not os.path.exists(self.profile_file):
             self.RECORD_MODE = True
+            
+        if self.RECORD_MODE:
+            self.retraining_rate = 0.5
             self.eta, self.BT = None, None
             self.record_dict = defaultdict(list)
         else:
             file = json.load(open(self.profile_file))
             self.eta = file['eta'] if 'eta' in file else None # forward coefficient
             self.BT = file['BT'] if 'BT' in file else None # backward latency
+            self.profiled_losses = file['loss'] # list of offline training losses
+            self.profiled_loss_dict = {int(taskID): loss for (taskID, loss) in file['loss_dict'].items()} # {taskID: loss}
             print("\n ** Profile file loaded: eta={}, BT={} **\n".format(self.eta, self.BT))
         self.alpha = args.alpha
         self.beta = args.beta
         self.epsilon = args.epsilon
+        self.k = args.k
             
         # If dynamic method has decided the number of nodes, use that for 'rr+', 'random+', 'util+'
         if self.setting == 'isolated':
@@ -92,7 +100,7 @@ class DistributedLLM:
             lh = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
             asl = f"active_{self.active_selection}" if self.active_selection is not None else "active_1.0"
             task_assignment = f"workload(a={self.alpha}|b={self.beta}|tau={self.epsilon})"
-            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{lh}-{self.length_distribution}_{self.retraining_rate}-{asl}.json'
+            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{lh}-{self.length_distribution}_{self.retraining_rate}-{asl}_ID=0.json'
             
             if not os.path.exists(stats_f):
                 raise ValueError(f'Cannot find dynamic result: {stats_f}')
@@ -101,8 +109,8 @@ class DistributedLLM:
             print(f"\n ** TASK ASSIGNMENT: {self.task_assignment} | Number of used nodes: {self.used_nodes} (out of {args.num_nodes}) **\n")
             
         if self.setting == 'isolated':
-            num_train_nodes = max(1, round(self.used_nodes * self.isolated_split))
-            num_test_nodes = max(1, self.used_nodes - num_train_nodes)
+            num_train_nodes = max(0, round(self.used_nodes * self.isolated_split))
+            num_test_nodes = max(0, self.used_nodes - num_train_nodes)
             self._test_nodes = list(range(num_test_nodes))
             self._train_nodes = list(range(num_test_nodes, self.used_nodes))
             print(f"** ISOLATED SYSTEM: Test nodes: {self._test_nodes}, Train nodes: {self._train_nodes} **")
@@ -166,41 +174,39 @@ class DistributedLLM:
         
         # Load datasets and dataloaders
         datasets = load_dataset(self.dataset_name_or_path)
-        # train_dataset = datasets['train']
-        test_dataset = datasets['test']
-        
-        # self.train_dataset = train_dataset.map(
-        #     self._tokenize_and_align_labels,
-        #     batched=True,
-        # ).remove_columns(datasets['train'].column_names)
-        test_dataset = test_dataset.map(
+        if self.RECORD_MODE:
+            dataset = datasets['train']
+        else:
+            dataset = datasets['test']
+            
+        dataset = dataset.map(
             self._tokenize_and_align_labels,
             batched=True,
-        ).remove_columns(datasets['train'].column_names)
+        ).remove_columns(dataset.column_names)
         
         # Do sampling according to the length distribution
-        input_lengths = [len(x) for x in test_dataset['input_ids']]
-        self.mean_length, self.std_length, self.medium_length, self.min_length, self.max_length = np.mean(input_lengths), np.std(input_lengths), np.median(input_lengths), min(input_lengths), max(input_lengths)
+        input_lengths = [len(x) for x in dataset['input_ids']]
+        self.mean_length, self.std_length, self.medium_length, self.min_length, self.max_length \
+            = np.mean(input_lengths), np.std(input_lengths), np.median(input_lengths), min(input_lengths), max(input_lengths)
         print(" ** Original data length distribution: mean={}, std={}, medium={}, min={}, max={} **".format(
             self.mean_length, self.std_length, self.medium_length, self.min_length, self.max_length))
         if self.n_samples > 0:
             n_samples = min(self.n_samples, len(input_lengths))
             if self.length_heterogeneity is None:
                 indices = random.sample(range(len(input_lengths)), n_samples)
-                test_dataset = test_dataset.select(indices)
+                dataset = dataset.select(indices)
             else:
                 indices = self._sample_subset_indices(input_lengths, n_samples, self.mean_length, self.length_heterogeneity)
-                test_dataset = test_dataset.select(indices)
+                dataset = dataset.select(indices)
   
-            subset_lengths = [len(x) for x in test_dataset['input_ids']]
-            self.mean_length, self.std_length, self.medium_length, self.min_length, self.max_length = np.mean(subset_lengths), np.std(subset_lengths), np.median(subset_lengths), min(subset_lengths), max(subset_lengths)
+            subset_lengths = [len(x) for x in dataset['input_ids']]
+            self.mean_length, self.std_length, self.medium_length, self.min_length, self.max_length \
+                = np.mean(subset_lengths), np.std(subset_lengths), np.median(subset_lengths), min(subset_lengths), max(subset_lengths)
             print(f" ** Sampled {len(subset_lengths)} data points: mean={self.mean_length}, std={self.std_length}, medium={self.medium_length}, min={self.min_length}, max={self.max_length} **")
         
-        self.test_dataset = test_dataset
-    
-        # self.train_dataloader = self.get_dataloader(dataset=self.train_dataset)
-        self.test_dataloader = DataLoader(
-            self.test_dataset,
+        self.dataset = dataset
+        self.dataloader = DataLoader(
+            self.dataset,
             batch_size=self.batch_size,
             collate_fn=self.data_collator,
         )
@@ -208,7 +214,7 @@ class DistributedLLM:
         # Preloaded dataset
         self.distributed_preloaded_tasks, self.total_tasks, self.retraining_tasks, retraining_taskIDs = self.get_preloaded_dataset(
             self.distributed_nodes, 
-            self.test_dataloader, 
+            self.dataloader, 
             retraining_rate=self.retraining_rate,
         )
         self.saving_steps = max(min(100, self.retraining_tasks // 2), 1)
@@ -216,8 +222,12 @@ class DistributedLLM:
         self._training_step = 0
         self._trained_task_lengths = []
         
-        if self.active_selection in ['random', 'first', 'last']:
-            adapt_f = f'{self.output_dir}/metrics_{self.model_n}_{self.task_assignment}_{setting}-{self.priority}_{self.workload}-{lh}-{self.length_distribution}_{self.retraining_rate}-active_adaptive.json'
+        # Select tasks to be trained
+        if (self.active_selection is None) or self.RECORD_MODE: 
+            self.backward_taskIDs = set(retraining_taskIDs)
+        elif self.active_selection in ['random', 'first', 'last']:
+            lh = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
+            adapt_f = f'{self.output_dir}/metrics_{self.model_n}_{self.task_assignment}_{setting}-{self.priority}_{self.workload}-{lh}-{self.length_distribution}_{self.retraining_rate}-active_adaptive_ID=0.json'
             if os.path.exists(adapt_f):
                 adapt_res = json.load(open(adapt_f))
                 actual_trained_tasks = adapt_res['actual_retrained_tasks']
@@ -230,7 +240,27 @@ class DistributedLLM:
                     self.backward_taskIDs = set(retraining_taskIDs[-actual_trained_tasks:])
             else:
                 self.backward_taskIDs = set(retraining_taskIDs)
-        
+        elif '-' in self.active_selection: 
+            # check if the string is a float number
+            policy, ratio = self.active_selection.split('-')
+            k = int(self.retraining_tasks * float(ratio))
+            print("\n ** Selective training policy: {} | Ratio: {} | Number of tasks to be trained: {} **\n".format(policy, ratio, k))
+            if policy == 'random':
+                self.backward_taskIDs = set(random.sample(retraining_taskIDs, k=k))
+            elif policy == 'length':
+                LCs = {taskID: self._compute_LC(self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]) for taskID in retraining_taskIDs}
+                self.backward_taskIDs = set(sorted(LCs, key=lambda x: LCs[x], reverse=True)[:k]) # select the top-k tasks with the highest LC
+            elif policy == 'loss' or policy == 'adaptive':
+                # We need to do backward for the top-k tasks with the highest losses
+                self.backward_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: float(self.profiled_loss_dict[x]), reverse=True)[:k])
+            elif policy == 'first':
+                self.backward_taskIDs = set(retraining_taskIDs[:k])
+            elif policy == 'last':
+                self.backward_taskIDs = set(retraining_taskIDs[-k:])
+            # elif policy == 'adaptive':
+            #     losses = [float(self.profiled_loss_dict[taskID]) for taskID in retraining_taskIDs]
+            #     self.loss_threshold = np.quantile(losses, 1 - float(ratio)) # select the top-k tasks with the highest losses
+            
         # Save task length distribution for further analysis
         if self.save_length:
             length_dict = {taskID: task.query['input_ids'].shape[1] for taskID, task in enumerate(self.distributed_preloaded_tasks[0])}
@@ -321,10 +351,10 @@ class DistributedLLM:
         
         print("Using preloaded data ...")
         distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
-        dataloader = dataloader if dataloader is not None else self.test_dataloader
+        dataloader = dataloader if dataloader is not None else self.dataloader
         retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
         distributed_preloaded_tasks = defaultdict(list)
-        total_tasks, retraining_tasks, retraining_taskIDs = 0, 0, []
+        total_tasks, retraining_taskIDs = 0, []
         
         selected_data = []
         for i, batch in enumerate(dataloader):
@@ -357,8 +387,7 @@ class DistributedLLM:
             # 10% of the time, produce a task with feedback
             require_training = random.random() < retraining_rate
             total_tasks += 1
-            if require_training:
-                retraining_tasks += 1 
+            if require_training: 
                 retraining_taskIDs.append(i)
                 
             for nodeID, node in distributed_nodes.items():
@@ -374,7 +403,7 @@ class DistributedLLM:
                 )
                 distributed_preloaded_tasks[nodeID].append(task)
         
-        return distributed_preloaded_tasks, total_tasks, retraining_tasks, retraining_taskIDs
+        return distributed_preloaded_tasks, total_tasks, len(retraining_taskIDs), retraining_taskIDs
 
 
     def producer(
@@ -403,7 +432,7 @@ class DistributedLLM:
         print("Producer finished producing tasks")
         
         
-    def _compute_LH(
+    def _compute_node_LC(
         self, 
         nodeID: int,
         task_length: int,
@@ -417,6 +446,16 @@ class DistributedLLM:
             return 0
         # Gaussian probability based on task length as length heterogeneity
         return scipy.stats.norm(mean, std).pdf(task_length)
+    
+    
+    def _compute_LC(
+        self, 
+        task_length: int,
+    ):
+        if self.std_length == 0:
+            return 0
+        # Gaussian probability based on task length as length heterogeneity
+        return scipy.stats.norm(self.mean_length, self.std_length).pdf(task_length)
         
     
     def _check_do_backward(
@@ -424,53 +463,69 @@ class DistributedLLM:
         taskID: int,
         task_length: int,
         training_step: int,
-        nodeID: int,
         total_training_tasks: int,
-    ):
+        # nodeID: int,
+    ) -> bool:
         # print("Selective algorithm will be implemented!")
-        LH = self._compute_LH(nodeID, task_length)
-        
-        if self.active_selection is None:
-            do_backward = True
-        else:
-            if self.active_selection == 'adaptive':
-                P_adjusted = 0.1 * LH + 0.9 * (1 - (training_step / total_training_tasks))
-                do_backward = P_adjusted > random.random()
-            elif self.active_selection in ['random', 'first', 'last']:
-                do_backward = taskID in self.backward_taskIDs
+        # LC = self._compute_node_LC(nodeID, task_length)
+        try:
+            if '-' in self.active_selection: 
+                # check if the string is a float number
+                policy, ratio = self.active_selection.split('-')
+                if policy != 'adaptive':
+                    do_backward = taskID in self.backward_taskIDs
+                else:
+                    lc = self._compute_LC(task_length)
+                    P_adjusted = self.k * int(taskID in self.backward_taskIDs) + (1 - self.k) * max(lc, 1)
+                    do_backward = P_adjusted > random.random()
             else:
-                raise ValueError(f"Invalid active selection type: {self.active_selection}!")
+                raise ValueError(f"Invalid active selection: {self.active_selection}")
+                
+            # if self.active_selection != 'adaptive':
+                # if '-' in self.active_selection and self.active_selection.split('-')[0] == 'loss': # loss-based selection
+                #     do_backward = self.profiled_loss_dict[str(taskID)] > self.loss_threshold
+                # else:
+                #     do_backward = taskID in self.backward_taskIDs
+                # do_backward = taskID in self.backward_taskIDs
+           
+        except Exception as e:
+            print(f"Error in selective algorithm: {e}")
+            # do_backward = True
+            
+        return do_backward
+            # elif self.active_selection in ['random', 'first', 'last']:
+            # else:
+            #     do_backward = taskID in self.backward_taskIDs
             # else:
             #     do_backward = random.random() < float(self.active_selection)
             # try:
             #     # Gaussian probability based on task length
-            #     # LH = (1 / (self.std_length * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - self.mean_length) / self.std_length) ** 2)
-            #     # LH = scipy.stats.norm(self.mean_length, self.std_length).pdf(task_length) # scipy probability density function
+            #     # LC = (1 / (self.std_length * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - self.mean_length) / self.std_length) ** 2)
+            #     # LC = scipy.stats.norm(self.mean_length, self.std_length).pdf(task_length) # scipy probability density function
             #     # Adjusting probability based on training progress
                 
             #     # P_adjusted = 1 - (training_step / total_training_tasks)
-            #     # print("Task length: {}, Gaussian P: {:.4f} -> P_adjusted: {:.4f}".format(task_length, LH, P_adjusted))
+            #     # print("Task length: {}, Gaussian P: {:.4f} -> P_adjusted: {:.4f}".format(task_length, LC, P_adjusted))
             #     # print("Task length: {}, P_adjusted: {:.4f}".format(task_length, P_adjusted))
             #     do_backward = P_adjusted > random.random()
             # except Exception as e:
             #     print(f"Error in selective algorithm: {e}")
             #     do_backward = True
         
-        return do_backward, LH
         
         
-        
-    def _compute_rewards(self, nodeID: int, taskID: int):
+    def _compute_rewards(self, nodeID: int, taskID: int, do_backward: bool = False):
         """
         Predict the execution traces for the incoming task and compute the reward (bubble rate & response time).
         """
         length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1]
-        if self.distributed_preloaded_tasks[nodeID][taskID].require_training:
-            do_backward, LH = self._check_do_backward(taskID, length, self._training_step, nodeID, self.retraining_tasks)
-        else:
-            do_backward, LH = False, self._compute_LH(nodeID, length)
-        # Update do_backward flag
-        self.distributed_preloaded_tasks[nodeID][taskID].do_backward = do_backward
+        # if self.distributed_preloaded_tasks[nodeID][taskID].require_training:
+        #     do_backward, LC = self._check_do_backward(taskID, length, self._training_step, nodeID, self.retraining_tasks)
+        # else:
+        #     # do_backward, LC = False, self._compute_LC(nodeID, length)
+        #     do_backward, LC = False, self._compute_node_LC(nodeID, length)
+        # # Update do_backward flag
+        # self.distributed_preloaded_tasks[nodeID][taskID].do_backward = do_backward
         
         # Initialize bubble rate and response time
         fb = self.task_arrival[taskID]['release']
@@ -523,11 +578,11 @@ class DistributedLLM:
                     
         # Compute reward (bubble profit and response time)
         response = fe - self.task_arrival[taskID]['release']
-        # LH = self.calculate_node_LH(nodeID, length) if self.beta != 0 else 0
+        # LC = self.calculate_node_LC(nodeID, length) if self.beta != 0 else 0
         # if arrival_gap is not None:
-        #     reward = (br - bi / (1000 * arrival_gap)) / (self.alpha * response + self.beta * LH + self.epsilon)
+        #     reward = (br - bi / (1000 * arrival_gap)) / (self.alpha * response + self.beta * LC + self.epsilon)
         # else:
-        #     reward = (br - bi) / (self.alpha * response + self.beta * LH + self.epsilon)
+        #     reward = (br - bi) / (self.alpha * response + self.beta * LC + self.epsilon)
         # Normalize BI by the arrival gap
         # original_bi = bi
         # bi = max(1/self.test_lambda - self.eta * length ** 2 - self.epsilon, 0)
@@ -536,10 +591,11 @@ class DistributedLLM:
         # else:
             # fbi = max(bi/self.num_gpus_per_node - arrival_gap - self.epsilon, 0)
         fbi = max(self.epsilon, bi/self.num_gpus_per_node - arrival_gap)
-        reward = (br - fbi) / (self.alpha * response + self.beta * LH + self.epsilon)
-        # reward = br / (self.alpha * response + self.beta * LH + self.epsilon)
-        # print(f"[Node {nodeID} | Task {taskID} | reward {reward:.2f}]: epsilon {self.epsilon} - BI {bi:.2f} (BI/N - |a - a0|: {bi/self.num_gpus_per_node - arrival_gap:.2f}) - BR {br:.2f} - Response {response:.2f} - LH {LH:.2f}")
-        # reward = br / (self.alpha * response + self.beta * LH + self.epsilon)
+        lc = self._compute_node_LC(nodeID, length)
+        reward = (br - fbi + self.beta * lc) / (self.alpha * response + self.epsilon)
+        # reward = br / (self.alpha * response + self.beta * LC + self.epsilon)
+        # print(f"[Node {nodeID} | Task {taskID} | reward {reward:.2f}]: epsilon {self.epsilon} - BI {bi:.2f} (BI/N - |a - a0|: {bi/self.num_gpus_per_node - arrival_gap:.2f}) - BR {br:.2f} - Response {response:.2f} - LC {LC:.2f}")
+        # reward = br / (self.alpha * response + self.beta * LC + self.epsilon)
         # if len(self.node_allocation[nodeID]) > 0: # this node is not empty
         #     reward = (self.node_accumulated_bubble[nodeID] + bi) / (len(self.node_allocation[nodeID]) + 1)
         # else:
@@ -551,7 +607,8 @@ class DistributedLLM:
             
         
         
-    def _assign_node(self, node_list: List[int], taskID: int):
+    def _assign_node(self, node_list: List[int], taskID: int, do_backward: bool = False):
+        
         if len(node_list) == 1:
             return node_list[0]
         if 'random' in self.task_assignment or self.RECORD_MODE: # Random assignment
@@ -570,7 +627,7 @@ class DistributedLLM:
             reward_list = []
             for nodeID in node_list:
                 try:
-                    reward = self._compute_rewards(nodeID, taskID)
+                    reward = self._compute_rewards(nodeID, taskID, do_backward=do_backward)
                 except Exception as e:
                     reward = random.random()
                     logging.error(f"[node {nodeID} | task {taskID}] Bubble calculation error occurred: {e}")
@@ -606,24 +663,39 @@ class DistributedLLM:
                     node.device_queues[0].put((float('inf'), float('inf'))) # for priority_queue, use a large number to signal the end
                 break
             
+            # Active selection
+            select_start = time.time()
+            if self.distributed_preloaded_tasks[0][taskID].require_training:
+                do_backward = self._check_do_backward(
+                    taskID, 
+                    self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1], 
+                    self._training_step, 
+                    self.retraining_tasks,
+                )
+            else:
+                do_backward = False
+            self.metrics['active_selection'].append(time.time() - select_start)
+            
             # Task assignment
             assign_start = time.time()
             try:
                 if self.setting != 'isolated':
-                    nodeID = self._assign_node(node_list=list(range(self.used_nodes)), taskID=taskID)
+                    nodeID = self._assign_node(node_list=list(range(self.used_nodes)), taskID=taskID, do_backward=do_backward)
                 else:
-                    if self.distributed_preloaded_tasks[0][taskID].require_training:
-                        nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID) # assign to one of the training nodes
-                    else:
-                        nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID) # assign to one of the test nodes
+                    if self.distributed_preloaded_tasks[0][taskID].require_training:  # assign to one of the training nodes
+                        nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID, do_backward=do_backward)
+                    else: # assign to one of the test nodes
+                        nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID, do_backward=do_backward) 
             except Exception as e:
                 logging.error(f"[Task {taskID}] Node assignment error occurred: {e}")
                 nodeID = random.choice(list(range(self.used_nodes)))
+
+            self.distributed_preloaded_tasks[nodeID][taskID].do_backward = do_backward
                     
             # Update train trace and all trace with the task trace
             if self.task_assignment == 'workload':
                 self.all_trace[nodeID][taskID] = self.task_trace[nodeID].copy()
-                if self.distributed_preloaded_tasks[nodeID][taskID].do_backward:
+                if do_backward:
                     self.train_trace[nodeID][taskID] = self.task_trace[nodeID].copy()
                         
             self.metrics['node_assignment'].append(time.time() - assign_start)
@@ -644,7 +716,7 @@ class DistributedLLM:
             # Record the node allocation 
             self.node_allocation[nodeID].append({
                 'taskID': taskID, 
-                'type': 'training' if self.distributed_preloaded_tasks[nodeID][taskID].do_backward else 'test', 
+                'type': 'training' if do_backward else 'test', 
                 'length': self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1],
             })
             # print("Global scheduler scheduled task {} (requre_training={}) to node {}".format(taskID, self.distributed_preloaded_tasks[0][taskID].require_training, nodeID))
@@ -666,16 +738,7 @@ class DistributedLLM:
         available_ratio = available_memory / self.device_total_memory
         # Check if the available memory ratio is above the threshold
         return available_ratio > (1 - threshold)
-    
-    
 
-    # def _get_gpu_utilization(self):
-    #     result = subprocess.run(
-    #         ['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
-    #         capture_output=True, text=True
-    #     )
-    #     gputils = [float(x) for x in result.stdout.strip().split('\n')]
-    #     return gputils
     
     
     def _wait_for_device_availability(self, device: int, check_interval: float = 0.1, threshold: float = 0.8):
@@ -815,55 +878,6 @@ class DistributedLLM:
                     nodeID,
                     node, 
                 )
-            
-            
-    def run(self):
-        # Run the stages concurrently
-        if self.RECORD_MODE:
-            print("\n ** Running in RECORD mode **\n")
-            task_queue = queue.Queue()
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                future1 = executor.submit(
-                    self.producer,
-                    task_queue, 
-                )
-                future2 = executor.submit(
-                    self.globalScheduler,
-                    task_queue,
-                )
-                future3 = executor.submit(self.run_stages_concurrently)
-                
-            # Save recorded dict
-            self.record_dict['eta'] = np.mean(self.record_dict['etas'])
-            self.record_dict['BT'] = np.mean(self.record_dict['BTs'])
-            # os.makedirs(self.profile_file, exist_ok=True)
-            with open(self.profile_file, 'w') as f:
-                json.dump(self.record_dict, f, indent=4)
-            
-        else:
-            task_queue = queue.Queue()
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                future1 = executor.submit(
-                    self.producer,
-                    task_queue, 
-                )
-                future2 = executor.submit(
-                    self.globalScheduler,
-                    task_queue,
-                )
-                future3 = executor.submit(self.run_stages_concurrently)
-            
-            # Delete checkpoint file in the disk if self.ckpt_path is not None
-            if self.ckpt_path is not None:
-                for j in range(self.num_gpus_per_node):
-                    if os.path.exists(f"{self.ckpt_path}_stage{j}.pt"):
-                        os.remove(f"{self.ckpt_path}_stage{j}.pt")
-            
-            # Save timing info
-            self.save_timing_info()
-            
-            # Calculate metrics
-            self.calculate_metrics()
         
         
     def save_timing_info(self):
@@ -1007,12 +1021,70 @@ class DistributedLLM:
         os.makedirs(self.output_dir, exist_ok=True)
         length_heterogeneity = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
         active_selection = f"active_{self.active_selection}" if self.active_selection is not None else "active_1.0"
-        # task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta}|tau={self.epsilon})" if self.task_assignment == 'workload' else self.task_assignment
         task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta}|tau={self.epsilon})" if (self.task_assignment == 'workload' or '+' in self.task_assignment) else self.task_assignment
-        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}.json'
+        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_ID={self.experimentID}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}")
+        
+        
+    def run(self):
+        # Run the stages concurrently
+        if self.RECORD_MODE:
+            print("\n ** Running in RECORD mode **\n")
+            task_queue = queue.Queue()
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                future1 = executor.submit(
+                    self.producer,
+                    task_queue, 
+                )
+                future2 = executor.submit(
+                    self.globalScheduler,
+                    task_queue,
+                )
+                future3 = executor.submit(self.run_stages_concurrently)
+                
+            # Save recorded dict
+            self.record_dict['eta'] = np.mean(self.record_dict['etas'])
+            self.record_dict['BT'] = np.mean(self.record_dict['BTs'])
+            losses = [loss for loss, _ in self.record_dict['loss']]
+            # Quantile (25, 50, 75) for record_dict['loss]
+            self.record_dict['loss_stats'] = {
+                'mean': np.mean(losses),
+                'std': np.std(losses),
+            }
+            for quantile in [10, 20, 30, 40, 50, 60, 70, 80, 90]:
+                self.record_dict['loss_stats'][f'{quantile}%'] = np.percentile(losses, quantile)
+                
+            self.record_dict['loss_dict'] = {taskID: loss for (loss, taskID) in self.record_dict['loss']}
+            # os.makedirs(self.profile_file, exist_ok=True)
+            with open(self.profile_file, 'w') as f:
+                json.dump(self.record_dict, f, indent=4)
+            
+        else:
+            task_queue = queue.Queue()
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                future1 = executor.submit(
+                    self.producer,
+                    task_queue, 
+                )
+                future2 = executor.submit(
+                    self.globalScheduler,
+                    task_queue,
+                )
+                future3 = executor.submit(self.run_stages_concurrently)
+            
+            # Delete checkpoint file in the disk if self.ckpt_path is not None
+            if self.ckpt_path is not None:
+                for j in range(self.num_gpus_per_node):
+                    if os.path.exists(f"{self.ckpt_path}_stage{j}.pt"):
+                        os.remove(f"{self.ckpt_path}_stage{j}.pt")
+            
+            # Save timing info
+            self.save_timing_info()
+            
+            # Calculate metrics
+            self.calculate_metrics()
 
     
     
@@ -1045,16 +1117,31 @@ if __name__ == '__main__':
     parser.add_argument('--alpha', type=float, default=1, help='response time coefficient')
     parser.add_argument('--beta', type=float, default=1, help='length heterogeneity coefficient')
     parser.add_argument('--epsilon', type=float, default=1e-6, help='small value to avoid division by zero')
+    parser.add_argument('--k', type=float, default=0.5, help='weight for balancing the loss and length consistency for adaptive training')
     parser.add_argument('--workload', type=str, default='poisson', help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], 
                         help='distribution of input sequence length')
     parser.add_argument('--length_heterogeneity', type=int, default=None, 
                         help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=str, default=None, choices=['adaptive', 'random', 'first', 'last'],
+    parser.add_argument('--active_selection', type=str, default=None,
                         help='active selection ratio for training tasks')
     parser.add_argument('--profile_dir', type=str, default='profile', help='directory to save profiling results')
     parser.add_argument('--output_dir', type=str, default='prof')
+    parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
+    parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
     args = parser.parse_args()
     
-    distributed_llm = DistributedLLM(args)
-    distributed_llm.run()
+    for i in range(args.experiments):
+        print(f"\n ** Experiment {i+1} **\n")
+        distributed_llm = DistributedLLM(args, experimentID=i)
+        distributed_llm.run()
+
+        # Clear all the data in the memory
+        if distributed_llm.RECORD_MODE:
+            del distributed_llm
+            torch.cuda.empty_cache()
+            new_run =  DistributedLLM(args, experimentID=i)
+            new_run.run()
+        else:
+            del distributed_llm
+            torch.cuda.empty_cache()

@@ -22,8 +22,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
         
 class DistributedLlama(DistributedLLM):
     
-    def __init__(self, args: argparse.Namespace):
-        super().__init__(args)
+    def __init__(self, args: argparse.Namespace, experimentID: int = 0):
+        super().__init__(args, experimentID)
 
     def device_inference(
         self, 
@@ -159,11 +159,27 @@ if __name__ == '__main__':
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
     parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=float, default=None, choices=['adaptive', 'random', 'first', 'last'], help='active selection ratio for training tasks')
+    parser.add_argument('--active_selection', type=float, default=None, help='active selection ratio for training tasks')
+    parser.add_argument('--k', type=float, default=0.5, help='weight for balancing the loss and length consistency for adaptive training')
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--profile_dir', type=str, default='profile', help='directory to save profiling results')
+    parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
+    parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
     args = parser.parse_args()
     
-    distributed_llm = DistributedLlama(args)
-    distributed_llm.run()
+    for i in range(args.experiments):
+        print(f"\n ** Experiment {i+1} **\n")
+        distributed_llm = DistributedLlama(args, experimentID=i)
+        distributed_llm.run()
+
+        # Clear all the data in the memory
+        if distributed_llm.RECORD_MODE:
+            del distributed_llm
+            torch.cuda.empty_cache()
+            new_run =  DistributedLlama(args, experimentID=i)
+            new_run.run()
+        else:
+            del distributed_llm
+            torch.cuda.empty_cache()
+
     

@@ -24,8 +24,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 
 class DistributedDialoGPT(DistributedLLM):
     
-    def __init__(self, args: argparse.Namespace):
-        super().__init__(args)
+    def __init__(self, args: argparse.Namespace, experimentID: int = 0):
+        super().__init__(args, experimentID)
 
     def device_inference(
         self, 
@@ -95,25 +95,10 @@ class DistributedDialoGPT(DistributedLLM):
                 loss = tuple_outputs[0]
                 # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())
+                if self.RECORD_MODE:
+                    self.record_dict['loss'].append((loss.item(), taskID))
                 
                 if task.do_backward:
-                    # # Synchronize to ensure all previous operations on the GPU are completed
-                    # torch.cuda.synchronize(device)
-                    # Backprop on the last stage
-                    # if self.active_selection is None:
-                    #     do_backward = True
-                    # else:
-                    #     if self.active_selection == 'adaptive':
-                    #         do_backward = self.selective_algorithm(
-                    #             input_length,
-                    #             training_step=self._training_step,
-                    #             trained_task_lengths=self._trained_task_lengths,
-                    #             total_training_tasks=self.retraining_tasks,
-                    #         )
-                    #     else:
-                    #         do_backward = random.random() < float(self.active_selection)
-                    
-                    # if do_backward:
                     bb = time.time()
                     self.task_trace[nodeID][self.num_gpus_per_node-1]['bb'] = bb
                     if taskID in self.train_trace[nodeID]:
@@ -121,8 +106,6 @@ class DistributedDialoGPT(DistributedLLM):
                         self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
                     
                     try:
-                        # if self.RECORD_MODE:
-                        #     self.backward_start.record()
                         loss.backward()
                         be = record_time(init_device, 'end', 'backward', taskID, timing_info)
                         if self.RECORD_MODE:
@@ -140,16 +123,17 @@ class DistributedDialoGPT(DistributedLLM):
                         self.train_trace[nodeID][taskID][0]['be'] = be   
                         self.all_trace[nodeID][taskID][0]['be'] = be
                         
+                    print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                     self._trained_task_lengths.append(input_length)
                     
                     # Optimization
-                    try:
-                        self.distributed_optimizers[nodeID].step()
-                        self.distributed_schedulers[nodeID].step()
-                    except Exception as e:
-                        logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
-                        # pass
-                    print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                    if not self.RECORD_MODE: # In RECORD_MODE, we do not update the model parameters
+                        try:
+                            self.distributed_optimizers[nodeID].step()
+                            self.distributed_schedulers[nodeID].step()
+                        except Exception as e:
+                            logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
+                            # pass
                     
                     self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     
@@ -204,15 +188,31 @@ if __name__ == '__main__':
     parser.add_argument('--train_lambda', type=int, default=10, help='Average number of training tasks produced per second')
     parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', help='workload arrival pattern')
-    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], 
+    parser.add_argument('--length_distribution', type=str, default='random',
                         help='distribution of input sequence length')
     parser.add_argument('--length_heterogeneity', type=int, default=None, 
                         help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=str, default=None, choices=['adaptive', 'random', 'first', 'last'],
+    parser.add_argument('--active_selection', type=str, default=None,
                         help='active selection ratio for training tasks')
+    parser.add_argument('--k', type=float, default=0.5, help='weight for balancing the loss and length consistency for adaptive training')
     parser.add_argument('--profile_dir', type=str, default='profile', help='directory to save profiling results')
     parser.add_argument('--output_dir', type=str, default='prof')
+    parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
+    parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
     args = parser.parse_args()
     
-    distributed_llm = DistributedDialoGPT(args)
-    distributed_llm.run()
+    for i in range(args.experiments):
+        print(f"\n ** Experiment {i+1} **\n")
+        distributed_llm = DistributedDialoGPT(args, experimentID=i)
+        distributed_llm.run()
+
+        # Clear all the data in the memory
+        if distributed_llm.RECORD_MODE:
+            del distributed_llm
+            torch.cuda.empty_cache()
+            new_run =  DistributedDialoGPT(args, experimentID=i)
+            new_run.run()
+        else:
+            del distributed_llm
+            torch.cuda.empty_cache()
+
