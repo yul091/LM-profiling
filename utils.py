@@ -4,7 +4,9 @@ import time
 import queue
 import logging
 from typing import Dict, Union, Any, List, Tuple, Optional, Callable
+import numpy as np
 import pandas as pd
+# from collections import defaultdict
 import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
@@ -54,6 +56,41 @@ class Node:
         self.init_device = init_device if init_device is not None else 0
         self.last_device = init_device + num_gpus_per_node - 1
         self.device_ids = list(range(init_device, init_device + num_gpus_per_node))
+        # Stats for recording
+        self.task_allocation = []
+        self.num_tasks = 0
+        self.train_tasks = 0
+        self.test_tasks = 0
+        self.mean = 0
+        self.std = 0
+        self.M2 = 0  # Sum of squares of differences from the current mean
+        
+    def updata_task_stats(self, taskID: int, loss: float, length: int, computation_type: str):
+        self.task_allocation.append({
+            'taskID': taskID, 
+            'type': computation_type, 
+            'loss': loss,
+            'length': length,
+        })
+
+    def update_length_stats(self, length: int, computation_type: str):
+        self.num_tasks += 1
+        if computation_type == 'training':
+            self.train_tasks += 1
+        elif computation_type == 'test':
+            self.test_tasks += 1
+        else:
+            raise ValueError(f"Invalid computation type: {computation_type}")
+        delta = length - self.mean
+        self.mean += delta / self.num_tasks
+        delta2 = length - self.mean
+        self.M2 += delta * delta2
+        self.std = np.sqrt(self.M2 / self.num_tasks) if self.num_tasks > 1 else 0
+    
+    def length_consistency(self, length: int):
+        if self.num_tasks == 0 or self.std == 0:
+            return 0
+        return (1 / (self.std * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((length - self.mean) / self.std) ** 2)
         
         
 class Task:

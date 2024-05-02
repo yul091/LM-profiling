@@ -95,8 +95,10 @@ class DistributedDialoGPT(DistributedLLM):
                 loss = tuple_outputs[0]
                 # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())
+                
                 if self.RECORD_MODE:
                     self.record_dict['loss'].append((loss.item(), taskID))
+                    self.record_dict['length'].append((input_length, taskID))
                 
                 if task.do_backward:
                     bb = time.time()
@@ -104,26 +106,30 @@ class DistributedDialoGPT(DistributedLLM):
                     if taskID in self.train_trace[nodeID]:
                         self.train_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
                         self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
-                    
                     try:
+                        # if self.RECORD_MODE:
+                        #     self.backward_start.record()
                         loss.backward()
+                        # if self.RECORD_MODE:
+                        #     self.backward_end.record()
+                        #     torch.cuda.synchronize()
+                        #     BT = self.backward_start.elapsed_time(self.backward_end) / 1e3
+                            # self.record_dict['BTs'].append(BT, taskID)
                         be = record_time(init_device, 'end', 'backward', taskID, timing_info)
-                        if self.RECORD_MODE:
-                            # self.backward_end.record()
-                            # torch.cuda.synchronize()
-                            # Profiling backward time (seconds) per stage
-                            # self.BT = self.backward_start.elapsed_time(self.backward_end) / (self.num_gpus_per_node * 1e3)
-                            self.record_dict['BTs'].append((be - bb) / self.num_gpus_per_node)
+                        self.task_trace[nodeID][0]['be'] = be
+                        if taskID in self.train_trace[nodeID]:
+                            self.train_trace[nodeID][taskID][0]['be'] = be   
+                            self.all_trace[nodeID][taskID][0]['be'] = be
+                            
+                        print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                        
                     except Exception as e:
-                        # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
+                        logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                         pass
                     
-                    self.task_trace[nodeID][0]['be'] = be
-                    if taskID in self.train_trace[nodeID]:
-                        self.train_trace[nodeID][taskID][0]['be'] = be   
-                        self.all_trace[nodeID][taskID][0]['be'] = be
+                    if self.RECORD_MODE:
+                        self.record_dict['BTs'].append(((be - bb)/self.num_gpus_per_node, taskID))
                         
-                    print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                     self._trained_task_lengths.append(input_length)
                     
                     # Optimization
@@ -150,11 +156,15 @@ class DistributedDialoGPT(DistributedLLM):
                                 self.distributed_stages[i][j].load_state_dict(torch.load(f"{self.ckpt_path}_stage{j}.pt"))
                     
                     self._training_step += 1   
-                             
-                # else:
-                #     self.metrics["loss"].append(loss.item()) # we only compute performance for inference-only tasks
-                #     task.hiddens.append(loss)
-                #     deviceQueue.put(taskID) # put it back to the queue
+                
+                # Update task stats
+                self.distributed_nodes[nodeID].updata_task_stats(
+                    taskID=taskID, 
+                    loss=loss.item(), 
+                    length=input_length, 
+                    computation_type='training' if task.do_backward else 'test',
+                )             
+                
 
     
     
@@ -185,8 +195,7 @@ if __name__ == '__main__':
     parser.add_argument('--alpha', type=float, default=1, help='response time coefficient')
     parser.add_argument('--beta', type=float, default=1, help='length heterogeneity coefficient')
     parser.add_argument('--epsilon', type=float, default=1e-6, help='small value to avoid division by zero')
-    parser.add_argument('--train_lambda', type=int, default=10, help='Average number of training tasks produced per second')
-    parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
+    parser.add_argument('--rate_lambda', type=int, default=10, help='Average number of tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random',
                         help='distribution of input sequence length')
@@ -205,14 +214,11 @@ if __name__ == '__main__':
         print(f"\n ** Experiment {i+1} **\n")
         distributed_llm = DistributedDialoGPT(args, experimentID=i)
         distributed_llm.run()
-
-        # Clear all the data in the memory
-        if distributed_llm.RECORD_MODE:
+        
+        # If run_mode is online and RECORD_MODE is activated, we need to re-run the experiment
+        if distributed_llm.RECORD_MODE and args.run_mode == 'online':
             del distributed_llm
             torch.cuda.empty_cache()
             new_run =  DistributedDialoGPT(args, experimentID=i)
             new_run.run()
-        else:
-            del distributed_llm
-            torch.cuda.empty_cache()
 

@@ -3,7 +3,6 @@ import sys
 sys.dont_write_bytecode = True
 import pdb
 import time
-import scipy
 import json
 import queue
 import random
@@ -47,8 +46,7 @@ class DistributedLLM:
         self.priority = args.priority
         self.num_nodes = args.num_nodes
         self.batch_size = args.batch_size
-        self.train_lambda = args.train_lambda
-        self.test_lambda = args.test_lambda
+        self.rate_lambda = args.rate_lambda
         self.output_dir = args.output_dir
         self.task_assignment = args.task_assignment
         self.dataset_name_or_path = args.dataset_name_or_path
@@ -63,25 +61,29 @@ class DistributedLLM:
         self.profile_dir = args.profile_dir
         self.experimentID = experimentID
         self.run_mode = args.run_mode
+        
         # Reproducibility
         set_seed(args.seed)
         
         os.makedirs(self.profile_dir, exist_ok=True)
-        self.profile_file = f"{self.profile_dir}/{self.model_n}_lambda={self.test_lambda}_nodes={self.num_nodes}.json"
+        lh = 'default' if self.length_heterogeneity is None else self.length_heterogeneity
+        self.profile_file = f"{self.profile_dir}/{self.model_n}_lambda={self.rate_lambda}_nodes={self.num_nodes}_retrain={self.retraining_rate}_LH={lh}.json"
         self.RECORD_MODE = False if self.run_mode == 'online' else True
         if self.profile_file is None or not os.path.exists(self.profile_file):
             self.RECORD_MODE = True
             
         if self.RECORD_MODE:
             self.retraining_rate = 0.5
+            self.task_assignment = 'rr'
+            self.active_selection = None
             self.eta, self.BT = None, None
             self.record_dict = defaultdict(list)
         else:
             file = json.load(open(self.profile_file))
             self.eta = file['eta'] if 'eta' in file else None # forward coefficient
             self.BT = file['BT'] if 'BT' in file else None # backward latency
-            self.profiled_losses = file['loss'] # list of offline training losses
-            self.profiled_loss_dict = {int(taskID): loss for (taskID, loss) in file['loss_dict'].items()} # {taskID: loss}
+            # self.profiled_losses = file['loss'] # list of offline training losses
+            self.profiled_loss_dict = {int(taskID): float(instance['loss']) for (taskID, instance) in file['task_dict'].items()} # {taskID: loss}
             print("\n ** Profile file loaded: eta={}, BT={} **\n".format(self.eta, self.BT))
         self.alpha = args.alpha
         self.beta = args.beta
@@ -109,8 +111,13 @@ class DistributedLLM:
             print(f"\n ** TASK ASSIGNMENT: {self.task_assignment} | Number of used nodes: {self.used_nodes} (out of {args.num_nodes}) **\n")
             
         if self.setting == 'isolated':
-            num_train_nodes = max(0, round(self.used_nodes * self.isolated_split))
-            num_test_nodes = max(0, self.used_nodes - num_train_nodes)
+            num_train_nodes = max(1, round(self.used_nodes * self.isolated_split))
+            if self.retraining_rate == 0:
+                num_train_nodes = 0
+            num_test_nodes = max(1, self.used_nodes - num_train_nodes)
+            if self.retraining_rate == 1:
+                num_test_nodes = 0
+            
             self._test_nodes = list(range(num_test_nodes))
             self._train_nodes = list(range(num_test_nodes, self.used_nodes))
             print(f"** ISOLATED SYSTEM: Test nodes: {self._test_nodes}, Train nodes: {self._train_nodes} **")
@@ -129,7 +136,6 @@ class DistributedLLM:
         self.train_trace = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
         self.user_task_record = defaultdict(dict)
         self.all_trace = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
-        self.node_allocation = defaultdict(list)
         self.node_accumulated_bubble = defaultdict(int)
         self.forward_start = torch.cuda.Event(enable_timing=True)
         self.forward_end = torch.cuda.Event(enable_timing=True)
@@ -248,16 +254,22 @@ class DistributedLLM:
             if policy == 'random':
                 self.backward_taskIDs = set(random.sample(retraining_taskIDs, k=k))
             elif policy == 'length':
-                LCs = {taskID: self._compute_LC(self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]) for taskID in retraining_taskIDs}
-                self.backward_taskIDs = set(sorted(LCs, key=lambda x: LCs[x], reverse=True)[:k]) # select the top-k tasks with the highest LC
-            elif policy == 'loss' or policy == 'adaptive':
+                # LCs = {taskID: self._compute_LC(self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]) for taskID in retraining_taskIDs}
+                # self.backward_taskIDs = set(sorted(LCs, key=lambda x: LCs[x], reverse=True)[:k]) # select the top-k tasks with the highest LC
+                self.backward_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
+            elif policy == 'loss':
                 # We need to do backward for the top-k tasks with the highest losses
-                self.backward_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: float(self.profiled_loss_dict[x]), reverse=True)[:k])
+                self.backward_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
             elif policy == 'first':
                 self.backward_taskIDs = set(retraining_taskIDs[:k])
             elif policy == 'last':
                 self.backward_taskIDs = set(retraining_taskIDs[-k:])
-            # elif policy == 'adaptive':
+            elif policy == 'adaptive':
+                # We either select the top-k tasks with the highest losses or the top-k tasks with the smallest lengths
+                self.loss_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
+                self.length_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
+            else:
+                raise ValueError(f"Invalid active selection: {self.active_selection}")
             #     losses = [float(self.profiled_loss_dict[taskID]) for taskID in retraining_taskIDs]
             #     self.loss_threshold = np.quantile(losses, 1 - float(ratio)) # select the top-k tasks with the highest losses
             
@@ -381,6 +393,25 @@ class DistributedLLM:
             pass
         else:
             raise ValueError(f"Invalid length distribution: {self.length_distribution}")
+        
+        
+        # If workload is 'alternate', we need to create a list of varying lambda values (e.g., 5, 5, ..., 10, 10, ..., 30, 30, ..., 50, 50, ...), each for 20 consecutive tasks
+        if self.rate_lambda == -1:
+            print("\n ** Using alternate workload **\n")
+            lambda_values = [5, 10, 30, 50]
+            current_length, idx, tasks_per_lambda = 0, 0, 20
+            task_lambdas = []
+            while current_length < len(selected_data):
+                if current_length + tasks_per_lambda > len(selected_data):
+                    # Add fewer elements if adding 20 would exceed the total length
+                    repetitions = len(selected_data) - current_length
+                else:
+                    repetitions = tasks_per_lambda
+                    
+                task_lambdas.extend([lambda_values[idx]] * repetitions)
+                current_length += repetitions
+                idx = (idx + 1) % len(lambda_values)
+         
             
         # Create preloaded tasks with each one on a specific CUDA device
         for i, (_, batch) in enumerate(selected_data):
@@ -393,8 +424,7 @@ class DistributedLLM:
             for nodeID, node in distributed_nodes.items():
                 task = Task(
                     task_id=i,
-                    # rate_lambda=lambda_values[i] if self.rate_lambda is None else self.rate_lambda,
-                    rate_lambda=self.train_lambda if require_training else self.test_lambda,
+                    rate_lambda=self.rate_lambda if self.rate_lambda != -1 else task_lambdas[i],
                     query=_prepare_inputs(batch, device=node.init_device),
                     feedback=_prepare_inputs(batch['labels'], device=node.last_device),
                     node_id=nodeID,
@@ -412,12 +442,10 @@ class DistributedLLM:
     ):
         # Produce using the dataset
         for taskID, task in enumerate(self.distributed_preloaded_tasks[0]):
-            if self.workload == 'poisson':
-                time.sleep(random.expovariate(task.rate_lambda))
-            elif self.workload == 'all':
+            if self.workload == 'all':
                 time.sleep(0)
             else:
-                raise ValueError(f"Invalid workload type: {self.workload}")
+                time.sleep(random.expovariate(task.rate_lambda))
             # 10% of the time, produce a task with feedback
             # print("Producing task {} with input length {}".format(taskID, task.query['input_ids'].shape[1]))
             # Essentially, we are using preloaded data (task ID)
@@ -432,30 +460,15 @@ class DistributedLLM:
         print("Producer finished producing tasks")
         
         
-    def _compute_node_LC(
-        self, 
-        nodeID: int,
-        task_length: int,
-        window_size: int = 10,
-    ):
-        history_lengths = [task['length'] for task in self.node_allocation[nodeID][-window_size:]]
-        if len(history_lengths) == 0:
-            return 0
-        mean, std = np.mean(history_lengths), np.std(history_lengths)
-        if std == 0:
-            return 0
-        # Gaussian probability based on task length as length heterogeneity
-        return scipy.stats.norm(mean, std).pdf(task_length)
-    
-    
     def _compute_LC(
         self, 
         task_length: int,
-    ):
-        if self.std_length == 0:
-            return 0
-        # Gaussian probability based on task length as length heterogeneity
-        return scipy.stats.norm(self.mean_length, self.std_length).pdf(task_length)
+        mean_length: int = None,
+        std_length: int = None,
+    ): # Gaussian probability based on task length as length heterogeneity
+        mean_length = self.mean_length if mean_length is None else mean_length
+        std_length = self.std_length if std_length is None else std_length
+        return (1 / (std_length * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - mean_length) / std_length) ** 2)
         
     
     def _check_do_backward(
@@ -468,6 +481,8 @@ class DistributedLLM:
     ) -> bool:
         # print("Selective algorithm will be implemented!")
         # LC = self._compute_node_LC(nodeID, task_length)
+        if self.active_selection is None:
+            return True
         try:
             if '-' in self.active_selection: 
                 # check if the string is a float number
@@ -475,9 +490,10 @@ class DistributedLLM:
                 if policy != 'adaptive':
                     do_backward = taskID in self.backward_taskIDs
                 else:
-                    lc = self._compute_LC(task_length)
-                    P_adjusted = self.k * int(taskID in self.backward_taskIDs) + (1 - self.k) * max(lc, 1)
+                    # lc = self._compute_LC(task_length)
+                    P_adjusted = self.k * int(taskID in self.loss_taskIDs) + (1 - self.k) * int(taskID in self.length_taskIDs)
                     do_backward = P_adjusted > random.random()
+            
             else:
                 raise ValueError(f"Invalid active selection: {self.active_selection}")
                 
@@ -501,7 +517,6 @@ class DistributedLLM:
             # try:
             #     # Gaussian probability based on task length
             #     # LC = (1 / (self.std_length * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - self.mean_length) / self.std_length) ** 2)
-            #     # LC = scipy.stats.norm(self.mean_length, self.std_length).pdf(task_length) # scipy probability density function
             #     # Adjusting probability based on training progress
                 
             #     # P_adjusted = 1 - (training_step / total_training_tasks)
@@ -519,14 +534,6 @@ class DistributedLLM:
         Predict the execution traces for the incoming task and compute the reward (bubble rate & response time).
         """
         length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1]
-        # if self.distributed_preloaded_tasks[nodeID][taskID].require_training:
-        #     do_backward, LC = self._check_do_backward(taskID, length, self._training_step, nodeID, self.retraining_tasks)
-        # else:
-        #     # do_backward, LC = False, self._compute_LC(nodeID, length)
-        #     do_backward, LC = False, self._compute_node_LC(nodeID, length)
-        # # Update do_backward flag
-        # self.distributed_preloaded_tasks[nodeID][taskID].do_backward = do_backward
-        
         # Initialize bubble rate and response time
         fb = self.task_arrival[taskID]['release']
         br, bi, init_id, finished_ids = 0, 0, 0, []
@@ -585,13 +592,14 @@ class DistributedLLM:
         #     reward = (br - bi) / (self.alpha * response + self.beta * LC + self.epsilon)
         # Normalize BI by the arrival gap
         # original_bi = bi
-        # bi = max(1/self.test_lambda - self.eta * length ** 2 - self.epsilon, 0)
+        # bi = max(1/self.rate_lambda - self.eta * length ** 2 - self.epsilon, 0)
         # if last_taskID is None: # the first task
         #     fbi = 0
         # else:
             # fbi = max(bi/self.num_gpus_per_node - arrival_gap - self.epsilon, 0)
         fbi = max(self.epsilon, bi/self.num_gpus_per_node - arrival_gap)
-        lc = self._compute_node_LC(nodeID, length)
+        # lc = self._compute_node_LC(nodeID, length)
+        lc = self.distributed_nodes[nodeID].length_consistency(length)
         reward = (br - fbi + self.beta * lc) / (self.alpha * response + self.epsilon)
         # reward = br / (self.alpha * response + self.beta * LC + self.epsilon)
         # print(f"[Node {nodeID} | Task {taskID} | reward {reward:.2f}]: epsilon {self.epsilon} - BI {bi:.2f} (BI/N - |a - a0|: {bi/self.num_gpus_per_node - arrival_gap:.2f}) - BR {br:.2f} - Response {response:.2f} - LC {LC:.2f}")
@@ -714,11 +722,10 @@ class DistributedLLM:
                 self.distributed_nodes[nodeID].device_queues[0].put((taskID, taskID))
             
             # Record the node allocation 
-            self.node_allocation[nodeID].append({
-                'taskID': taskID, 
-                'type': 'training' if do_backward else 'test', 
-                'length': self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1],
-            })
+            self.distributed_nodes[nodeID].update_length_stats(
+                length=self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1],
+                computation_type='training' if do_backward else 'test',
+            )
             # print("Global scheduler scheduled task {} (requre_training={}) to node {}".format(taskID, self.distributed_preloaded_tasks[0][taskID].require_training, nodeID))
     
     
@@ -817,7 +824,9 @@ class DistributedLLM:
                 # torch.cuda.synchronize()
                 # Profile forward time (seconds) per stage
                 # self.eta = self.forward_start.elapsed_time(self.forward_end) / (task.query['input_ids'].shape[1] ** 2 * 1e3)
-                self.record_dict['etas'].append((fe - fb) / (task.query['input_ids'].shape[1] ** 2))
+                self.record_dict['etas'].append(((fe - fb) / (task.query['input_ids'].shape[1] ** 2), task.task_id))
+                self.record_dict['FTs'].append((fe - fb, task.task_id))
+                
             
         except Exception as e:
             logging.error(f"[Node {nodeID} - stage {stageID} - device {device}] Forward error occurred: {e}")
@@ -971,15 +980,15 @@ class DistributedLLM:
         metrics['total_runtime'] = total_runtime
         metrics['end2end_latency'] = global_max_time - global_min_time
         metrics['throughput'] = self.total_tasks / (global_max_time - global_min_time)
-        metrics['num_tasks (node)'] = {nodeID: len(self.node_allocation[nodeID]) for nodeID in self.node_allocation}
-        metrics['retrain_tasks (node)'] = {nodeID: len([task for task in self.node_allocation[nodeID] if task['type'] == 'training']) for nodeID in self.node_allocation}
-        metrics['user_tasks (node)'] = {nodeID: len([task for task in self.node_allocation[nodeID] if task['type'] == 'test']) for nodeID in self.node_allocation}
+        metrics['num_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].num_tasks for nodeID in self.distributed_nodes}
+        metrics['retrain_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].train_tasks for nodeID in self.distributed_nodes}
+        metrics['user_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].test_tasks for nodeID in self.distributed_nodes}
         metrics['bubble_rate (node)'] = {
             nodeID: sum(idles) / sum(latencies) if sum(latencies) > 0 else 0 
             for nodeID, idles, latencies in zip(node_idles.keys(), node_idles.values(), node_latencies.values())
         }
         metrics['end2end_latency (node)'] = {nodeID: node_timelines[nodeID][1] - node_timelines[nodeID][0] for nodeID in node_timelines}
-        metrics['throughput (node)'] = {nodeID: len(self.node_allocation[nodeID]) / (node_timelines[nodeID][1] - node_timelines[nodeID][0]) for nodeID in node_timelines}
+        metrics['throughput (node)'] = {nodeID: self.distributed_nodes[nodeID].num_tasks / (node_timelines[nodeID][1] - node_timelines[nodeID][0]) for nodeID in node_timelines}
         metrics['node_timelines'] = node_timelines
         metrics['idles_sum'] = sum(total_idles)
         metrics['idles_sum (node)'] = {nodeID: sum(idles) for nodeID, idles in node_idles.items()}
@@ -992,6 +1001,21 @@ class DistributedLLM:
             'min': self.min_length,
             'max': self.max_length,
         }
+        metrics['length_statistics (node)'] = {}
+        for nodeID in self.distributed_nodes:
+            node_lengths = [task['length'] for task in self.distributed_nodes[nodeID].task_allocation]
+            if not node_lengths:
+                continue
+            medium_length = np.median(node_lengths)
+            min_length = min(node_lengths)
+            max_length = max(node_lengths)
+            metrics['length_statistics (node)'][nodeID] = {
+                'mean': self.distributed_nodes[nodeID].mean,
+                'std': self.distributed_nodes[nodeID].std,
+                'medium': medium_length,
+                'min': min_length,
+                'max': max_length,
+            } 
         
         if self.user_task_record:
             # total_response_time, total_wait_time, total_inference_time = 0, 0, 0
@@ -1015,7 +1039,12 @@ class DistributedLLM:
             metrics['user_responses'] = response_times # list
             
         metrics['idles'] = total_idles # list
-        metrics['losses'] = losses # list    
+        metrics['losses'] = losses # list
+        # metrics['losses (node)'] = {nodeID: list(self.distributed_nodes[nodeID].losses.values()) for nodeID in self.distributed_nodes} 
+        metrics['task_stats (node)'] = {
+            nodeID: self.distributed_nodes[nodeID].task_allocation 
+            for nodeID in self.distributed_nodes
+        }   
         
         # Save metrics
         os.makedirs(self.output_dir, exist_ok=True)
@@ -1045,18 +1074,39 @@ class DistributedLLM:
                 future3 = executor.submit(self.run_stages_concurrently)
                 
             # Save recorded dict
-            self.record_dict['eta'] = np.mean(self.record_dict['etas'])
-            self.record_dict['BT'] = np.mean(self.record_dict['BTs'])
             losses = [loss for loss, _ in self.record_dict['loss']]
             # Quantile (25, 50, 75) for record_dict['loss]
-            self.record_dict['loss_stats'] = {
-                'mean': np.mean(losses),
-                'std': np.std(losses),
-            }
+            self.record_dict['loss_stats'] = {'mean': np.mean(losses), 'std': np.std(losses)}
             for quantile in [10, 20, 30, 40, 50, 60, 70, 80, 90]:
                 self.record_dict['loss_stats'][f'{quantile}%'] = np.percentile(losses, quantile)
                 
-            self.record_dict['loss_dict'] = {taskID: loss for (loss, taskID) in self.record_dict['loss']}
+            loss_dict = {taskID: loss for (loss, taskID) in self.record_dict['loss']}
+            length_dict = {taskID: length for (length, taskID) in self.record_dict['length']}
+            
+            # First get the forward dict where each taskID corresponds to multiple forward times
+            tmp = defaultdict(list)
+            for (ft, taskID) in self.record_dict['FTs']:
+                tmp[taskID].append(ft)
+            # Then take the sum of the forward times for each taskID
+            forward_dict = {taskID: np.mean(fts) for taskID, fts in tmp.items()}
+            eta_dict = {taskID: et for et, taskID in self.record_dict['etas']}
+            backward_dict = {taskID: bt for bt, taskID in self.record_dict['BTs']}
+            self.record_dict['eta'] = np.mean(list(eta_dict.values()))
+            self.record_dict['BT'] = np.mean(list(backward_dict.values()))
+            
+            self.record_dict['task_dict'] = {
+                taskID: {
+                    'loss': loss_dict.get(taskID, 'None'),
+                    'length': length_dict.get(taskID, 'None'),
+                    'forward': forward_dict.get(taskID, 'None'),
+                    'backward': backward_dict.get(taskID, 'None'),
+                    'eta': eta_dict.get(taskID, 'None'),
+                } for taskID in loss_dict
+            }
+            # Remove etas, FTs, BTs, loss, length
+            for key in ['etas', 'FTs', 'BTs', 'loss', 'length']:
+                self.record_dict.pop(key)
+            
             # os.makedirs(self.profile_file, exist_ok=True)
             with open(self.profile_file, 'w') as f:
                 json.dump(self.record_dict, f, indent=4)
@@ -1112,8 +1162,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='proportion of training tasks')
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
-    parser.add_argument('--train_lambda', type=int, default=10, help='Average number of training tasks produced per second')
-    parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
+    parser.add_argument('--rate_lambda', type=int, default=10, help='Average number of tasks produced per second')
     parser.add_argument('--alpha', type=float, default=1, help='response time coefficient')
     parser.add_argument('--beta', type=float, default=1, help='length heterogeneity coefficient')
     parser.add_argument('--epsilon', type=float, default=1e-6, help='small value to avoid division by zero')
@@ -1135,13 +1184,10 @@ if __name__ == '__main__':
         print(f"\n ** Experiment {i+1} **\n")
         distributed_llm = DistributedLLM(args, experimentID=i)
         distributed_llm.run()
-
-        # Clear all the data in the memory
-        if distributed_llm.RECORD_MODE:
+        
+        # If run_mode is online and RECORD_MODE is activated, we need to re-run the experiment
+        if distributed_llm.RECORD_MODE and args.run_mode == 'online':
             del distributed_llm
             torch.cuda.empty_cache()
             new_run =  DistributedLLM(args, experimentID=i)
             new_run.run()
-        else:
-            del distributed_llm
-            torch.cuda.empty_cache()

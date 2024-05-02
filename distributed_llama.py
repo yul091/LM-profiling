@@ -154,8 +154,7 @@ if __name__ == '__main__':
     parser.add_argument('--beta', type=float, default=1, help='length heterogeneity coefficient')
     parser.add_argument('--epsilon', type=float, default=1e-6, help='small value to avoid division by zero')
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
-    parser.add_argument('--train_lambda', type=int, default=50, help='Average number of training tasks produced per second')
-    parser.add_argument('--test_lambda', type=int, default=10, help='Average number of test tasks produced per second')
+    parser.add_argument('--rate_lambda', type=int, default=10, help='Average number of tasks produced per second')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
     parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
@@ -171,15 +170,12 @@ if __name__ == '__main__':
         print(f"\n ** Experiment {i+1} **\n")
         distributed_llm = DistributedLlama(args, experimentID=i)
         distributed_llm.run()
-
-        # Clear all the data in the memory
-        if distributed_llm.RECORD_MODE:
+        
+        # If run_mode is online and RECORD_MODE is activated, we need to re-run the experiment
+        if distributed_llm.RECORD_MODE and args.run_mode == 'online':
             del distributed_llm
             torch.cuda.empty_cache()
             new_run =  DistributedLlama(args, experimentID=i)
             new_run.run()
-        else:
-            del distributed_llm
-            torch.cuda.empty_cache()
 
     

@@ -11,7 +11,7 @@ EXPERIMENTS=5 # each experiment run 5 times
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 for NUM_NODES in 1; do
-    for RATE_LAMBDA in 50 10 1; do
+    for RATE_LAMBDA in 50 10; do
         OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
 
         # python distributed_dialogpt.py \
@@ -41,7 +41,7 @@ for NUM_NODES in 1; do
 
         for ACTIVE_SELECTION in 0.01 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 0.99; do
             # for POLICY in 'random' 'length' 'loss' 'first'; do
-            for POLICY in 'first'; do
+            for POLICY in 'length'; do
                 SELECTION_POLICY="${POLICY}-${ACTIVE_SELECTION}"
                 python distributed_dialogpt.py \
                     --model_name_or_path "microsoft/$MODEL_NAME" \
