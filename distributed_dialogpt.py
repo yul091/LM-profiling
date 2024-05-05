@@ -124,7 +124,7 @@ class DistributedDialoGPT(DistributedLLM):
                         print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                         
                     except Exception as e:
-                        logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
+                        # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                         pass
                     
                     if self.RECORD_MODE:

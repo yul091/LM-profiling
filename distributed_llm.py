@@ -398,7 +398,7 @@ class DistributedLLM:
         # If workload is 'alternate', we need to create a list of varying lambda values (e.g., 5, 5, ..., 10, 10, ..., 30, 30, ..., 50, 50, ...), each for 20 consecutive tasks
         if self.rate_lambda == -1:
             print("\n ** Using alternate workload **\n")
-            lambda_values = [5, 10, 30, 50]
+            lambda_values = [10, 20, 30]
             current_length, idx, tasks_per_lambda = 0, 0, 20
             task_lambdas = []
             while current_length < len(selected_data):
