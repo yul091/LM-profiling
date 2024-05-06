@@ -9,7 +9,7 @@ from typing import List, Dict, Optional, Any, Union
 import torch
 import logging
 from utils import record_time, Task
-from distributed_llm import DistributedLLM
+from distributed_llm import DistributedLLM, set_seed, gc
 from models import (
     # GPTStartingStage,
     # GPTIntermediateStage,
@@ -20,6 +20,34 @@ from models import (
 
 # torch.autograd.set_detect_anomaly(True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+
+
+def run_experiment(args: argparse.Namespace, experimentID: int):
+    print(f"\n ** Experiment {experimentID+1} **\n")
+    
+    # Set seed for reproducibility
+    set_seed(args.seed)
+    
+    # Initialize and run the distributed model
+    distributed_llm = DistributedDialoGPT(args, experimentID=experimentID)
+    distributed_llm.run()
+    record_mode = distributed_llm.RECORD_MODE
+    
+    # Clean up resources explicitly
+    del distributed_llm
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Rerun if necessary based on specific conditions
+    if record_mode and args.run_mode == 'online':  # Assuming record_mode is a valid arg
+        new_run = DistributedDialoGPT(args, experimentID=experimentID)
+        new_run.run()
+        
+        # Final clean up
+        del new_run
+        torch.cuda.empty_cache()
+        gc.collect()
  
 
 class DistributedDialoGPT(DistributedLLM):
@@ -211,14 +239,17 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     for i in range(args.experiments):
-        print(f"\n ** Experiment {i+1} **\n")
-        distributed_llm = DistributedDialoGPT(args, experimentID=i)
-        distributed_llm.run()
+        run_experiment(args, i)
+    
+    # for i in range(args.experiments):
+    #     print(f"\n ** Experiment {i+1} **\n")
+    #     distributed_llm = DistributedDialoGPT(args, experimentID=i)
+    #     distributed_llm.run()
         
-        # If run_mode is online and RECORD_MODE is activated, we need to re-run the experiment
-        if distributed_llm.RECORD_MODE and args.run_mode == 'online':
-            del distributed_llm
-            torch.cuda.empty_cache()
-            new_run =  DistributedDialoGPT(args, experimentID=i)
-            new_run.run()
+    #     # If run_mode is online and RECORD_MODE is activated, we need to re-run the experiment
+    #     if distributed_llm.RECORD_MODE and args.run_mode == 'online':
+    #         del distributed_llm
+    #         torch.cuda.empty_cache()
+    #         new_run =  DistributedDialoGPT(args, experimentID=i)
+    #         new_run.run()
 

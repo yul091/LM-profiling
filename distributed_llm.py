@@ -9,7 +9,7 @@ import random
 import argparse
 import logging
 import numpy as np
-import subprocess
+import gc
 from tqdm import tqdm
 import GPUtil
 from GPUtil import GPU
@@ -36,6 +36,34 @@ from models import (
 
 # torch.autograd.set_detect_anomaly(True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+
+def run_experiment(args: argparse.Namespace, experimentID: int):
+    print(f"\n ** Experiment {experimentID+1} **\n")
+    
+    # Set seed for reproducibility
+    set_seed(args.seed)
+    
+    # Initialize and run the distributed model
+    distributed_llm = DistributedLLM(args, experimentID=experimentID)
+    distributed_llm.run()
+    record_mode = distributed_llm.RECORD_MODE
+    
+    # Clean up resources explicitly
+    del distributed_llm
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Rerun if necessary based on specific conditions
+    if record_mode and args.run_mode == 'online':  # Assuming record_mode is a valid arg
+        new_run = DistributedLLM(args, experimentID=experimentID)
+        new_run.run()
+        
+        # Final clean up
+        del new_run
+        torch.cuda.empty_cache()
+        gc.collect()
+        
  
 
 class DistributedLLM:
@@ -61,9 +89,6 @@ class DistributedLLM:
         self.profile_dir = args.profile_dir
         self.experimentID = experimentID
         self.run_mode = args.run_mode
-        
-        # Reproducibility
-        set_seed(args.seed)
         
         os.makedirs(self.profile_dir, exist_ok=True)
         lh = 'default' if self.length_heterogeneity is None else self.length_heterogeneity
@@ -483,19 +508,17 @@ class DistributedLLM:
         # LC = self._compute_node_LC(nodeID, task_length)
         if self.active_selection is None:
             return True
-        try:
-            if '-' in self.active_selection: 
-                # check if the string is a float number
-                policy, ratio = self.active_selection.split('-')
-                if policy != 'adaptive':
-                    do_backward = taskID in self.backward_taskIDs
-                else:
-                    # lc = self._compute_LC(task_length)
-                    P_adjusted = self.k * int(taskID in self.loss_taskIDs) + (1 - self.k) * int(taskID in self.length_taskIDs)
-                    do_backward = P_adjusted > random.random()
-            
-            else:
-                raise ValueError(f"Invalid active selection: {self.active_selection}")
+        # if '-' in self.active_selection: 
+        # check if the string is a float number
+        policy, ratio = self.active_selection.split('-')
+        if policy != 'adaptive':
+            do_backward = taskID in self.backward_taskIDs
+        else:
+            # lc = self._compute_LC(task_length)
+            P_adjusted = self.k * int(taskID in self.loss_taskIDs) + (1 - self.k) * int(taskID in self.length_taskIDs)
+            do_backward = P_adjusted > random.random()
+        
+        return do_backward
                 
             # if self.active_selection != 'adaptive':
                 # if '-' in self.active_selection and self.active_selection.split('-')[0] == 'loss': # loss-based selection
@@ -504,11 +527,10 @@ class DistributedLLM:
                 #     do_backward = taskID in self.backward_taskIDs
                 # do_backward = taskID in self.backward_taskIDs
            
-        except Exception as e:
-            print(f"Error in selective algorithm: {e}")
+        # except Exception as e:
+        #     print(f"Error in selective algorithm: {e}")
             # do_backward = True
             
-        return do_backward
             # elif self.active_selection in ['random', 'first', 'last']:
             # else:
             #     do_backward = taskID in self.backward_taskIDs
@@ -679,24 +701,24 @@ class DistributedLLM:
                     self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1], 
                     self._training_step, 
                     self.retraining_tasks,
-                )
+                ) if self.task_assignment == 'workload' else True
             else:
                 do_backward = False
             self.metrics['active_selection'].append(time.time() - select_start)
             
             # Task assignment
             assign_start = time.time()
-            try:
-                if self.setting != 'isolated':
-                    nodeID = self._assign_node(node_list=list(range(self.used_nodes)), taskID=taskID, do_backward=do_backward)
-                else:
-                    if self.distributed_preloaded_tasks[0][taskID].require_training:  # assign to one of the training nodes
-                        nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID, do_backward=do_backward)
-                    else: # assign to one of the test nodes
-                        nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID, do_backward=do_backward) 
-            except Exception as e:
-                logging.error(f"[Task {taskID}] Node assignment error occurred: {e}")
-                nodeID = random.choice(list(range(self.used_nodes)))
+            # try:
+            if self.setting != 'isolated':
+                nodeID = self._assign_node(node_list=list(range(self.used_nodes)), taskID=taskID, do_backward=do_backward)
+            else:
+                if self.distributed_preloaded_tasks[0][taskID].require_training:  # assign to one of the training nodes
+                    nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID, do_backward=do_backward)
+                else: # assign to one of the test nodes
+                    nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID, do_backward=do_backward) 
+            # except Exception as e:
+            #     logging.error(f"[Task {taskID}] Node assignment error occurred: {e}")
+            #     nodeID = random.choice(list(range(self.used_nodes)))
 
             self.distributed_preloaded_tasks[nodeID][taskID].do_backward = do_backward
                     
@@ -1181,13 +1203,16 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     for i in range(args.experiments):
-        print(f"\n ** Experiment {i+1} **\n")
-        distributed_llm = DistributedLLM(args, experimentID=i)
-        distributed_llm.run()
+        run_experiment(args, i)
+    
+    # for i in range(args.experiments):
+    #     print(f"\n ** Experiment {i+1} **\n")
+    #     distributed_llm = DistributedLLM(args, experimentID=i)
+    #     distributed_llm.run()
         
-        # If run_mode is online and RECORD_MODE is activated, we need to re-run the experiment
-        if distributed_llm.RECORD_MODE and args.run_mode == 'online':
-            del distributed_llm
-            torch.cuda.empty_cache()
-            new_run =  DistributedLLM(args, experimentID=i)
-            new_run.run()
+    #     # If run_mode is online and RECORD_MODE is activated, we need to re-run the experiment
+    #     if distributed_llm.RECORD_MODE and args.run_mode == 'online':
+    #         del distributed_llm
+    #         torch.cuda.empty_cache()
+    #         new_run =  DistributedLLM(args, experimentID=i)
+    #         new_run.run()
