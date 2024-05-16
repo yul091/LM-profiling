@@ -190,6 +190,7 @@ if __name__ == '__main__':
     parser.add_argument('--profile_dir', type=str, default='profile', help='directory to save profiling results')
     parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
+    parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     args = parser.parse_args()
     
     for i in range(args.experiments):

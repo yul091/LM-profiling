@@ -15,8 +15,7 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     workload = args.workload
     retraining_rate = args.retraining_rate
     model_name = args.model_name
-    # task_assignment = args.task_assignment
-    # task_assignment = f"{args.task_assignment}(a={args.alpha}|b={args.beta}|tau={args.epsilon})" if args.task_assignment == 'workload' else args.task_assignment
+    no_prior_profile = args.no_prior_profile
     task_assignment = f"{args.task_assignment}(a={args.alpha}|b={args.beta}|tau={args.epsilon})" if (args.task_assignment == 'workload' or '+' in args.task_assignment) else args.task_assignment
     length_distribution = args.length_distribution
     length_heterogeneity = f"hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "hetero_default"
@@ -31,7 +30,10 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
     elif node is None:
         stats_f = f'{output_dir}/timing_info_{model_name}_{setting}.json'
     else:
-        stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
+        if no_prior_profile:
+            stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-prior-profile_node{node}.json'
+        else:
+            stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
 
     with open(stats_f, 'r') as f:
         timing_info = json.load(f)
@@ -127,6 +129,7 @@ if __name__ == '__main__':
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='retraining rate')
     parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
     parser.add_argument('--active_selection', type=str, default=None, help='active selection ratio for training tasks')
+    parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     parser.add_argument('--test_asyncio', action='store_true')
     args = parser.parse_args()
     
@@ -137,8 +140,7 @@ if __name__ == '__main__':
     workload = args.workload
     model_name = args.model_name
     retraining_rate = args.retraining_rate
-    # task_assignment = args.task_assignment
-    # task_assignment = f"{args.task_assignment}(a={args.alpha}|b={args.beta}|tau={args.epsilon})" if args.task_assignment == 'workload' else args.task_assignment
+    no_prior_profile = args.no_prior_profile
     task_assignment = f"{args.task_assignment}(a={args.alpha}|b={args.beta}|tau={args.epsilon})" if (args.task_assignment == 'workload' or '+' in args.task_assignment) else args.task_assignment
     length_distribution = args.length_distribution
     length_heterogeneity = f"hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "hetero_default"
@@ -149,7 +151,10 @@ if __name__ == '__main__':
     
     for node in range(args.node):
         # Load timing information
-        stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
+        if no_prior_profile:
+            stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-prior-profile_node{node}.json'
+        else:
+            stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
 
         with open(stats_f, 'r') as f:
             timing_info = json.load(f)
@@ -167,5 +172,11 @@ if __name__ == '__main__':
         # plot(args, node)
         ax = axes[node] if args.node > 1 else axes
         plot_mix(args, ax, node, start_time)
+        
+    if no_prior_profile:
+        save_fig = f"{output_dir}/{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-prior-profile.png"
+    else:
+        save_fig = f"{output_dir}/{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}.png"
+        
     plt.tight_layout()
-    plt.savefig(f"{output_dir}/{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}.png", bbox_inches='tight', dpi=300)
+    plt.savefig(save_fig, bbox_inches='tight', dpi=300)

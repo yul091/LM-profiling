@@ -148,6 +148,9 @@ class DistributedDialoGPT(DistributedLLM):
                         if taskID in self.train_trace[nodeID]:
                             self.train_trace[nodeID][taskID][0]['be'] = be   
                             self.all_trace[nodeID][taskID][0]['be'] = be
+                        
+                        if self.BT is None:
+                            self.BT = (be - bb) / self.num_gpus_per_node
                             
                         print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                         
@@ -236,6 +239,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
+    parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     args = parser.parse_args()
     
     for i in range(args.experiments):

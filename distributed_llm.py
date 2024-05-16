@@ -89,6 +89,7 @@ class DistributedLLM:
         self.profile_dir = args.profile_dir
         self.experimentID = experimentID
         self.run_mode = args.run_mode
+        self.no_prior_profile = args.no_prior_profile
         
         os.makedirs(self.profile_dir, exist_ok=True)
         lh = 'default' if self.length_heterogeneity is None else self.length_heterogeneity
@@ -104,12 +105,16 @@ class DistributedLLM:
             self.eta, self.BT = None, None
             self.record_dict = defaultdict(list)
         else:
-            file = json.load(open(self.profile_file))
-            self.eta = file['eta'] if 'eta' in file else None # forward coefficient
-            self.BT = file['BT'] if 'BT' in file else None # backward latency
-            # self.profiled_losses = file['loss'] # list of offline training losses
-            self.profiled_loss_dict = {int(taskID): float(instance['loss']) for (taskID, instance) in file['task_dict'].items()} # {taskID: loss}
-            print("\n ** Profile file loaded: eta={}, BT={} **\n".format(self.eta, self.BT))
+            if self.no_prior_profile:
+                self.eta, self.BT = None, None
+                print("\n ** No offline profile used [pure ONLINE] **\n")
+            else:
+                file = json.load(open(self.profile_file))
+                self.eta = file['eta'] if 'eta' in file else None # forward coefficient
+                self.BT = file['BT'] if 'BT' in file else None # backward latency
+                # self.profiled_losses = file['loss'] # list of offline training losses
+                self.profiled_loss_dict = {int(taskID): float(instance['loss']) for (taskID, instance) in file['task_dict'].items()} # {taskID: loss}
+                print("\n ** Offline profile loaded: eta={}, BT={} **\n".format(self.eta, self.BT))
         self.alpha = args.alpha
         self.beta = args.beta
         self.epsilon = args.epsilon
@@ -284,19 +289,24 @@ class DistributedLLM:
                 self.backward_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
             elif policy == 'loss':
                 # We need to do backward for the top-k tasks with the highest losses
-                self.backward_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
+                if self.no_prior_profile:
+                    self.backward_taskIDs = set(random.sample(retraining_taskIDs, k=k))
+                else:
+                    self.backward_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
             elif policy == 'first':
                 self.backward_taskIDs = set(retraining_taskIDs[:k])
             elif policy == 'last':
                 self.backward_taskIDs = set(retraining_taskIDs[-k:])
             elif policy == 'adaptive':
                 # We either select the top-k tasks with the highest losses or the top-k tasks with the smallest lengths
-                self.loss_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
-                self.length_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
+                if self.no_prior_profile:
+                    self.loss_taskIDs = set(random.sample(retraining_taskIDs, k=k))
+                    self.length_taskIDs = set(random.sample(retraining_taskIDs, k=k))
+                else:
+                    self.loss_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
+                    self.length_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
             else:
                 raise ValueError(f"Invalid active selection: {self.active_selection}")
-            #     losses = [float(self.profiled_loss_dict[taskID]) for taskID in retraining_taskIDs]
-            #     self.loss_threshold = np.quantile(losses, 1 - float(ratio)) # select the top-k tasks with the highest losses
             
         # Save task length distribution for further analysis
         if self.save_length:
@@ -423,7 +433,7 @@ class DistributedLLM:
         # If workload is 'alternate', we need to create a list of varying lambda values (e.g., 5, 5, ..., 10, 10, ..., 30, 30, ..., 50, 50, ...), each for 20 consecutive tasks
         if self.rate_lambda == -1:
             print("\n ** Using alternate workload **\n")
-            lambda_values = [10, 20, 30]
+            lambda_values = [5, 10, 20, 30]
             current_length, idx, tasks_per_lambda = 0, 0, 20
             task_lambdas = []
             while current_length < len(selected_data):
@@ -510,44 +520,18 @@ class DistributedLLM:
             return True
         # if '-' in self.active_selection: 
         # check if the string is a float number
-        policy, ratio = self.active_selection.split('-')
+        policy, _ = self.active_selection.split('-')
         if policy != 'adaptive':
             do_backward = taskID in self.backward_taskIDs
         else:
-            # lc = self._compute_LC(task_length)
-            P_adjusted = self.k * int(taskID in self.loss_taskIDs) + (1 - self.k) * int(taskID in self.length_taskIDs)
+            if self.no_prior_profile:
+                P_l = self._compute_LC(task_length)
+                P_adjusted = (P_l + (1 - (training_step / total_training_tasks))) / 2
+            else:
+                P_adjusted = self.k * int(taskID in self.loss_taskIDs) + (1 - self.k) * int(taskID in self.length_taskIDs)
             do_backward = P_adjusted > random.random()
         
         return do_backward
-                
-            # if self.active_selection != 'adaptive':
-                # if '-' in self.active_selection and self.active_selection.split('-')[0] == 'loss': # loss-based selection
-                #     do_backward = self.profiled_loss_dict[str(taskID)] > self.loss_threshold
-                # else:
-                #     do_backward = taskID in self.backward_taskIDs
-                # do_backward = taskID in self.backward_taskIDs
-           
-        # except Exception as e:
-        #     print(f"Error in selective algorithm: {e}")
-            # do_backward = True
-            
-            # elif self.active_selection in ['random', 'first', 'last']:
-            # else:
-            #     do_backward = taskID in self.backward_taskIDs
-            # else:
-            #     do_backward = random.random() < float(self.active_selection)
-            # try:
-            #     # Gaussian probability based on task length
-            #     # LC = (1 / (self.std_length * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - self.mean_length) / self.std_length) ** 2)
-            #     # Adjusting probability based on training progress
-                
-            #     # P_adjusted = 1 - (training_step / total_training_tasks)
-            #     # print("Task length: {}, Gaussian P: {:.4f} -> P_adjusted: {:.4f}".format(task_length, LC, P_adjusted))
-            #     # print("Task length: {}, P_adjusted: {:.4f}".format(task_length, P_adjusted))
-            #     do_backward = P_adjusted > random.random()
-            # except Exception as e:
-            #     print(f"Error in selective algorithm: {e}")
-            #     do_backward = True
         
         
         
@@ -561,6 +545,8 @@ class DistributedLLM:
         br, bi, init_id, finished_ids = 0, 0, 0, []
         previous_taskIDs = list(self.all_trace[nodeID].keys())
         previous_train_taskIDs = list(self.train_trace[nodeID].keys())
+        eta = self.eta if self.eta is not None else 2e-5
+        BT = self.BT if self.BT is not None else 0.07
             
         # Get/Estimate previous forward execution traces
         if previous_taskIDs:
@@ -573,32 +559,32 @@ class DistributedLLM:
         for stageID in range(self.num_gpus_per_node):
             pfe = self.all_trace[nodeID][last_taskID][stageID]['fe'] if last_taskID is not None else fb
             fb = max(pfe, fb)
-            fe = fb + self.eta * length ** 2 # f_e = f_b + eta * L^2
+            fe = fb + eta * length ** 2 # f_e = f_b + eta * L^2
             i = init_id
             
             for i in range(init_id, len(previous_train_taskIDs)):
                 ptID = previous_train_taskIDs[i]
                 if fe <= self.train_trace[nodeID][ptID][stageID]['bb']:
-                    br += self.eta * length ** 2 # update BR
+                    br += eta * length ** 2 # update BR
                     break
                 fb = max(fb, self.train_trace[nodeID][ptID][stageID]['be']) # forward starts at least at the end of the backward
-                fe = fb + self.eta * length ** 2 # f_e = f_b + eta * L^2
+                fe = fb + eta * length ** 2 # f_e = f_b + eta * L^2
                 if stageID == 0: # this training task has finished
                     finished_ids.append(ptID)
                     
             # Write the forward and backward execution traces
             self.task_trace[nodeID][stageID]['fb'] = fb
             self.task_trace[nodeID][stageID]['fe'] = fe
-            bi += max(fb - pfe - (i - init_id) * self.BT, 0) # update BI
+            bi += max(fb - pfe - (i - init_id) * BT, 0) # update BI
             init_id = i + 1 # update the initial training check index for the next stage
         
         if do_backward:
             bb = fe # backward starts at the end of the forward
             for stageID in range(self.num_gpus_per_node-1, -1, -1):
                 self.task_trace[nodeID][stageID]['bb'] = bb
-                self.task_trace[nodeID][stageID]['be'] = bb + self.BT
+                self.task_trace[nodeID][stageID]['be'] = bb + BT
                 # bi += max(bb - self.task_trace[nodeID][stageID]['fe'], 0) # update BI
-                bb += self.BT
+                bb += BT
         
         # Clear the finished training tasks
         for ptID in finished_ids:
@@ -607,32 +593,11 @@ class DistributedLLM:
                     
         # Compute reward (bubble profit and response time)
         response = fe - self.task_arrival[taskID]['release']
-        # LC = self.calculate_node_LC(nodeID, length) if self.beta != 0 else 0
-        # if arrival_gap is not None:
-        #     reward = (br - bi / (1000 * arrival_gap)) / (self.alpha * response + self.beta * LC + self.epsilon)
-        # else:
-        #     reward = (br - bi) / (self.alpha * response + self.beta * LC + self.epsilon)
-        # Normalize BI by the arrival gap
-        # original_bi = bi
-        # bi = max(1/self.rate_lambda - self.eta * length ** 2 - self.epsilon, 0)
-        # if last_taskID is None: # the first task
-        #     fbi = 0
-        # else:
-            # fbi = max(bi/self.num_gpus_per_node - arrival_gap - self.epsilon, 0)
         fbi = max(self.epsilon, bi/self.num_gpus_per_node - arrival_gap)
-        # lc = self._compute_node_LC(nodeID, length)
         lc = self.distributed_nodes[nodeID].length_consistency(length)
         reward = (br - fbi + self.beta * lc) / (self.alpha * response + self.epsilon)
-        # reward = br / (self.alpha * response + self.beta * LC + self.epsilon)
-        # print(f"[Node {nodeID} | Task {taskID} | reward {reward:.2f}]: epsilon {self.epsilon} - BI {bi:.2f} (BI/N - |a - a0|: {bi/self.num_gpus_per_node - arrival_gap:.2f}) - BR {br:.2f} - Response {response:.2f} - LC {LC:.2f}")
-        # reward = br / (self.alpha * response + self.beta * LC + self.epsilon)
-        # if len(self.node_allocation[nodeID]) > 0: # this node is not empty
-        #     reward = (self.node_accumulated_bubble[nodeID] + bi) / (len(self.node_allocation[nodeID]) + 1)
-        # else:
-        #     reward = 10000 # we prefer to assign a task to the empty node
-        # reward = br - bi # only consider bubble rate
-        # blank = self.node_accumulated_bubble[nodeID] + bi
-        # return reward, br, bi
+        # reward = (br - fbi) / (self.alpha * response + self.beta * lc + self.epsilon)
+        
         return reward
             
         
@@ -841,6 +806,9 @@ class DistributedLLM:
                 if stageID == self.num_gpus_per_node - 1: # last stage
                     self.user_task_record[task.task_id]['end'] = fe
                     
+            if self.eta is None:
+                self.eta = (fe - fb) / (task.query['input_ids'].shape[1] ** 2)
+                    
             if self.RECORD_MODE:
                 # self.forward_end.record()
                 # torch.cuda.synchronize()
@@ -849,7 +817,6 @@ class DistributedLLM:
                 self.record_dict['etas'].append(((fe - fb) / (task.query['input_ids'].shape[1] ** 2), task.task_id))
                 self.record_dict['FTs'].append((fe - fb, task.task_id))
                 
-            
         except Exception as e:
             logging.error(f"[Node {nodeID} - stage {stageID} - device {device}] Forward error occurred: {e}")
             tuple_outputs = None
@@ -923,12 +890,10 @@ class DistributedLLM:
         # task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta}|tau={self.epsilon})" if self.task_assignment == 'workload' else self.task_assignment
         task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta}|tau={self.epsilon})" if (self.task_assignment == 'workload' or '+' in self.task_assignment) else self.task_assignment
         for nodeID, timing_info in self.timing_infos.items():
-            # # Remove the first start and end time for each GPU
-            # gpus = list(set(int(key.split('_')[0]) for key in timing_info))
-            # for gpu_id in gpus:
-            #     timing_info[f'{gpu_id}_start'] = timing_info[f'{gpu_id}_start']
-            #     timing_info[f'{gpu_id}_end'] = timing_info[f'{gpu_id}_end']
-            stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
+            if self.no_prior_profile:
+                stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-prior-profile_node{nodeID}.json'
+            else:
+                stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
                 json.dump(timing_info, f, indent=4)
         
@@ -1073,7 +1038,10 @@ class DistributedLLM:
         length_heterogeneity = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
         active_selection = f"active_{self.active_selection}" if self.active_selection is not None else "active_1.0"
         task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta}|tau={self.epsilon})" if (self.task_assignment == 'workload' or '+' in self.task_assignment) else self.task_assignment
-        stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_ID={self.experimentID}.json'
+        if self.no_prior_profile:
+            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-prior-profile_ID={self.experimentID}.json'
+        else:
+            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_ID={self.experimentID}.json'
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}")
@@ -1200,6 +1168,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
+    parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     args = parser.parse_args()
     
     for i in range(args.experiments):
