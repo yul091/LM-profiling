@@ -17,9 +17,10 @@ from models import (
     CustomizedGPT2Out,
     _prepare_decoding_inputs,
 )
-
+# from memory_profiler import memory_usage
 # torch.autograd.set_detect_anomaly(True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
 
 
 
@@ -244,6 +245,7 @@ if __name__ == '__main__':
     
     for i in range(args.experiments):
         run_experiment(args, i)
+        
     
     # for i in range(args.experiments):
     #     print(f"\n ** Experiment {i+1} **\n")

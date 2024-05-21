@@ -15,6 +15,7 @@ import GPUtil
 from GPUtil import GPU
 from typing import List, Dict, Optional, Any, Union, Tuple
 from collections import defaultdict
+from memory_profiler import profile
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -505,7 +506,7 @@ class DistributedLLM:
         std_length = self.std_length if std_length is None else std_length
         return (1 / (std_length * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - mean_length) / std_length) ** 2)
         
-    
+    # @profile
     def _check_do_backward(
         self, 
         taskID: int,
@@ -534,7 +535,7 @@ class DistributedLLM:
         return do_backward
         
         
-        
+    # @profile 
     def _compute_rewards(self, nodeID: int, taskID: int, do_backward: bool = False):
         """
         Predict the execution traces for the incoming task and compute the reward (bubble rate & response time).
@@ -601,7 +602,7 @@ class DistributedLLM:
         return reward
             
         
-        
+    # @profile
     def _assign_node(self, node_list: List[int], taskID: int, do_backward: bool = False):
         
         if len(node_list) == 1:
@@ -643,7 +644,7 @@ class DistributedLLM:
         else:
             raise ValueError(f"Invalid task assignment method: {self.task_assignment}")
         
-
+    # @profile
     def globalScheduler(
         self, 
         taskQueue: queue.Queue, 
@@ -673,7 +674,6 @@ class DistributedLLM:
             
             # Task assignment
             assign_start = time.time()
-            # try:
             if self.setting != 'isolated':
                 nodeID = self._assign_node(node_list=list(range(self.used_nodes)), taskID=taskID, do_backward=do_backward)
             else:
@@ -681,9 +681,6 @@ class DistributedLLM:
                     nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID, do_backward=do_backward)
                 else: # assign to one of the test nodes
                     nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID, do_backward=do_backward) 
-            # except Exception as e:
-            #     logging.error(f"[Task {taskID}] Node assignment error occurred: {e}")
-            #     nodeID = random.choice(list(range(self.used_nodes)))
 
             self.distributed_preloaded_tasks[nodeID][taskID].do_backward = do_backward
                     
