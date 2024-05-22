@@ -527,7 +527,8 @@ class DistributedLLM:
         else:
             if self.no_prior_profile:
                 P_l = self._compute_LC(task_length)
-                P_adjusted = (P_l + (1 - (training_step / total_training_tasks))) / 2
+                P_adjusted = self.k * P_l + (1 - self.k) * (1 - (training_step / total_training_tasks))
+                # P_adjusted = P_l
             else:
                 P_adjusted = self.k * int(taskID in self.loss_taskIDs) + (1 - self.k) * int(taskID in self.length_taskIDs)
             do_backward = P_adjusted > random.random()

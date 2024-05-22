@@ -5,7 +5,7 @@ SETTING=active # "active" "isolated"
 WORKLOAD=poisson
 # TASK_ASSIGNMENT=workload # "workload" "random" "rr" "util" "random+" "rr+" "util+"
 LENGTH_DIST=random # "ascending" "bursty" "random" "descending"
-BASE_DIR=prof_main
+BASE_DIR=prof_memory
 # MODEL_NAME="DialoGPT-medium" # "DialoGPT-medium" "DialoGPT-small"
 ALPHA=0.05
 BETA=0.1
@@ -14,9 +14,9 @@ K=0.5
 EXPERIMENTS=1 # each experiment run 3 times
 NUM_NODES=4
 
-for MODEL_NAME in "DialoGPT-medium"; do
+for MODEL_NAME in "DialoGPT-large"; do
     for RATE_LAMBDA in 10; do
-        for RETRAIN_RATE in 0.9; do
+        for RETRAIN_RATE in 0.5; do
             OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
             # python distributed_dialogpt.py \
             #     --model_name_or_path "microsoft/$MODEL_NAME" \
@@ -52,62 +52,62 @@ for MODEL_NAME in "DialoGPT-medium"; do
             #     --output_dir $OUTPUT_DIR
 
             # for TASK_ASSIGNMENT in 'random' 'rr' 'util' 'workload'; do
-            # for TASK_ASSIGNMENT in 'workload'; do
-            #     python -m memory_profiler distributed_dialogpt.py \
-            #         --model_name_or_path "microsoft/$MODEL_NAME" \
-            #         --model_name $MODEL_NAME \
-            #         --num_nodes $NUM_NODES \
-            #         --n_samples $NUM_SAMPLES \
-            #         --rate_lambda $RATE_LAMBDA \
-            #         --workload $WORKLOAD \
-            #         --setting $SETTING \
-            #         --retraining_rate $RETRAIN_RATE \
-            #         --task_assignment $TASK_ASSIGNMENT \
-            #         --output_dir $OUTPUT_DIR \
-            #         --batch_size $BATCH_SIZE \
-            #         --alpha $ALPHA \
-            #         --beta $BETA \
-            #         --epsilon $EPSILON \
-            #         --k $K \
-            #         --experiments $EXPERIMENTS \
-            #         --memory_threshold $MEMORY_THRESHOLD
+            for TASK_ASSIGNMENT in 'workload'; do
+                python -m memory_profiler distributed_dialogpt.py \
+                    --model_name_or_path "microsoft/$MODEL_NAME" \
+                    --model_name $MODEL_NAME \
+                    --num_nodes $NUM_NODES \
+                    --n_samples $NUM_SAMPLES \
+                    --rate_lambda $RATE_LAMBDA \
+                    --workload $WORKLOAD \
+                    --setting $SETTING \
+                    --retraining_rate $RETRAIN_RATE \
+                    --task_assignment $TASK_ASSIGNMENT \
+                    --output_dir $OUTPUT_DIR \
+                    --batch_size $BATCH_SIZE \
+                    --alpha $ALPHA \
+                    --beta $BETA \
+                    --epsilon $EPSILON \
+                    --k $K \
+                    --experiments $EXPERIMENTS \
+                    --memory_threshold $MEMORY_THRESHOLD
 
-            #     python plot.py \
-            #         --node $NUM_NODES \
-            #         --model_name $MODEL_NAME \
-            #         --setting $SETTING \
-            #         --workload $WORKLOAD \
-            #         --task_assignment $TASK_ASSIGNMENT \
-            #         --retraining_rate $RETRAIN_RATE \
-            #         --alpha $ALPHA \
-            #         --beta $BETA \
-            #         --epsilon $EPSILON \
-            #         --output_dir $OUTPUT_DIR
-            # done
+                python plot.py \
+                    --node $NUM_NODES \
+                    --model_name $MODEL_NAME \
+                    --setting $SETTING \
+                    --workload $WORKLOAD \
+                    --task_assignment $TASK_ASSIGNMENT \
+                    --retraining_rate $RETRAIN_RATE \
+                    --alpha $ALPHA \
+                    --beta $BETA \
+                    --epsilon $EPSILON \
+                    --output_dir $OUTPUT_DIR
+            done
 
-            python distributed_dialogpt.py \
-                --model_name_or_path "microsoft/$MODEL_NAME" \
-                --model_name $MODEL_NAME \
-                --num_nodes $NUM_NODES \
-                --n_samples $NUM_SAMPLES \
-                --rate_lambda $RATE_LAMBDA \
-                --workload $WORKLOAD \
-                --setting "isolated" \
-                --retraining_rate $RETRAIN_RATE \
-                --task_assignment 'rr' \
-                --output_dir $OUTPUT_DIR \
-                --batch_size $BATCH_SIZE \
-                --experiments $EXPERIMENTS \
-                --memory_threshold $MEMORY_THRESHOLD
+            # python distributed_dialogpt.py \
+            #     --model_name_or_path "microsoft/$MODEL_NAME" \
+            #     --model_name $MODEL_NAME \
+            #     --num_nodes $NUM_NODES \
+            #     --n_samples $NUM_SAMPLES \
+            #     --rate_lambda $RATE_LAMBDA \
+            #     --workload $WORKLOAD \
+            #     --setting "isolated" \
+            #     --retraining_rate $RETRAIN_RATE \
+            #     --task_assignment 'rr' \
+            #     --output_dir $OUTPUT_DIR \
+            #     --batch_size $BATCH_SIZE \
+            #     --experiments $EXPERIMENTS \
+            #     --memory_threshold $MEMORY_THRESHOLD
 
-            python plot.py \
-                --node $NUM_NODES \
-                --model_name $MODEL_NAME \
-                --setting "isolated" \
-                --workload $WORKLOAD \
-                --task_assignment 'rr' \
-                --retraining_rate $RETRAIN_RATE \
-                --output_dir $OUTPUT_DIR
+            # python plot.py \
+            #     --node $NUM_NODES \
+            #     --model_name $MODEL_NAME \
+            #     --setting "isolated" \
+            #     --workload $WORKLOAD \
+            #     --task_assignment 'rr' \
+            #     --retraining_rate $RETRAIN_RATE \
+            #     --output_dir $OUTPUT_DIR
 
         done
     done

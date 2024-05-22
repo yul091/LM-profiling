@@ -13,12 +13,14 @@ EPSILON=0.5
 K=0.5
 EXPERIMENTS=3 # each experiment run 3 times
 NUM_NODES=4
+RATE_LAMBDA=-1
 
-
-for RATE_LAMBDA in 30 25 20 15 10 5 1; do
-    for RETRAIN_RATE in 0.01 0.05 0.1 0.15 0.2 0.25 0.3; do
-        # OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_alternate/$MODEL_NAME
-        OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
+# for RATE_LAMBDA in 30 25 20 15 10 5 1; do
+for MODEL_NAME in "DialoGPT-large" "DialoGPT-medium" "DialoGPT-small"; do
+    # for RETRAIN_RATE in 0.01 0.05 0.1 0.15 0.2 0.25 0.3; do
+    for RETRAIN_RATE in 0.5; do
+        OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_alternate/$MODEL_NAME
+        # OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
         python distributed_dialogpt.py \
             --model_name_or_path "microsoft/$MODEL_NAME" \
             --model_name $MODEL_NAME \
@@ -34,7 +36,7 @@ for RATE_LAMBDA in 30 25 20 15 10 5 1; do
             --alpha $ALPHA \
             --beta $BETA \
             --epsilon $EPSILON \
-            --k $K \
+            --active_selection "adaptive-0.8" \
             --experiments $EXPERIMENTS \
             --no_prior_profile \
             --memory_threshold $MEMORY_THRESHOLD
@@ -49,6 +51,7 @@ for RATE_LAMBDA in 30 25 20 15 10 5 1; do
             --alpha $ALPHA \
             --beta $BETA \
             --epsilon $EPSILON \
+            --active_selection "adaptive-0.8" \
             --no_prior_profile \
             --output_dir $OUTPUT_DIR
         done
