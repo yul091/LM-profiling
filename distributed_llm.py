@@ -249,7 +249,7 @@ class DistributedLLM:
         )
         
         # Preloaded dataset
-        self.distributed_preloaded_tasks, self.total_tasks, self.retraining_tasks, retraining_taskIDs = self.get_preloaded_dataset(
+        self.distributed_preloaded_tasks, self.total_tasks, self.retraining_tasks, self.training_taskIDs, self.inference_taskIDs = self.get_preloaded_dataset(
             self.distributed_nodes, 
             self.dataloader, 
             retraining_rate=self.retraining_rate,
@@ -261,7 +261,7 @@ class DistributedLLM:
         
         # Select tasks to be trained
         if (self.active_selection is None) or self.RECORD_MODE: 
-            self.backward_taskIDs = set(retraining_taskIDs)
+            self.backward_taskIDs = set(self.training_taskIDs)
         elif self.active_selection in ['random', 'first', 'last']:
             lh = f"hetero{self.length_heterogeneity}" if self.length_heterogeneity is not None else "hetero_default"
             adapt_f = f'{self.output_dir}/metrics_{self.model_n}_{self.task_assignment}_{setting}-{self.priority}_{self.workload}-{lh}-{self.length_distribution}_{self.retraining_rate}-active_adaptive_ID=0.json'
@@ -270,42 +270,42 @@ class DistributedLLM:
                 actual_trained_tasks = adapt_res['actual_retrained_tasks']
                 print(f"\n ** Actual tasks to be trained: {actual_trained_tasks} (according to adaptive) **\n")
                 if self.active_selection == 'random':
-                    self.backward_taskIDs = set(random.sample(retraining_taskIDs, k=actual_trained_tasks))
+                    self.backward_taskIDs = set(random.sample(self.training_taskIDs, k=actual_trained_tasks))
                 elif self.active_selection == 'first':
-                    self.backward_taskIDs = set(retraining_taskIDs[:actual_trained_tasks])
+                    self.backward_taskIDs = set(self.training_taskIDs[:actual_trained_tasks])
                 else:
-                    self.backward_taskIDs = set(retraining_taskIDs[-actual_trained_tasks:])
+                    self.backward_taskIDs = set(self.training_taskIDs[-actual_trained_tasks:])
             else:
-                self.backward_taskIDs = set(retraining_taskIDs)
+                self.backward_taskIDs = set(self.training_taskIDs)
         elif '-' in self.active_selection: 
             # check if the string is a float number
             policy, ratio = self.active_selection.split('-')
             k = int(self.retraining_tasks * float(ratio))
             print("\n ** Selective training policy: {} | Ratio: {} | Number of tasks to be trained: {} **\n".format(policy, ratio, k))
             if policy == 'random':
-                self.backward_taskIDs = set(random.sample(retraining_taskIDs, k=k))
+                self.backward_taskIDs = set(random.sample(self.training_taskIDs, k=k))
             elif policy == 'length':
-                # LCs = {taskID: self._compute_LC(self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]) for taskID in retraining_taskIDs}
+                # LCs = {taskID: self._compute_LC(self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]) for taskID in training_taskIDs}
                 # self.backward_taskIDs = set(sorted(LCs, key=lambda x: LCs[x], reverse=True)[:k]) # select the top-k tasks with the highest LC
-                self.backward_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
+                self.backward_taskIDs = set(sorted(self.training_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
             elif policy == 'loss':
                 # We need to do backward for the top-k tasks with the highest losses
                 if self.no_prior_profile:
-                    self.backward_taskIDs = set(random.sample(retraining_taskIDs, k=k))
+                    self.backward_taskIDs = set(random.sample(self.training_taskIDs, k=k))
                 else:
-                    self.backward_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
+                    self.backward_taskIDs = set(sorted(self.training_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
             elif policy == 'first':
-                self.backward_taskIDs = set(retraining_taskIDs[:k])
+                self.backward_taskIDs = set(self.training_taskIDs[:k])
             elif policy == 'last':
-                self.backward_taskIDs = set(retraining_taskIDs[-k:])
+                self.backward_taskIDs = set(self.training_taskIDs[-k:])
             elif policy == 'adaptive':
                 # We either select the top-k tasks with the highest losses or the top-k tasks with the smallest lengths
                 if self.no_prior_profile:
-                    self.loss_taskIDs = set(random.sample(retraining_taskIDs, k=k))
-                    self.length_taskIDs = set(random.sample(retraining_taskIDs, k=k))
+                    self.loss_taskIDs = set(random.sample(self.training_taskIDs, k=k))
+                    self.length_taskIDs = set(random.sample(self.training_taskIDs, k=k))
                 else:
-                    self.loss_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
-                    self.length_taskIDs = set(sorted(retraining_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
+                    self.loss_taskIDs = set(sorted(self.training_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
+                    self.length_taskIDs = set(sorted(self.training_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
             else:
                 raise ValueError(f"Invalid active selection: {self.active_selection}")
             
@@ -402,7 +402,7 @@ class DistributedLLM:
         dataloader = dataloader if dataloader is not None else self.dataloader
         retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
         distributed_preloaded_tasks = defaultdict(list)
-        total_tasks, retraining_taskIDs = 0, []
+        total_tasks, inference_taskIDs, training_taskIDs = 0, [], []
         
         selected_data = []
         for i, batch in enumerate(dataloader):
@@ -455,7 +455,9 @@ class DistributedLLM:
             require_training = random.random() < retraining_rate
             total_tasks += 1
             if require_training: 
-                retraining_taskIDs.append(i)
+                training_taskIDs.append(i)
+            else:
+                inference_taskIDs.append(i)
                 
             for nodeID, node in distributed_nodes.items():
                 task = Task(
@@ -469,7 +471,7 @@ class DistributedLLM:
                 )
                 distributed_preloaded_tasks[nodeID].append(task)
         
-        return distributed_preloaded_tasks, total_tasks, len(retraining_taskIDs), retraining_taskIDs
+        return distributed_preloaded_tasks, total_tasks, len(training_taskIDs), training_taskIDs, inference_taskIDs
 
 
     def producer(
@@ -561,7 +563,7 @@ class DistributedLLM:
         for stageID in range(self.num_gpus_per_node):
             pfe = self.all_trace[nodeID][last_taskID][stageID]['fe'] if last_taskID is not None else fb
             fb = max(pfe, fb)
-            fe = fb + eta * length ** 2 # f_e = f_b + eta * L^2
+            fe = fb + eta * length ** 2  # f_e = f_b + eta * L^2
             i = init_id
             
             for i in range(init_id, len(previous_train_taskIDs)):
@@ -1049,18 +1051,20 @@ class DistributedLLM:
         # Run the stages concurrently
         if self.RECORD_MODE:
             print("\n ** Running in RECORD mode **\n")
-            task_queue = queue.Queue()
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                future1 = executor.submit(
-                    self.producer,
-                    task_queue, 
-                )
-                future2 = executor.submit(
-                    self.globalScheduler,
-                    task_queue,
-                )
-                future3 = executor.submit(self.run_stages_concurrently)
-                
+        
+        task_queue = queue.Queue()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future1 = executor.submit(
+                self.producer,
+                task_queue, 
+            )
+            future2 = executor.submit(
+                self.globalScheduler,
+                task_queue,
+            )
+            future3 = executor.submit(self.run_stages_concurrently)
+        
+        if self.RECORD_MODE:        
             # Save recorded dict
             losses = [loss for loss, _ in self.record_dict['loss']]
             # Quantile (25, 50, 75) for record_dict['loss]
@@ -1100,18 +1104,6 @@ class DistributedLLM:
                 json.dump(self.record_dict, f, indent=4)
             
         else:
-            task_queue = queue.Queue()
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                future1 = executor.submit(
-                    self.producer,
-                    task_queue, 
-                )
-                future2 = executor.submit(
-                    self.globalScheduler,
-                    task_queue,
-                )
-                future3 = executor.submit(self.run_stages_concurrently)
-            
             # Delete checkpoint file in the disk if self.ckpt_path is not None
             if self.ckpt_path is not None:
                 for j in range(self.num_gpus_per_node):

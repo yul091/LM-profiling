@@ -15,6 +15,7 @@ from .dialogpt import (
     GPTStartingStage,
     GPTIntermediateStage,
     GPTEndingStage,
+    GPTOneStage,
 )
 from transformers import (
     LlamaConfig, 
@@ -77,7 +78,7 @@ def get_stages(
 
     N_s, N_i, N_e: the number of hidden layers (LlamaDecoderLayers) for each stage
     """
-    assert num_stages > 1, 'At least 2 stages are required.'
+    assert num_stages > 0, 'At least 1 stage is required.'
     
     if hidden_layers_assignments is None:
         """
@@ -121,9 +122,8 @@ def get_stages(
         config.num_hidden_layers = hidden_layers_assignments[stage_id]
         device = init_device + stage_id
         layer_ids = list(range(stage_id * config.num_hidden_layers, (stage_id + 1) * config.num_hidden_layers))
-        if stage_id == num_stages - 1:
-            # Ending stage
-            stage = end_stage_class(
+        if num_stages == 1:
+            stage = GPTOneStage(
                 config=config,
                 device=device, 
                 layer_ids=layer_ids,
@@ -133,26 +133,39 @@ def get_stages(
             # stage.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
             # Set pad_token_id to eos_token_id because Llama / GPT does not have a PAD token
             stage.generation_config.pad_token_id = stage.generation_config.eos_token_id
-        elif stage_id == 0:
-            # Starting stage
-            stage = start_stage_class(
-                config=config,
-                device=device, 
-                layer_ids=layer_ids,
-                pretrained_model=pretrained_model,
-                timing_info=timing_info,
-            )
-            # stage.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
         else:
-            # Intermediate stage
-            stage = intermediate_stage_class(
-                config=config,
-                device=device, 
-                layer_ids=layer_ids,
-                pretrained_model=pretrained_model,
-                timing_info=timing_info,
-            )
-            # stage.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+            if stage_id == num_stages - 1:
+                # Ending stage
+                stage = end_stage_class(
+                    config=config,
+                    device=device, 
+                    layer_ids=layer_ids,
+                    pretrained_model=pretrained_model,
+                    timing_info=timing_info,
+                )
+                # stage.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+                # Set pad_token_id to eos_token_id because Llama / GPT does not have a PAD token
+                stage.generation_config.pad_token_id = stage.generation_config.eos_token_id
+            elif stage_id == 0:
+                # Starting stage
+                stage = start_stage_class(
+                    config=config,
+                    device=device, 
+                    layer_ids=layer_ids,
+                    pretrained_model=pretrained_model,
+                    timing_info=timing_info,
+                )
+                # stage.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+            else:
+                # Intermediate stage
+                stage = intermediate_stage_class(
+                    config=config,
+                    device=device, 
+                    layer_ids=layer_ids,
+                    pretrained_model=pretrained_model,
+                    timing_info=timing_info,
+                )
+                # stage.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
             
         print(f"Put stage {stage.__class__.__name__} ({stage.num_parameters()} parameters) on device {device}")
         totoal_params += stage.num_parameters()
