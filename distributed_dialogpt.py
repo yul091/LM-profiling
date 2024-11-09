@@ -11,9 +11,6 @@ import logging
 from utils import record_time, Task
 from distributed_llm import DistributedLLM, set_seed, gc
 from models import (
-    # GPTStartingStage,
-    # GPTIntermediateStage,
-    # GPTEndingStage,
     CustomizedGPT2Out,
     _prepare_decoding_inputs,
 )
@@ -211,6 +208,7 @@ if __name__ == '__main__':
                         help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--num_nodes', type=int, default=2)
+    parser.add_argument('--num_gpus', type=int, default=None)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--save_length', action='store_true', help='save the length of each task')
@@ -227,7 +225,8 @@ if __name__ == '__main__':
     parser.add_argument('--alpha', type=float, default=1, help='response time coefficient')
     parser.add_argument('--beta', type=float, default=1, help='length heterogeneity coefficient')
     parser.add_argument('--epsilon', type=float, default=1e-6, help='small value to avoid division by zero')
-    parser.add_argument('--rate_lambda', type=int, default=10, help='Average number of tasks produced per second')
+    parser.add_argument('--rate_lambda', type=int, default=10, help='Average number of inference requests per second')
+    parser.add_argument('--training_lambda', type=int, default=30, help='Average number of training requests per second')
     parser.add_argument('--workload', type=str, default='poisson', help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random',
                         help='distribution of input sequence length')

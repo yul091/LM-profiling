@@ -74,8 +74,10 @@ class DistributedLLM:
         self.setting = args.setting
         self.priority = args.priority
         self.num_nodes = args.num_nodes
+        self.num_gpus = args.num_gpus
         self.batch_size = args.batch_size
         self.rate_lambda = args.rate_lambda
+        self.training_lambda = args.training_lambda
         self.output_dir = args.output_dir
         self.task_assignment = args.task_assignment
         self.dataset_name_or_path = args.dataset_name_or_path
@@ -96,9 +98,10 @@ class DistributedLLM:
         lh = 'default' if self.length_heterogeneity is None else self.length_heterogeneity
         self.profile_file = f"{self.profile_dir}/{self.model_n}_lambda={self.rate_lambda}_nodes={self.num_nodes}_retrain={self.retraining_rate}_LH={lh}.json"
         self.RECORD_MODE = False if self.run_mode == 'online' else True
-        if self.profile_file is None or not os.path.exists(self.profile_file):
-            self.RECORD_MODE = True
-            
+        if self.task_assignment == 'workload':
+            if self.profile_file is None or not os.path.exists(self.profile_file):
+                self.RECORD_MODE = True
+                
         if self.RECORD_MODE:
             self.retraining_rate = 0.5
             self.task_assignment = 'rr'
@@ -106,7 +109,7 @@ class DistributedLLM:
             self.eta, self.BT = None, None
             self.record_dict = defaultdict(list)
         else:
-            if self.no_prior_profile:
+            if self.no_prior_profile or self.task_assignment != 'workload':
                 self.eta, self.BT = None, None
                 print("\n ** No offline profile used [pure ONLINE] **\n")
             else:
@@ -116,6 +119,7 @@ class DistributedLLM:
                 # self.profiled_losses = file['loss'] # list of offline training losses
                 self.profiled_loss_dict = {int(taskID): float(instance['loss']) for (taskID, instance) in file['task_dict'].items()} # {taskID: loss}
                 print("\n ** Offline profile loaded: eta={}, BT={} **\n".format(self.eta, self.BT))
+        
         self.alpha = args.alpha
         self.beta = args.beta
         self.epsilon = args.epsilon
@@ -142,12 +146,15 @@ class DistributedLLM:
             print(f"\n ** TASK ASSIGNMENT: {self.task_assignment} | Number of used nodes: {self.used_nodes} (out of {args.num_nodes}) **\n")
             
         if self.setting == 'isolated':
-            num_train_nodes = max(1, round(self.used_nodes * self.isolated_split))
-            if self.retraining_rate == 0:
-                num_train_nodes = 0
-            num_test_nodes = max(1, self.used_nodes - num_train_nodes)
-            if self.retraining_rate == 1:
-                num_test_nodes = 0
+            if self.isolated_split != 100:
+                num_train_nodes = max(1, round(self.used_nodes * self.isolated_split))
+                if self.retraining_rate == 0:
+                    num_train_nodes = 0
+                num_test_nodes = max(1, self.used_nodes - num_train_nodes)
+                if self.retraining_rate == 1:
+                    num_test_nodes = 0
+            else:
+                num_test_nodes = self.used_nodes // 4
             
             self._test_nodes = list(range(num_test_nodes))
             self._train_nodes = list(range(num_test_nodes, self.used_nodes))
@@ -156,7 +163,6 @@ class DistributedLLM:
             self._train_nodes = list(range(self.used_nodes))
             self._test_nodes = list(range(self.used_nodes))
         
-        # task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta})" if self.task_assignment == 'workload' else self.task_assignment
         if self.priority is not None:
             self.ckpt_path = f'{self.output_dir}/stages-{self.task_assignment}_{self.model_n}_{setting}-{self.priority}_{self.workload}_{self.retraining_rate}'
         else:
@@ -173,7 +179,17 @@ class DistributedLLM:
         self.backward_start = torch.cuda.Event(enable_timing=True)
         self.backward_end = torch.cuda.Event(enable_timing=True)
         
-        self.num_gpus_per_node = torch.cuda.device_count() // self.num_nodes
+        # Count number GPUs per node
+        if self.num_gpus is None:
+            self.num_gpus_per_node = torch.cuda.device_count() // self.num_nodes
+        else:
+            # Ensure the user-specified number of GPUs does not exceed the available GPUs
+            available_gpus = torch.cuda.device_count()
+            if self.num_gpus > available_gpus:
+                raise ValueError(f"Requested {self.num_gpus} GPUs, but only {available_gpus} GPUs are available.")
+        self.num_gpus_per_node = self.num_gpus // self.num_nodes
+
+        # Define node instance
         self.distributed_nodes = {
             nodeID: Node(
                 nodeID, 
@@ -395,26 +411,28 @@ class DistributedLLM:
         distributed_nodes: Optional[Dict[int, Node]] = None, 
         dataloader: Optional[DataLoader] = None, 
         retraining_rate: Optional[float] = None,
-    ) -> Tuple[Dict[int, List[Task]], int, int]:
+    ) -> Tuple[Dict[int, List[Task]], int, int, List[int], List[int]]:
         
         print("Using preloaded data ...")
         distributed_nodes = distributed_nodes if distributed_nodes is not None else self.distributed_nodes
         dataloader = dataloader if dataloader is not None else self.dataloader
         retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
         distributed_preloaded_tasks = defaultdict(list)
-        total_tasks, inference_taskIDs, training_taskIDs = 0, [], []
+        inference_taskIDs, training_taskIDs = [], []
         
         selected_data = []
         for i, batch in enumerate(dataloader):
             seq_length = batch['input_ids'].shape[1]
             selected_data.append((seq_length, batch))
+        inference_tasks = int(len(selected_data) * (1-retraining_rate))
+        inference_ids = random.sample(range(len(selected_data)), k=inference_tasks)
             
         # Define the order of arrival input sequence length
         if self.length_distribution == 'ascending':
             selected_data.sort(key=lambda x: x[0])
         elif self.length_distribution == 'descending':
             selected_data.sort(key=lambda x: x[0], reverse=True)
-        elif self.length_distribution == 'bursty': # one short one long, ...
+        elif self.length_distribution == 'bursty':  # one short one long, ...
             selected_data.sort(key=lambda x: x[0])
             mid_index = len(selected_data) // 2
             short_data, long_data = selected_data[:mid_index], selected_data[mid_index:]
@@ -431,38 +449,89 @@ class DistributedLLM:
             raise ValueError(f"Invalid length distribution: {self.length_distribution}")
         
         
-        # If workload is 'alternate', we need to create a list of varying lambda values (e.g., 5, 5, ..., 10, 10, ..., 30, 30, ..., 50, 50, ...), each for 20 consecutive tasks
-        if self.rate_lambda == -1:
-            print("\n ** Using alternate workload **\n")
-            lambda_values = [5, 10, 20, 30]
-            current_length, idx, tasks_per_lambda = 0, 0, 20
-            task_lambdas = []
-            while current_length < len(selected_data):
-                if current_length + tasks_per_lambda > len(selected_data):
-                    # Add fewer elements if adding 20 would exceed the total length
-                    repetitions = len(selected_data) - current_length
-                else:
-                    repetitions = tasks_per_lambda
-                    
-                task_lambdas.extend([lambda_values[idx]] * repetitions)
-                current_length += repetitions
-                idx = (idx + 1) % len(lambda_values)
-         
-            
-        # Create preloaded tasks with each one on a specific CUDA device
+        # If workload is 'alternate', we need to create a list of varying lambda values (e.g., 1, 1, ..., 5, 5, ..., 30, 30, ...), each for X consecutive tasks
+        if self.rate_lambda == -1 and retraining_rate != 1:
+            print(f"\n ** Frequency-alternated {inference_tasks} serving requests **\n")
+            lambda_values = [6, 12, 29, 15, 8, 20, 11, 6, 24, 19, 30, 14]
+            total_lambda = sum(lambda_values)
+            k = inference_tasks / total_lambda  # Proportionality constant
+
+            # Initialize variables
+            tasks_per_lambda_dict = {}
+            total_assigned_tasks = 0
+            inference_lambdas = []
+
+            # Calculate tasks per lambda proportional to lambda values
+            for lam in lambda_values:
+                tasks = int(k * lam)
+                tasks_per_lambda_dict[lam] = tasks
+                total_assigned_tasks += tasks
+
+            # Adjust for any remaining tasks due to integer rounding
+            remaining_tasks = inference_tasks - total_assigned_tasks
+            if remaining_tasks > 0:
+                # Distribute the remaining tasks starting from the largest lambda
+                sorted_lambdas = sorted(lambda_values, reverse=True)
+                idx = 0
+                while remaining_tasks > 0:
+                    lam = sorted_lambdas[idx % len(sorted_lambdas)]
+                    tasks_per_lambda_dict[lam] += 1
+                    remaining_tasks -= 1
+                    idx += 1
+
+            # Construct a list of dictionaries to store ranges and node requirements
+            lambda_ranges = []
+            current_start_id = 0  # Initial task ID
+            for lam in lambda_values:
+                repetitions = tasks_per_lambda_dict[lam]
+                inference_lambdas.extend([lam] * repetitions)
+                test_nodes = self.num_nodes // 4 if lam <= 15 else self.num_nodes // 2
+                current_end_id = current_start_id + repetitions - 1  # Calculate the end ID for this lambda range
+                
+                # Append the range to lambda_ranges
+                lambda_ranges.append({
+                    'lambda': lam,
+                    'start_id': current_start_id,
+                    'end_id': current_end_id,
+                    'test_nodes': test_nodes
+                })
+                
+                # Update the start ID for the next lambda
+                current_start_id = current_end_id + 1
+
+            if self.isolated_split == 100:
+                # Now lambda_ranges contains the ranges and test node requirements
+                lambda_ranges[-1]['end_id'] = len(selected_data) - 1
+                self.ID2test = {}
+                for taskID in range(len(selected_data)):
+                    matched = False
+                    for entry in lambda_ranges:
+                        if entry['start_id'] <= taskID <= entry['end_id']:
+                            self.ID2test[taskID] = entry['test_nodes']
+                            matched = True
+                            break
+                    if not matched:
+                        raise ValueError(f'No lambda intervals match task {taskID}')
+                print(f'\nLambda Ranges and Test Node Requirements: {lambda_ranges}')
+
+
+        # print(f'inference lambdas {len(inference_lambdas)}, inference_ids {len(inference_ids)}')
+        j = 0
         for i, (_, batch) in enumerate(selected_data):
             # 10% of the time, produce a task with feedback
-            require_training = random.random() < retraining_rate
-            total_tasks += 1
+            require_training = i not in set(inference_ids)
             if require_training: 
                 training_taskIDs.append(i)
+                lamda = self.training_lambda
             else:
                 inference_taskIDs.append(i)
+                lamda = self.rate_lambda if self.rate_lambda != -1 else inference_lambdas[j]
+                j += 1
                 
             for nodeID, node in distributed_nodes.items():
                 task = Task(
                     task_id=i,
-                    rate_lambda=self.rate_lambda if self.rate_lambda != -1 else task_lambdas[i],
+                    rate_lambda=lamda,
                     query=_prepare_inputs(batch, device=node.init_device),
                     feedback=_prepare_inputs(batch['labels'], device=node.last_device),
                     node_id=nodeID,
@@ -471,31 +540,41 @@ class DistributedLLM:
                 )
                 distributed_preloaded_tasks[nodeID].append(task)
         
-        return distributed_preloaded_tasks, total_tasks, len(training_taskIDs), training_taskIDs, inference_taskIDs
+        return distributed_preloaded_tasks, len(selected_data), len(training_taskIDs), training_taskIDs, inference_taskIDs
 
 
     def producer(
         self,
         taskQueue: queue.Queue, 
-    ):
+        function: str = 'training',
+    ) -> None:
+        if function == 'training':
+            IDs = self.training_taskIDs
+        elif function == 'serving':
+            IDs = self.inference_taskIDs
+        elif function == 'mixed':
+            IDs = list(range(len(self.distributed_preloaded_tasks[0])))
+        else:
+            raise ValueError(f'Unrecognized function type {function}! Must be one of the following: training, serving, mixed.')
+        
         # Produce using the dataset
-        for taskID, task in enumerate(self.distributed_preloaded_tasks[0]):
+        for taskID in IDs:
             if self.workload == 'all':
                 time.sleep(0)
             else:
-                time.sleep(random.expovariate(task.rate_lambda))
+                time.sleep(random.expovariate(self.distributed_preloaded_tasks[0][taskID].rate_lambda))
             # 10% of the time, produce a task with feedback
             # print("Producing task {} with input length {}".format(taskID, task.query['input_ids'].shape[1]))
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(taskID)
             # We record and calculate the response time for each user task (no retraining)
             release = time.time()
-            if not task.require_training:
+            if not self.distributed_preloaded_tasks[0][taskID].require_training:
                 self.user_task_record[taskID]['release'] = release
             self.task_arrival[taskID]['release'] = release
             
         taskQueue.put(None)  # Signal the end of the dataset
-        print("Producer finished producing tasks")
+        print(f"Producer finished producing {function} tasks")
         
         
     def _compute_LC(
@@ -680,10 +759,28 @@ class DistributedLLM:
             if self.setting != 'isolated':
                 nodeID = self._assign_node(node_list=list(range(self.used_nodes)), taskID=taskID, do_backward=do_backward)
             else:
+                ################ Dynamic separate ##############
+                test_nodes = self._test_nodes
+                train_nodes = self._train_nodes
+                if self.rate_lambda == -1 and self.isolated_split == 100:  # dynamic
+                    # if self.num_gpus != 8:
+                    #     raise ValueError(f'Dynamic separate only support 8 GPUs! Currently have {self.num_gpus} GPUs!')
+                    # if taskID <= self.ID_thresholds[0]:
+                    #     num_test_nodes = self.used_nodes // 4
+                    # elif self.ID_thresholds[0] < taskID <= self.ID_thresholds[1]:
+                    #     num_test_nodes = self.used_nodes // 2
+                    # else:
+                    #     num_test_nodes = self.used_nodes * 3 // 4
+                    num_test_nodes = self.ID2test[taskID]
+                    test_nodes = list(range(num_test_nodes))
+                    train_nodes = list(range(num_test_nodes, self.used_nodes))
+                    print(f' ** Dynamic separate: taskID {taskID}, test_nodes {test_nodes}, train_nodes {train_nodes} ** ')
+                ################ Dynamic separate ##############
+                
                 if self.distributed_preloaded_tasks[0][taskID].require_training:  # assign to one of the training nodes
-                    nodeID = self._assign_node(node_list=self._train_nodes, taskID=taskID, do_backward=do_backward)
+                    nodeID = self._assign_node(node_list=train_nodes, taskID=taskID, do_backward=do_backward)
                 else: # assign to one of the test nodes
-                    nodeID = self._assign_node(node_list=self._test_nodes, taskID=taskID, do_backward=do_backward) 
+                    nodeID = self._assign_node(node_list=test_nodes, taskID=taskID, do_backward=do_backward) 
 
             self.distributed_preloaded_tasks[nodeID][taskID].do_backward = do_backward
                     
@@ -871,11 +968,7 @@ class DistributedLLM:
     def run_stages_concurrently(self):
         with ThreadPoolExecutor(max_workers=len(self.distributed_nodes)) as executor:
             for nodeID, node in self.distributed_nodes.items():
-                future = executor.submit(
-                    self.node_inference, 
-                    nodeID,
-                    node, 
-                )
+                future = executor.submit(self.node_inference, nodeID, node)
         
         
     def save_timing_info(self):
@@ -1012,6 +1105,9 @@ class DistributedLLM:
                 # total_response_time += record_dict['end'] - record_dict['release']
                 # total_wait_time += record_dict['start'] - record_dict['release']
                 # total_inference_time += record_dict['end'] - record_dict['start']
+                if 'start' not in record_dict or 'end' not in record_dict:
+                    print(f"Unrecorded user request (ID={taskID})!")
+                    continue
                 user_global_min_time = min(user_global_min_time, record_dict['start'])
                 user_global_max_time = max(user_global_max_time, record_dict['end'])
                 response_times.append(record_dict['end'] - record_dict['release'])
@@ -1053,16 +1149,35 @@ class DistributedLLM:
             print("\n ** Running in RECORD mode **\n")
         
         task_queue = queue.Queue()
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            future1 = executor.submit(
-                self.producer,
-                task_queue, 
-            )
-            future2 = executor.submit(
+        num_workers = 2
+        if self.training_taskIDs:
+            num_workers += 1
+        if self.inference_taskIDs:
+            num_workers += 1
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            if self.inference_taskIDs:
+                executor.submit(
+                    self.producer,
+                    task_queue, 
+                    'serving',
+                )
+            if self.training_taskIDs:
+                executor.submit(
+                    self.producer,
+                    task_queue, 
+                    'training',
+                )
+            # future1 = executor.submit(
+            #     self.producer,
+            #     task_queue, 
+            #     'mixed',
+            # )
+            executor.submit(
                 self.globalScheduler,
                 task_queue,
             )
-            future3 = executor.submit(self.run_stages_concurrently)
+            executor.submit(self.run_stages_concurrently)
         
         if self.RECORD_MODE:        
             # Save recorded dict
@@ -1129,6 +1244,7 @@ if __name__ == '__main__':
                         help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--num_nodes', type=int, default=2)
+    parser.add_argument('--num_gpus', type=int, default=None)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--save_length', action='store_true', help='save the length of each task')
@@ -1142,7 +1258,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=3)
     parser.add_argument('--retraining_rate', type=float, default=0.1, help='proportion of training tasks')
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
-    parser.add_argument('--rate_lambda', type=int, default=10, help='Average number of tasks produced per second')
+    parser.add_argument('--rate_lambda', type=int, default=10, help='Average number of inference requests per second')
+    parser.add_argument('--training_lambda', type=int, default=30, help='Average number of training requests per second')
     parser.add_argument('--alpha', type=float, default=1, help='response time coefficient')
     parser.add_argument('--beta', type=float, default=1, help='length heterogeneity coefficient')
     parser.add_argument('--epsilon', type=float, default=1e-6, help='small value to avoid division by zero')

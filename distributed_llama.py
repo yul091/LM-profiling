@@ -3,7 +3,7 @@ import sys
 sys.dont_write_bytecode = True
 import queue
 import argparse
-import pdb
+import time
 from typing import List, Dict, Optional, Any, Union
 import torch
 import logging
@@ -76,6 +76,7 @@ class DistributedLlama(DistributedLLM):
                 break
             
             task: Task = preloaded_tasks[taskID]
+            input_length = task.query['input_ids'].shape[1]
             assert task.task_id == taskID
             inputs = task.hiddens[stageID]
             
@@ -114,30 +115,53 @@ class DistributedLlama(DistributedLLM):
                 loss = tuple_outputs[0]
                 # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())
+
+                if self.RECORD_MODE:
+                    self.record_dict['loss'].append((loss.item(), taskID))
+                    self.record_dict['length'].append((input_length, taskID))
                 
-                if task.require_training:
+                if task.do_backward:
                     # # Synchronize to ensure all previous operations on the GPU are completed
                     # torch.cuda.synchronize(device)
                     # Backprop on the last stage
+                    bb = time.time()
+                    self.task_trace[nodeID][self.num_gpus_per_node-1]['bb'] = bb
+                    if taskID in self.train_trace[nodeID]:
+                        self.train_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
+                        self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
                     try:
                         loss.backward()
-                        record_time(init_device, 'end', 'backward', taskID, timing_info)
+                        be = record_time(init_device, 'end', 'backward', taskID, timing_info)
+                        self.task_trace[nodeID][0]['be'] = be
+                        if taskID in self.train_trace[nodeID]:
+                            self.train_trace[nodeID][taskID][0]['be'] = be   
+                            self.all_trace[nodeID][taskID][0]['be'] = be
+                        
+                        if self.BT is None:
+                            self.BT = (be - bb) / self.num_gpus_per_node
+                            
+                        print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                     except Exception as e:
                         # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                         pass
-                    self._trained_tasks += 1
+
+                    if self.RECORD_MODE:
+                        self.record_dict['BTs'].append(((be - bb)/self.num_gpus_per_node, taskID))
+                        
+                    self._trained_task_lengths.append(input_length)
                     
                     # Optimization
-                    try:
-                        self.distributed_optimizers[nodeID].step()
-                        self.distributed_schedulers[nodeID].step()
-                        self.distributed_optimizers[nodeID].zero_grad() # clear gradients
-                    except Exception as e:
-                        logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
-                        # pass
-                    print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                    if not self.RECORD_MODE: # In RECORD_MODE, we do not update the model parameters
+                        try:
+                            self.distributed_optimizers[nodeID].step()
+                            self.distributed_schedulers[nodeID].step()
+                        except Exception as e:
+                            logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
+                            # pass
                     
-                    if (self.setting == 'isolated') and (self._trained_tasks % self.saving_steps == 0): 
+                    self.distributed_optimizers[nodeID].zero_grad() # clear gradients
+                    
+                    if (self.setting == 'isolated') and (len(self._trained_task_lengths) % self.saving_steps == 0): 
                         # Save the parameters of stages in the last node and load them in other nodes
                         print(f" *** Save checkpoint {self.ckpt_path} *** ")
                         for j in range(self.num_gpus_per_node):
@@ -148,11 +172,16 @@ class DistributedLlama(DistributedLLM):
                             print(f" *** Load checkpoint for Node {i} *** ")
                             for j in range(self.num_gpus_per_node):
                                 self.distributed_stages[i][j].load_state_dict(torch.load(f"{self.ckpt_path}_stage{j}.pt"))
-                                
-                # else:
-                #     self.metrics["loss"].append(loss.item()) # we only compute performance for inference-only tasks
-                #     task.hiddens.append(loss)
-                #     deviceQueue.put(taskID) # put it back to the queue
+                    
+                    self._training_step += 1
+
+                # Update task stats
+                self.distributed_nodes[nodeID].updata_task_stats(
+                    taskID=taskID, 
+                    loss=loss.item(), 
+                    length=input_length, 
+                    computation_type='training' if task.do_backward else 'test',
+                )             
 
     
     
@@ -166,11 +195,14 @@ if __name__ == '__main__':
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--memory_threshold', type=float, default=0.8, help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--num_nodes', type=int, default=2)
+    parser.add_argument('--num_gpus', type=int, default=None)
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--save_length', action='store_true', help='save the length of each task')
-    parser.add_argument('--setting', type=str, default='active', choices=['active', 'interval', 'isolated'], help='training setting')
-    parser.add_argument('--isolated_split', type=float, default=None, help='split ratio for isolated test and train nodes')
+    parser.add_argument('--setting', type=str, default='active', choices=['active', 'interval', 'isolated'], 
+                        help='training setting')
+    parser.add_argument('--isolated_split', type=float, default=None, 
+                        help='split ratio for isolated test and train nodes')
     parser.add_argument('--priority', type=str, default='FIFO', choices=['FIFO', 'MLF', 'LLF'], help='scheduling priority')
     parser.add_argument('--task_assignment', type=str, default='random', choices=['rr', 'random', 'workload', 'util', 'rr+', 'random+', 'util+'], 
                         help='node level scheduling policy')
@@ -181,10 +213,14 @@ if __name__ == '__main__':
     parser.add_argument('--epsilon', type=float, default=1e-6, help='small value to avoid division by zero')
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
     parser.add_argument('--rate_lambda', type=int, default=10, help='Average number of tasks produced per second')
+    parser.add_argument('--training_lambda', type=int, default=30, help='Average number of training requests per second')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
-    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], help='distribution of input sequence length')
-    parser.add_argument('--length_heterogeneity', type=int, default=None, help='standard deviation of the length distribution of the sampled subset')
-    parser.add_argument('--active_selection', type=float, default=None, help='active selection ratio for training tasks')
+    parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], 
+                        help='distribution of input sequence length')
+    parser.add_argument('--length_heterogeneity', type=int, default=None, 
+                        help='standard deviation of the length distribution of the sampled subset')
+    parser.add_argument('--active_selection', type=float, default=None,
+                         help='active selection ratio for training tasks')
     parser.add_argument('--k', type=float, default=0.5, help='weight for balancing the loss and length consistency for adaptive training')
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--profile_dir', type=str, default='profile', help='directory to save profiling results')
