@@ -5,7 +5,6 @@ from collections import defaultdict
 from collections.abc import Mapping
 from typing import Optional, Tuple, Dict, List, Any, Union
 import torch
-import torch.nn as nn
 from .llama import (
     LlamaStartingStage,
     LlamaIntermediateStage,
@@ -65,6 +64,7 @@ def _prepare_inputs(
 def get_stages(
     config: LlamaConfig,
     token: str,
+    # tokenizer: Union[LlamaTokenizer, GPT2Tokenizer],
     model_name_or_path: str,
     num_stages: int,
     hidden_layers_assignments: List[int] = None,
@@ -99,6 +99,7 @@ def get_stages(
         # torch_dtype="float32",
     )
     # if 'llama' in model_name_or_path.lower():
+    #     pretrained_model.resize_token_embeddings(len(tokenizer))
     #     pretrained_model = pretrained_model.half()
     #     pretrained_model.gradient_checkpointing_enable()
     print("Model hidden dim {}, num layers {}, num heads {}, num parameters {}".format(
@@ -182,10 +183,12 @@ def stages_forward(
     labels = inputs.get('labels', None)
     labels = labels.to(stages[-1]._device) if labels is not None else None
     for i, stage in enumerate(stages):
+        # print(f'current stage {i}: {stage}')
         if verbose:
             print(f"Forward pass for stage {i} on device {stage._device}")
         if i == 0:
             batch_inputs = _prepare_inputs(inputs, device=stage._device)
+            # print(f"inputs: {batch_inputs['input_ids'].shape} (min: {batch_inputs['input_ids'].min()}, max: {batch_inputs['input_ids'].max()})")
             outputs = stage(**batch_inputs)
         else:
             batch_inputs = _prepare_inputs(outputs, device=stage._device) 
@@ -292,21 +295,24 @@ if __name__ == '__main__':
         tokenized_inputs['labels'] = labels['input_ids']
         return tokenized_inputs
     
+    print("Dataset example (first 2 examples):", datasets['test'][:2])
     train_dataset = datasets['test'].map(
         tokenize_and_align_labels,
         batched=True,
     ).remove_columns(datasets['test'].column_names)
+    print("Dataset tokenized example (first 2 examples):", train_dataset[:2])
+    print(f" ** pretrain name {model_name_or_path} tokenizer size: {len(tokenizer)} tokenized dataset IDs range: ({min(min(train_dataset['input_ids']))}, {max(max(train_dataset['input_ids']))}) ** ")
     
     label_pad_token_id = tokenizer.pad_token_id
     data_collator = DataCollatorForSeq2Seq(
         tokenizer,
-        model=model,
+        # model=model,
         label_pad_token_id=label_pad_token_id,
         pad_to_multiple_of=None,
     )
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=10,
+        batch_size=1,
         collate_fn=data_collator,
     )
     inputs = next(iter(train_dataloader))

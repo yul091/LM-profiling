@@ -19,7 +19,7 @@ from memory_profiler import profile
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from datasets import load_dataset
 from transformers import (
     AutoConfig, 
@@ -199,10 +199,7 @@ class DistributedLLM:
         }
         self.memory_threshold = args.memory_threshold
         self.device_total_memory = torch.cuda.get_device_properties(0).total_memory
-        self.timing_infos = {
-            nodeID: defaultdict(list) 
-            for nodeID in range(self.num_nodes)
-        }
+        self.timing_infos = {nodeID: defaultdict(list) for nodeID in range(self.num_nodes)}
         self.metrics = defaultdict(list)
         
         # Load the model and tokenizer
@@ -217,13 +214,7 @@ class DistributedLLM:
             token=self.access_token,
         )
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Data collator
-        self.data_collator = DataCollatorForSeq2Seq(
-            self.tokenizer,
-            label_pad_token_id=self.tokenizer.pad_token_id,
-            pad_to_multiple_of=None,
-        )
+        # print(f"Tokenizer: {self.tokenizer}, pad token id: {self.tokenizer.pad_token_id}, eos token id: {self.tokenizer.eos_token_id}, unk token id: {self.tokenizer.unk_token_id}")
         
         # Load datasets and dataloaders
         datasets = load_dataset(self.dataset_name_or_path)
@@ -231,11 +222,30 @@ class DistributedLLM:
             dataset = datasets['train']
         else:
             dataset = datasets['test']
-            
+
+        def tokenize_and_align_labels(examples):
+            tokenized_inputs = self.tokenizer(
+                examples['query'], 
+                padding=False, 
+                truncation=True,
+            )
+            labels = self.tokenizer(
+                examples['reference'], 
+                padding=False, 
+                truncation=True,
+            )
+            tokenized_inputs['labels'] = labels['input_ids']
+            # tokenized_inputs['labels_attention_mask'] = labels['attention_mask']
+            return tokenized_inputs
+        
+        # print("Dataset example (first 2 examples):", dataset[:2])
         dataset = dataset.map(
-            self._tokenize_and_align_labels,
+            tokenize_and_align_labels,
             batched=True,
+            load_from_cache_file=False,
         ).remove_columns(dataset.column_names)
+        # print("Dataset tokenized example (first 2 examples):", dataset[:2])
+        # print(f" ** pretrain name {self.model_name_or_path}, tokenized IDs range: ({min(min(dataset['input_ids']))}, {max(max(dataset['input_ids']))}) ** ")
         
         # Do sampling according to the length distribution
         input_lengths = [len(x) for x in dataset['input_ids']]
@@ -257,6 +267,12 @@ class DistributedLLM:
                 = np.mean(subset_lengths), np.std(subset_lengths), np.median(subset_lengths), min(subset_lengths), max(subset_lengths)
             print(f" ** Sampled {len(subset_lengths)} data points: mean={self.mean_length}, std={self.std_length}, medium={self.medium_length}, min={self.min_length}, max={self.max_length} **")
         
+        # Data collator
+        self.data_collator = DataCollatorForSeq2Seq(
+            self.tokenizer,
+            label_pad_token_id=self.tokenizer.pad_token_id,
+            pad_to_multiple_of=None,
+        )
         self.dataset = dataset
         self.dataloader = DataLoader(
             self.dataset,
@@ -330,8 +346,8 @@ class DistributedLLM:
             length_dict = {taskID: task.query['input_ids'].shape[1] for taskID, task in enumerate(self.distributed_preloaded_tasks[0])}
             with open(f"{self.output_dir}/task_length_{self.model_n}_{setting}_{self.workload}_{self.retraining_rate}.json", 'w') as f:
                 json.dump(length_dict, f, indent=4)
-        
-        # Stages, opimizer, and scheduler
+
+        # Stages
         self.distributed_stages = {
             nodeID: get_stages(
                 self.config,
@@ -359,22 +375,6 @@ class DistributedLLM:
                 num_training_steps=100,
             ) for nodeID in range(self.num_nodes)
         }
-        
-        
-    def _tokenize_and_align_labels(self, examples):
-        tokenized_inputs = self.tokenizer(
-            examples['query'], 
-            padding=False, 
-            truncation=True,
-        )
-        labels = self.tokenizer(
-            examples['reference'], 
-            padding=False, 
-            truncation=True,
-        )
-        tokenized_inputs['labels'] = labels['input_ids']
-        # tokenized_inputs['labels_attention_mask'] = labels['attention_mask']
-        return tokenized_inputs
     
     
     def _sample_subset_indices(self, input_lengths: List[int], K: int, mu: float, std: float) -> List[int]:
@@ -423,6 +423,9 @@ class DistributedLLM:
         selected_data = []
         for i, batch in enumerate(dataloader):
             seq_length = batch['input_ids'].shape[1]
+            # print(f"task {i}: {batch['input_ids'].shape} range ({batch['input_ids'].min()}, {batch['input_ids'].max()})")
+            if batch['input_ids'].max() >= self.tokenizer.vocab_size:
+                raise ValueError(f"Index error of token ID {batch['input_ids'].max()}")
             selected_data.append((seq_length, batch))
         inference_tasks = int(len(selected_data) * (1-retraining_rate))
         inference_ids = random.sample(range(len(selected_data)), k=inference_tasks)
@@ -860,12 +863,15 @@ class DistributedLLM:
         timing_info: Dict[str, List[float]],
     ) -> Tuple[torch.Tensor, ...]:
         
-        # if stageID == 0:
-        #     self.task_trace[nodeID].clear() # clear the current task trace
+        self._wait_for_device_availability(device, threshold=self.memory_threshold)
+        ################################ Print usage ############################
+        # for name, input in inputs.items():
+        #     if isinstance(input, torch.Tensor):
+        #         print(f'[stage {stageID}] {name}: {input.shape} - range ({input.min()}, {input.max()})')
+        #     else:
+        #         print(f'[stage {stageID}] {name}: {input}')
+        ##########################################################################
         try:
-            self._wait_for_device_availability(device, threshold=self.memory_threshold)
-            # if self.RECORD_MODE:
-            #     self.forward_start.record()
             if task.require_training: # this is a retraining task
                 fb = record_time(device, 'start', 'forward_grad', task.task_id, timing_info)
                 self.task_trace[nodeID][stageID]['fb'] = fb
@@ -892,7 +898,9 @@ class DistributedLLM:
                     self.user_task_record[task.task_id]['start'] = fb
                     
                 with torch.no_grad():
+                    # print(f'current stage {stageID}: {self.distributed_stages[nodeID][stageID]}')
                     tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
+                    # print(f'outputs: {tuple_outputs}')
                 # torch.cuda.synchronize() # synchronize the device
                 fe = record_time(device, 'end', 'forward', task.task_id, timing_info)
                 
@@ -902,6 +910,7 @@ class DistributedLLM:
                 
                 if stageID == self.num_gpus_per_node - 1: # last stage
                     self.user_task_record[task.task_id]['end'] = fe
+                    logging.info(f"[Node {nodeID}] Task {task.task_id} finished forward pass!")
                     
             if self.eta is None:
                 self.eta = (fe - fb) / (task.query['input_ids'].shape[1] ** 2)
@@ -1072,8 +1081,8 @@ class DistributedLLM:
         metrics['node_timelines'] = node_timelines
         metrics['idles_sum'] = sum(total_idles)
         metrics['idles_sum (node)'] = {nodeID: sum(idles) for nodeID, idles in node_idles.items()}
-        metrics['idles_avg'] = sum(total_idles) / len(total_idles)
-        metrics['idles_avg (node)'] = {nodeID: sum(idles) / len(idles) if len(idles) > 0 else 0 for nodeID, idles in node_idles.items()}
+        metrics['idles_avg'] = sum(total_idles) / len(total_idles) if total_idles else 0
+        metrics['idles_avg (node)'] = {nodeID: sum(idles) / len(idles) if idles else 0 for nodeID, idles in node_idles.items()}
         metrics['length_statistics'] = {
             'mean': self.mean_length,
             'std': self.std_length,

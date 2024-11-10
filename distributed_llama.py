@@ -190,8 +190,8 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_name_or_path', type=str, default='data/Anthropic', help='dataset name')
-    parser.add_argument('--model_name_or_path', type=str, default='microsoft/DialoGPT-small', help='model name or path')
-    parser.add_argument('--model_name', type=str, default='dialogpt', help='model name')
+    parser.add_argument('--model_name_or_path', type=str, default='meta-llama//Llama-2-7b-chat-hf', help='model name or path')
+    parser.add_argument('--model_name', type=str, default='Llama-2-7b-chat-hf', help='model name')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--memory_threshold', type=float, default=0.8, help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--num_nodes', type=int, default=2)

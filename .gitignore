@@ -6,4 +6,5 @@ results
 wandb
 # data
 notebooks
+anthropic
 *.csv
