@@ -1,7 +1,6 @@
 import os
 import sys
 sys.dont_write_bytecode = True
-import pdb
 import time
 import json
 import queue
@@ -10,7 +9,6 @@ import argparse
 import logging
 import numpy as np
 import gc
-from tqdm import tqdm
 import GPUtil
 from GPUtil import GPU
 from typing import List, Dict, Optional, Any, Union, Tuple
@@ -28,7 +26,7 @@ from transformers import (
     set_seed,
     get_scheduler,
 )
-from utils import Node, Task, record_time
+from utils import Node, Task, record_time, log_queue_contents
 from models import (
     get_stages, 
     _prepare_inputs,
@@ -214,7 +212,6 @@ class DistributedLLM:
             token=self.access_token,
         )
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        # print(f"Tokenizer: {self.tokenizer}, pad token id: {self.tokenizer.pad_token_id}, eos token id: {self.tokenizer.eos_token_id}, unk token id: {self.tokenizer.unk_token_id}")
         
         # Load datasets and dataloaders
         datasets = load_dataset(self.dataset_name_or_path)
@@ -244,8 +241,6 @@ class DistributedLLM:
             batched=True,
             load_from_cache_file=False,
         ).remove_columns(dataset.column_names)
-        # print("Dataset tokenized example (first 2 examples):", dataset[:2])
-        # print(f" ** pretrain name {self.model_name_or_path}, tokenized IDs range: ({min(min(dataset['input_ids']))}, {max(max(dataset['input_ids']))}) ** ")
         
         # Do sampling according to the length distribution
         input_lengths = [len(x) for x in dataset['input_ids']]
@@ -309,37 +304,6 @@ class DistributedLLM:
                     self.backward_taskIDs = set(self.training_taskIDs[-actual_trained_tasks:])
             else:
                 self.backward_taskIDs = set(self.training_taskIDs)
-        elif '-' in self.active_selection: 
-            # check if the string is a float number
-            policy, ratio = self.active_selection.split('-')
-            k = int(self.retraining_tasks * float(ratio))
-            print("\n ** Selective training policy: {} | Ratio: {} | Number of tasks to be trained: {} **\n".format(policy, ratio, k))
-            if policy == 'random':
-                self.backward_taskIDs = set(random.sample(self.training_taskIDs, k=k))
-            elif policy == 'length':
-                # LCs = {taskID: self._compute_LC(self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]) for taskID in training_taskIDs}
-                # self.backward_taskIDs = set(sorted(LCs, key=lambda x: LCs[x], reverse=True)[:k]) # select the top-k tasks with the highest LC
-                self.backward_taskIDs = set(sorted(self.training_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
-            elif policy == 'loss':
-                # We need to do backward for the top-k tasks with the highest losses
-                if self.no_prior_profile:
-                    self.backward_taskIDs = set(random.sample(self.training_taskIDs, k=k))
-                else:
-                    self.backward_taskIDs = set(sorted(self.training_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
-            elif policy == 'first':
-                self.backward_taskIDs = set(self.training_taskIDs[:k])
-            elif policy == 'last':
-                self.backward_taskIDs = set(self.training_taskIDs[-k:])
-            elif policy == 'adaptive':
-                # We either select the top-k tasks with the highest losses or the top-k tasks with the smallest lengths
-                if self.no_prior_profile:
-                    self.loss_taskIDs = set(random.sample(self.training_taskIDs, k=k))
-                    self.length_taskIDs = set(random.sample(self.training_taskIDs, k=k))
-                else:
-                    self.loss_taskIDs = set(sorted(self.training_taskIDs, key=lambda x: self.profiled_loss_dict[x], reverse=True)[:k])
-                    self.length_taskIDs = set(sorted(self.training_taskIDs, key=lambda x: self.distributed_preloaded_tasks[0][x].query['input_ids'].shape[1])[:k])
-            else:
-                raise ValueError(f"Invalid active selection: {self.active_selection}")
             
         # Save task length distribution for further analysis
         if self.save_length:
@@ -590,7 +554,7 @@ class DistributedLLM:
         std_length = self.std_length if std_length is None else std_length
         return (1 / (std_length * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - mean_length) / std_length) ** 2)
         
-    # @profile
+    
     def _check_do_backward(
         self, 
         taskID: int,
@@ -739,9 +703,10 @@ class DistributedLLM:
             taskID: int = taskQueue.get() # ID
             if taskID is None:
                 print("Global scheduler finished scheduling tasks")
-                for node in self.distributed_nodes.values():
-                    # node.device_queues[0].put(None)
+                for nodeID, node in self.distributed_nodes.items():
                     node.device_queues[0].put((float('inf'), float('inf'))) # for priority_queue, use a large number to signal the end
+                    # Log queue contents after sending termination signal
+                    log_queue_contents(node.device_queues[0], nodeID, stageID=0)
                 break
             
             # Active selection
@@ -766,14 +731,6 @@ class DistributedLLM:
                 test_nodes = self._test_nodes
                 train_nodes = self._train_nodes
                 if self.rate_lambda == -1 and self.isolated_split == 100:  # dynamic
-                    # if self.num_gpus != 8:
-                    #     raise ValueError(f'Dynamic separate only support 8 GPUs! Currently have {self.num_gpus} GPUs!')
-                    # if taskID <= self.ID_thresholds[0]:
-                    #     num_test_nodes = self.used_nodes // 4
-                    # elif self.ID_thresholds[0] < taskID <= self.ID_thresholds[1]:
-                    #     num_test_nodes = self.used_nodes // 2
-                    # else:
-                    #     num_test_nodes = self.used_nodes * 3 // 4
                     num_test_nodes = self.ID2test[taskID]
                     test_nodes = list(range(num_test_nodes))
                     train_nodes = list(range(num_test_nodes, self.used_nodes))
@@ -832,24 +789,29 @@ class DistributedLLM:
         available_ratio = available_memory / self.device_total_memory
         # Check if the available memory ratio is above the threshold
         return available_ratio > (1 - threshold)
-
     
     
-    def _wait_for_device_availability(self, device: int, check_interval: float = 0.1, threshold: float = 0.8):
+    def _wait_for_device_availability(
+        self, 
+        device: int, 
+        check_interval: float = 0.1, 
+        threshold: float = 0.8,
+        max_wait: float = 10.0,
+    ):
         """
         Wait until the device is available based on memory usage.
         Args:
         - device: The device to wait for.
         - check_interval: How often to check the device status (in seconds).
         - threshold: The maximum allowed memory utilization ratio.
+        - max_wait: Maximum wait time before exiting the wait state.
         """
-        wait_count = 0
+        start_time = time.time()
         while not self._check_device_availability(device, threshold):
             # print(f"Waiting for device {device} to become available...")
             time.sleep(check_interval)
-            wait_count += 1
-            if wait_count > 100:
-                print(f"Device {device} is not available after waiting for {wait_count * check_interval} seconds")
+            if time.time() - start_time > max_wait:
+                print(f"Exceeded max wait time for device {device}. Exiting wait loop.")
                 break
 
             
@@ -862,15 +824,9 @@ class DistributedLLM:
         device: int, 
         timing_info: Dict[str, List[float]],
     ) -> Tuple[torch.Tensor, ...]:
-        
+        # Memory check and scale down if necessary
         self._wait_for_device_availability(device, threshold=self.memory_threshold)
-        ################################ Print usage ############################
-        # for name, input in inputs.items():
-        #     if isinstance(input, torch.Tensor):
-        #         print(f'[stage {stageID}] {name}: {input.shape} - range ({input.min()}, {input.max()})')
-        #     else:
-        #         print(f'[stage {stageID}] {name}: {input}')
-        ##########################################################################
+        
         try:
             if task.require_training: # this is a retraining task
                 fb = record_time(device, 'start', 'forward_grad', task.task_id, timing_info)
@@ -950,7 +906,7 @@ class DistributedLLM:
     ):
         # We use num_gpus_per_node workers to simulateously get task from the queue and inference
         with ThreadPoolExecutor(max_workers=self.num_gpus_per_node) as executor:
-            # futures = []
+            futures = []
             for stageID in range(self.num_gpus_per_node):
                 future = executor.submit(
                     self.device_inference, 
@@ -962,22 +918,31 @@ class DistributedLLM:
                     nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(self.distributed_stages[nodeID]) - 1 else None,
                     init_device=node.init_device,
                 )
-            #     futures.append(future)
-            # for future in futures:
-            #     try:
-            #         # Set a timeout for each task. Adjust the timeout value as needed.
-            #         future.result(timeout=60)  # Timeout set to 60 seconds
-            #     except TimeoutError:
-            #         # Handle the timeout, for example, by logging an error, retrying the task, or skipping it.
-            #         print(f"Task execution exceeded the timeout limit and was aborted. Node ID: {nodeID}")
+                futures.append(future)
+            for future in futures:
+                try:
+                    # Set a timeout for each task. Adjust the timeout value as needed.
+                    future.result(timeout=60)  # Timeout set to 60 seconds
+                except TimeoutError:
+                    # Handle the timeout, for example, by logging an error, retrying the task, or skipping it.
+                    print(f"Task execution exceeded the timeout limit and was aborted for Node {nodeID}")
+                except Exception as e:
+                    print(f"Exception occurred in Node {nodeID}, Stage {stageID}: {e}")
                 
         print("Node {} finished inference".format(node.node_id))
 
 
     def run_stages_concurrently(self):
         with ThreadPoolExecutor(max_workers=len(self.distributed_nodes)) as executor:
+            futures = []
             for nodeID, node in self.distributed_nodes.items():
                 future = executor.submit(self.node_inference, nodeID, node)
+                futures.append(future)
+            for future in futures:
+                try:
+                    future.result(timeout=60)  # Set timeout to avoid indefinite waits
+                except TimeoutError:
+                    print(f"Task execution exceeded the timeout limit for Node {nodeID}.")
         
         
     def save_timing_info(self):

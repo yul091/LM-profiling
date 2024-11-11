@@ -8,3 +8,4 @@ wandb
 notebooks
 anthropic
 *.csv
+nvidia-profiling

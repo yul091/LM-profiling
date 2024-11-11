@@ -97,7 +97,7 @@ class DistributedDialoGPT(DistributedLLM):
                 # Need to send the output to the next stage, except for the last stage
                 task.hiddens[stageID+1] = CustomizedGPT2Out(
                     hidden_states=tuple_outputs[0].to(device+1),
-                    attention_mask=tuple_outputs[1].to(device+1),
+                    attention_mask=tuple_outputs[1].to(device+1) if tuple_outputs[1] is not None else None,
                     head_mask=tuple_outputs[2],
                     encoder_hidden_states=tuple_outputs[3],
                     encoder_attention_mask=tuple_outputs[4],
@@ -109,15 +109,6 @@ class DistributedDialoGPT(DistributedLLM):
                 nextdeviceQueue.put((priority, taskID))
                 
             else: # last stage
-                # outputs = CausalLMOutputWithCrossAttentions(
-                #     loss=tuple_outputs[0],
-                #     logits=tuple_outputs[1],
-                #     past_key_values=tuple_outputs[2],
-                #     hidden_states=tuple_outputs[3],
-                #     attentions=tuple_outputs[4],
-                #     cross_attentions=tuple_outputs[5],
-                # )
-                # loss = outputs.loss
                 loss = tuple_outputs[0]
                 # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())

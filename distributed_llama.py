@@ -7,7 +7,7 @@ import time
 from typing import List, Dict, Optional, Any, Union
 import torch
 import logging
-from utils import record_time, Task
+from utils import record_time, Task, log_queue_contents
 from distributed_llm import DistributedLLM, set_seed, gc
 from models import (
     CustomizedLlamaOut,
@@ -65,13 +65,14 @@ class DistributedLlama(DistributedLLM):
         init_device = init_device if init_device is not None else self.distributed_nodes[nodeID].init_device
         
         while True:
+            # log_queue_contents(deviceQueue, nodeID, stageID)
             priority, taskID = deviceQueue.get()
-            # if taskID is None:
+            # print(f"[Node {nodeID} | Stage {stageID}] Retrieved task {taskID} from deviceQueue")
+
             if taskID == float('inf'):
                 # Signal that this thread is done
-                print("Stage {} finished inference".format(device))
-                if nextdeviceQueue is not None: # intermediate stage
-                    # nextdeviceQueue.put(None)
+                # print(f"[Node {nodeID} | Stage {stageID}] Received termination signal, ending inference.")
+                if nextdeviceQueue is not None:  # Propagate termination signal to the next stage
                     nextdeviceQueue.put((float('inf'), float('inf')))
                 break
             
@@ -81,7 +82,7 @@ class DistributedLlama(DistributedLLM):
             inputs = task.hiddens[stageID]
             
             if inputs is None:
-                print("Stage {} waiting for task {}".format(device, taskID))
+                print(f"[Node {nodeID} | Stage {stageID}] Waiting for inputs for task {taskID}")
                 continue    
                 
             if stageID == 0: # prepare inputs
@@ -91,30 +92,32 @@ class DistributedLlama(DistributedLLM):
             tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
             task.hiddens[stageID] = None # clear the input that is no longer needed
                 
-            if nextdeviceQueue is not None: # intermediate stage
+            if nextdeviceQueue is not None:  # Intermediate stage
+                # ############################# DEBUG ###########################
+                # for out_name, out in [
+                #     ('hidden_states', tuple_outputs[0]), 
+                #     ('position_ids', tuple_outputs[4]), 
+                #     ('attention_mask', tuple_outputs[5]),
+                # ]:
+                #     if out is None:
+                #         print(f"Error in Node {nodeID}, Stage {stageID}, Task {taskID}: Received None in tuple_outputs' {out_name}")
+                ############################# DEBUG ###########################
                 # Need to send the output to the next stage, except for the last stage
                 task.hiddens[stageID+1] = CustomizedLlamaOut(
                     hidden_states=tuple_outputs[0].to(device+1),
                     past_key_values=_prepare_inputs(tuple_outputs[1], device+1),
                     all_hidden_states=tuple_outputs[2],
                     all_self_attns=tuple_outputs[3],
-                    position_ids=tuple_outputs[4].to(device+1),
-                    attention_mask=tuple_outputs[5].to(device+1),
+                    position_ids=tuple_outputs[4].to(device+1) if tuple_outputs[4] is not None else None,
+                    attention_mask=tuple_outputs[5].to(device+1) if tuple_outputs[5] is not None else None,
                 )
                 nextdeviceQueue.put((priority, taskID))
+                # print(f"[Node {nodeID} | Stage {stageID}] Passed task {taskID} to next stage")
                 
             else: # last stage
-                # outputs = CausalLMOutputWithPast(
-                #     loss=tuple_outputs[0],
-                #     logits=tuple_outputs[1],
-                #     past_key_values=tuple_outputs[2],
-                #     hidden_states=tuple_outputs[3],
-                #     attentions=tuple_outputs[4],
-                # )
-                # loss = outputs.loss
                 loss = tuple_outputs[0]
-                # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
                 self.metrics["loss"].append(loss.item())
+                # print(f"[Node {nodeID} | Stage {stageID}] Finished task {taskID} with loss {loss.item()}")
 
                 if self.RECORD_MODE:
                     self.record_dict['loss'].append((loss.item(), taskID))
@@ -157,7 +160,6 @@ class DistributedLlama(DistributedLLM):
                             self.distributed_schedulers[nodeID].step()
                         except Exception as e:
                             logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
-                            # pass
                     
                     self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     
@@ -167,7 +169,6 @@ class DistributedLlama(DistributedLLM):
                         for j in range(self.num_gpus_per_node):
                             torch.save(self.distributed_stages[nodeID][j].state_dict(), f"{self.ckpt_path}_stage{j}.pt")
                         # For other nodes, load the parameters from the last node
-                        # for i in range(self.num_nodes - 1):
                         for i in self._test_nodes:
                             print(f" *** Load checkpoint for Node {i} *** ")
                             for j in range(self.num_gpus_per_node):
@@ -231,17 +232,5 @@ if __name__ == '__main__':
     
     for i in range(args.experiments):
         run_experiment(args, i)
-    
-    # for i in range(args.experiments):
-    #     print(f"\n ** Experiment {i+1} **\n")
-    #     distributed_llm = DistributedLlama(args, experimentID=i)
-    #     distributed_llm.run()
-        
-    #     # If run_mode is online and RECORD_MODE is activated, we need to re-run the experiment
-    #     if distributed_llm.RECORD_MODE and args.run_mode == 'online':
-    #         del distributed_llm
-    #         torch.cuda.empty_cache()
-    #         new_run =  DistributedLlama(args, experimentID=i)
-    #         new_run.run()
 
     

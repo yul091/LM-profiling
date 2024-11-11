@@ -130,6 +130,10 @@ def record_time(
     if verbose:
         print(f"\t[CUDA {device}] Task {event_type} at time {timestamp}")
     return timestamp
+
+def log_queue_contents(queue: Union[queue.Queue, queue.PriorityQueue], nodeID: int, stageID: int):
+    queue_contents = list(queue.queue)  # Use .queue to access the contents of a Queue without dequeuing
+    print(f"[Node {nodeID} | Stage {stageID}] Current queue contents: {queue_contents}")
     
 
 def get_total_params(module: torch.nn.Module):

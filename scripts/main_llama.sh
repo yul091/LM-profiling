@@ -1,4 +1,4 @@
-NUM_SAMPLES=50
+NUM_SAMPLES=200
 BATCH_SIZE=1
 MEMORY_THRESHOLD=0.5
 SETTING=isolated  # "active" "isolated"
@@ -18,9 +18,9 @@ TOKEN="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"
 export CUDA_LAUNCH_BLOCKING=1
 
 for MODEL_NAME in "Llama-2-7b-chat-hf"; do
-    for RATE_LAMBDA in 1; do
+    for RATE_LAMBDA in 5; do
         OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}
-        for RETRAIN_RATE in 0.25; do
+        for RETRAIN_RATE in 0.5; do
             for TASK_ASSIGNMENT in "rr"; do
                 python distributed_llama.py \
                     --model_name_or_path "meta-llama/${MODEL_NAME}" \
