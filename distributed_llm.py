@@ -17,6 +17,7 @@ from memory_profiler import profile
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast
 from concurrent.futures import ThreadPoolExecutor
 from datasets import load_dataset
 from transformers import (
@@ -75,7 +76,7 @@ class DistributedLLM:
         self.num_gpus = args.num_gpus
         self.batch_size = args.batch_size
         self.rate_lambda = args.rate_lambda
-        self.training_lambda = args.training_lambda
+        self.training_lambda = args.training_lambda if args.training_lambda is not None else self.rate_lambda
         self.output_dir = args.output_dir
         self.task_assignment = args.task_assignment
         self.dataset_name_or_path = args.dataset_name_or_path
@@ -179,7 +180,7 @@ class DistributedLLM:
         
         # Count number GPUs per node
         if self.num_gpus is None:
-            self.num_gpus_per_node = torch.cuda.device_count() // self.num_nodes
+            self.num_gpus = torch.cuda.device_count()
         else:
             # Ensure the user-specified number of GPUs does not exceed the available GPUs
             available_gpus = torch.cuda.device_count()
@@ -489,7 +490,7 @@ class DistributedLLM:
             require_training = i not in set(inference_ids)
             if require_training: 
                 training_taskIDs.append(i)
-                lamda = self.training_lambda
+                lamda = self.training_lambda if self.training_lambda != -1 else 5
             else:
                 inference_taskIDs.append(i)
                 lamda = self.rate_lambda if self.rate_lambda != -1 else inference_lambdas[j]
@@ -752,7 +753,11 @@ class DistributedLLM:
                         
             self.metrics['node_assignment'].append(time.time() - assign_start)
 
-            # Each node queue store task IDs
+            # # Each node queue store task IDs
+            # while self.distributed_nodes[nodeID].device_queues[0].qsize() > 2:
+            #     # print(f"Task {taskID} waiting due to queue limit on Node {nodeID}")
+            #     time.sleep(0.01)  # Brief wait to avoid busy-waiting
+
             if self.setting == 'interval':
                 seq_length = self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]
                 if self.priority is None or self.priority == 'LLF':
@@ -811,7 +816,7 @@ class DistributedLLM:
             # print(f"Waiting for device {device} to become available...")
             time.sleep(check_interval)
             if time.time() - start_time > max_wait:
-                print(f"Exceeded max wait time for device {device}. Exiting wait loop.")
+                print(f"Exceeded max wait time for device {device}. Exit forward waiting loop.")
                 break
 
             
@@ -828,14 +833,15 @@ class DistributedLLM:
         self._wait_for_device_availability(device, threshold=self.memory_threshold)
         
         try:
-            if task.require_training: # this is a retraining task
+            if task.require_training: # this is a training task
                 fb = record_time(device, 'start', 'forward_grad', task.task_id, timing_info)
                 self.task_trace[nodeID][stageID]['fb'] = fb
                 if task.task_id in self.train_trace[nodeID]: # this training task has been completely recorded
                     self.train_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
                     self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
 
-                tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
+                with autocast():
+                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 # torch.cuda.synchronize() # synchronize the device
                 fe = record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
                 
@@ -854,9 +860,8 @@ class DistributedLLM:
                     self.user_task_record[task.task_id]['start'] = fb
                     
                 with torch.no_grad():
-                    # print(f'current stage {stageID}: {self.distributed_stages[nodeID][stageID]}')
-                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
-                    # print(f'outputs: {tuple_outputs}')
+                    with autocast():
+                        tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 # torch.cuda.synchronize() # synchronize the device
                 fe = record_time(device, 'end', 'forward', task.task_id, timing_info)
                 
@@ -1123,30 +1128,31 @@ class DistributedLLM:
             print("\n ** Running in RECORD mode **\n")
         
         task_queue = queue.Queue()
-        num_workers = 2
-        if self.training_taskIDs:
-            num_workers += 1
-        if self.inference_taskIDs:
-            num_workers += 1
+        # num_workers = 2
+        # if self.training_taskIDs:
+        #     num_workers += 1
+        # if self.inference_taskIDs:
+        #     num_workers += 1
+        num_workers = 3
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            if self.inference_taskIDs:
-                executor.submit(
-                    self.producer,
-                    task_queue, 
-                    'serving',
-                )
-            if self.training_taskIDs:
-                executor.submit(
-                    self.producer,
-                    task_queue, 
-                    'training',
-                )
-            # future1 = executor.submit(
-            #     self.producer,
-            #     task_queue, 
-            #     'mixed',
-            # )
+            # if self.inference_taskIDs:
+            #     executor.submit(
+            #         self.producer,
+            #         task_queue, 
+            #         'serving',
+            #     )
+            # if self.training_taskIDs:
+            #     executor.submit(
+            #         self.producer,
+            #         task_queue, 
+            #         'training',
+            #     )
+            executor.submit(
+                self.producer,
+                task_queue, 
+                'mixed',
+            )
             executor.submit(
                 self.globalScheduler,
                 task_queue,

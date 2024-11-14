@@ -64,7 +64,6 @@ def _prepare_inputs(
 def get_stages(
     config: LlamaConfig,
     token: str,
-    # tokenizer: Union[LlamaTokenizer, GPT2Tokenizer],
     model_name_or_path: str,
     num_stages: int,
     hidden_layers_assignments: List[int] = None,
@@ -96,7 +95,8 @@ def get_stages(
         # low_cpu_mem_usage=True,
         token=token,
         config=config,
-        # torch_dtype="float32",
+        torch_dtype=torch.float16 if 'llama' in model_name_or_path.lower() else torch.float32,
+        # load_in_8bit=True,
     )
     # if 'llama' in model_name_or_path.lower():
     #     pretrained_model.resize_token_embeddings(len(tokenizer))

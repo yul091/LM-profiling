@@ -5,7 +5,6 @@ import queue
 import argparse
 import time
 from typing import List, Dict, Optional, Any, Union
-import torch
 import logging
 from utils import record_time, Task, log_queue_contents
 from distributed_llm import DistributedLLM, set_seed, gc
@@ -14,6 +13,10 @@ from models import (
     _prepare_inputs,
     _prepare_decoding_inputs,
 )
+import torch
+from torch.nn.utils import clip_grad_norm_
+from torch.cuda.amp import GradScaler
+scaler = GradScaler()
 
 # torch.autograd.set_detect_anomaly(True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -71,7 +74,7 @@ class DistributedLlama(DistributedLLM):
 
             if taskID == float('inf'):
                 # Signal that this thread is done
-                # print(f"[Node {nodeID} | Stage {stageID}] Received termination signal, ending inference.")
+                print(f"[Node {nodeID} | Stage {stageID}] Received termination signal, ending inference.")
                 if nextdeviceQueue is not None:  # Propagate termination signal to the next stage
                     nextdeviceQueue.put((float('inf'), float('inf')))
                 break
@@ -93,15 +96,6 @@ class DistributedLlama(DistributedLLM):
             task.hiddens[stageID] = None # clear the input that is no longer needed
                 
             if nextdeviceQueue is not None:  # Intermediate stage
-                # ############################# DEBUG ###########################
-                # for out_name, out in [
-                #     ('hidden_states', tuple_outputs[0]), 
-                #     ('position_ids', tuple_outputs[4]), 
-                #     ('attention_mask', tuple_outputs[5]),
-                # ]:
-                #     if out is None:
-                #         print(f"Error in Node {nodeID}, Stage {stageID}, Task {taskID}: Received None in tuple_outputs' {out_name}")
-                ############################# DEBUG ###########################
                 # Need to send the output to the next stage, except for the last stage
                 task.hiddens[stageID+1] = CustomizedLlamaOut(
                     hidden_states=tuple_outputs[0].to(device+1),
@@ -117,15 +111,13 @@ class DistributedLlama(DistributedLLM):
             else: # last stage
                 loss = tuple_outputs[0]
                 self.metrics["loss"].append(loss.item())
-                # print(f"[Node {nodeID} | Stage {stageID}] Finished task {taskID} with loss {loss.item()}")
+                # print(f"[Node {nodeID} | Stage {stageID}] Finished task {taskID} with loss {loss} (tuple outputs {tuple_outputs})")
 
                 if self.RECORD_MODE:
                     self.record_dict['loss'].append((loss.item(), taskID))
                     self.record_dict['length'].append((input_length, taskID))
                 
                 if task.do_backward:
-                    # # Synchronize to ensure all previous operations on the GPU are completed
-                    # torch.cuda.synchronize(device)
                     # Backprop on the last stage
                     bb = time.time()
                     self.task_trace[nodeID][self.num_gpus_per_node-1]['bb'] = bb
@@ -133,7 +125,9 @@ class DistributedLlama(DistributedLLM):
                         self.train_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
                         self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
                     try:
-                        loss.backward()
+                        # loss.backward()
+                        scaler.scale(loss).backward()
+
                         be = record_time(init_device, 'end', 'backward', taskID, timing_info)
                         self.task_trace[nodeID][0]['be'] = be
                         if taskID in self.train_trace[nodeID]:
@@ -145,7 +139,7 @@ class DistributedLlama(DistributedLLM):
                             
                         print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                     except Exception as e:
-                        # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
+                        # logging.error(f"[node {nodeID} | stage {stageID} | task {taskID}] Backward error occurred: {e}")
                         pass
 
                     if self.RECORD_MODE:
@@ -156,10 +150,13 @@ class DistributedLlama(DistributedLLM):
                     # Optimization
                     if not self.RECORD_MODE: # In RECORD_MODE, we do not update the model parameters
                         try:
-                            self.distributed_optimizers[nodeID].step()
+                            # self.distributed_optimizers[nodeID].step()
+                            scaler.step(self.distributed_optimizers[nodeID])
                             self.distributed_schedulers[nodeID].step()
+                            scaler.update()
                         except Exception as e:
-                            logging.error(f"[node {nodeID} | stage {stageID}] Optimization error occurred: {e}")
+                            # logging.error(f"[node {nodeID} | stage {stageID} | task {taskID}] Optimization error occurred: {e}")  
+                            pass     
                     
                     self.distributed_optimizers[nodeID].zero_grad() # clear gradients
                     
@@ -214,7 +211,7 @@ if __name__ == '__main__':
     parser.add_argument('--epsilon', type=float, default=1e-6, help='small value to avoid division by zero')
     parser.add_argument('--lr', type=float, default=5e-5, help='learning rate')
     parser.add_argument('--rate_lambda', type=int, default=10, help='Average number of tasks produced per second')
-    parser.add_argument('--training_lambda', type=int, default=30, help='Average number of training requests per second')
+    parser.add_argument('--training_lambda', type=int, default=None, help='Average number of training requests per second')
     parser.add_argument('--workload', type=str, default='poisson', choices=['poisson', 'all'], help='workload arrival pattern')
     parser.add_argument('--length_distribution', type=str, default='random', choices=['random', 'ascending', 'descending', 'bursty'], 
                         help='distribution of input sequence length')
