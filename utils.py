@@ -8,19 +8,19 @@ import numpy as np
 import pandas as pd
 # from collections import defaultdict
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import seaborn as sns
-import torch
-from transformers import (
-    BertModel,
-    BertForSequenceClassification,
-    GPT2Model,
-    GPT2ForSequenceClassification,
-    XLNetModel,
-    XLNetForSequenceClassification,
-    BartModel,
-    BartForSequenceClassification,
-)
-from transformers.models.bert.modeling_bert import BertModel
+# from transformers import (
+#     BertModel,
+#     BertForSequenceClassification,
+#     GPT2Model,
+#     GPT2ForSequenceClassification,
+#     XLNetModel,
+#     XLNetForSequenceClassification,
+#     BartModel,
+#     BartForSequenceClassification,
+# )
+# from transformers.models.bert.modeling_bert import BertModel
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,172 @@ OPTIMIZER_NAME = "optimizer.pt"
 OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
+
+
+def avg_util_overtime(data: pd.DataFrame, num_nodes: int, active_node_list: List[int] = None, active_memory_threshold: int = 0):
+    node_utils = [0] * num_nodes
+    # active_count, total_count = 0, 0
+    results = []
+    for node in data['node'].unique():
+        if active_node_list and int(node) not in active_node_list:
+            continue
+        node_data = data[data['node'] == node].copy()
+        # Filter data based on non-zero memory usage
+        non_zero_memory = node_data[node_data['utilization.gpu [%]'] > active_memory_threshold]
+        if not non_zero_memory.empty:
+            start_time = non_zero_memory['timestamp'].min()
+            end_time = non_zero_memory['timestamp'].max()
+            filtered_data = node_data[(node_data['timestamp'] >= start_time) & (node_data['timestamp'] <= end_time)]
+            # Calculate average memory utilization
+            node_util = filtered_data['utilization.gpu [%]'].mean()
+            node_utils[int(node)] = round(node_util, 4)
+            results.append(filtered_data)
+    
+    processed_data = pd.concat(results, ignore_index=True)
+    avg_util = processed_data['utilization.gpu [%]'].mean()
+    return node_utils, avg_util
+
+
+def util_percent(data: pd.DataFrame, num_nodes: int, active_node_list: List[int], active_memory_threshold: int = 0):
+    node_utils = [0] * num_nodes
+    active_count, total_count = 0, 0
+    for node in data['node'].unique():
+        if active_node_list and int(node) not in active_node_list:
+            continue
+        node_data = data[data['node'] == node].copy()
+        # Filter data based on non-zero memory usage
+        non_zero_memory = node_data[node_data['utilization.gpu [%]'] > active_memory_threshold]
+        if not non_zero_memory.empty:
+            filtered_data = node_data[(node_data['timestamp'] >= non_zero_memory['timestamp'].min()) & (node_data['timestamp'] <= non_zero_memory['timestamp'].max())]
+            # Calculate average memory utilization
+            node_active_count = len(filtered_data[filtered_data['utilization.gpu [%]'] > active_memory_threshold])
+            node_total_count = len(filtered_data)
+            node_util = node_active_count / node_total_count if node_total_count else 0
+            active_count += node_active_count
+            total_count += node_total_count
+            node_utils[int(node)] = round(node_util, 4) * 100
+    
+    avg_util = active_count / total_count * 100 if total_count else 0
+    return node_utils, avg_util
+
+
+
+def hex_to_rgb(hex_color):
+    """ Convert hex color to RGB tuple. """
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def rgb_to_hex(rgb_color):
+    """ Convert RGB tuple back to hex. """
+    return '#' + ''.join(f'{int(c):02x}' for c in rgb_color)
+
+def get_lighter_colors_manual(hex_color, number_of_shades=5, blend_ratio=0.2):
+    """
+    Manually blend the color with white to create lighter shades.
+    
+    :param hex_color: str, Hex code of the original color
+    :param number_of_shades: int, Number of lighter shades to generate
+    :param blend_ratio: float, Ratio to blend with white
+    :return: list of str, Hex codes of lighter shades
+    """
+    original_rgb = hex_to_rgb(hex_color)
+    white_rgb = (255, 255, 255)
+    lighter_colors = [hex_color]
+    
+    for i in range(1, number_of_shades):
+        blended_rgb = [(1 - blend_ratio * i) * orig + (blend_ratio * i) * white for orig, white in zip(original_rgb, white_rgb)]
+        lighter_colors.append(rgb_to_hex(blended_rgb))
+    
+    return lighter_colors
+
+lighter_blue_manual = get_lighter_colors_manual('#1f77b4', number_of_shades=4, blend_ratio=0.25)
+lighter_orange_manual = get_lighter_colors_manual('#ff7f0e', number_of_shades=4, blend_ratio=0.25)
+lighter_purple_manual = get_lighter_colors_manual('#9467bd', number_of_shades=4, blend_ratio=0.25)
+lighter_green_manual = get_lighter_colors_manual('#2ca02c', number_of_shades=4, blend_ratio=0.25)
+lighter_red_manual = get_lighter_colors_manual('#d62728', number_of_shades=4, blend_ratio=0.25)
+lighter_brown_manual = get_lighter_colors_manual('#e377c2', number_of_shades=4, blend_ratio=0.25)
+
+
+# Define the custom mean function for lists
+def agg_list(data, policy='mean'):
+    # Transpose to make each column a list from different rows and compute mean
+    if policy == 'mean':
+        return [sum(x) / len(x) for x in zip(*data)]
+    elif policy == 'min':
+        return [min(x) for x in zip(*data)]
+    elif policy == 'max':
+        return [max(x) for x in zip(*data)]
+    else:
+        raise ValueError(f'Unsupported policy {policy}!')
+    
+
+def smooth_series(series: pd.Series, window_size: int = 10):
+    return series.rolling(window=window_size, min_periods=1, center=True).mean()
+
+
+LABEL2METHOD = {
+    "NaiveMix": "active",
+    "Separate": "isolated",
+    "LaMix-LLF": "interval",
+    "LaMix-MLF": "interval-MLF",
+}
+LABEL2LINESTYLE = {
+    "NaiveMix": "-",
+    "Separate": "dotted",
+    "LaMix-LLF": (0, (1, 10)),
+    "LaMix-MLF": '-',
+}
+METRIC2NAME = {
+    'losses': 'Eval loss',
+    'idles_sum': 'Idle time (s)',
+    'node_runtimes': 'Latency breakdown (s)',
+    'total_runtime': 'Latency (s)',
+    'bubble_rate': 'Idle rate (%)',
+    'bubble_rate (node)': 'Idle rate (%)',
+    'user_responses': 'Response time (s)',
+    'user_response_avg': 'Response time (s)',
+    'loss': 'Eval loss',
+    'num_nodes': '# Nodes',
+    'throughput': 'Throughput (/s)',
+}
+LEGENDS2NAME = {
+    'random': 'Random',
+    'random+': 'Random+',
+    'rr': 'RR',
+    'rr+': 'RR+',
+    'util': 'LUF',
+    'util+': 'LUF+',
+    'workload': 'LeMix',
+}
+COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'] # plt v2.0 colors
+LEGENDS2UTIL = {
+    'separate': {'name': 'Separate', 'color': '#1f77b4', 'boxcolor': lighter_blue_manual[1], 'linestyle': '-.', 'marker': '^', 'TAname': 'RR'},
+    'random': {'name': 'Mix-Random', 'color': '#d62728', 'boxcolor': lighter_red_manual[1], 'linestyle': 'dashed', 'marker': 'v', 'TAname': 'Random'},
+    'random+': {'name': 'Mix-Random+', 'color': '#d62728', 'boxcolor': lighter_red_manual[1], 'linestyle': 'dashed', 'marker': 'v', 'TAname': 'Random'},
+    'rr': {'name': 'Mix-RR', 'color': '#2ca02c', 'boxcolor': lighter_green_manual[1], 'linestyle': 'dotted', 'marker': 'D', 'TAname': 'RR'},
+    'rr+': {'name': 'Mix-RR+', 'color': '#2ca02c', 'boxcolor': lighter_green_manual[1], 'linestyle': 'dashed', 'marker': 'D', 'TAname': 'RR'},
+    'util': {'name': 'Mix-LUF', 'color': '#ff7f0e', 'boxcolor': lighter_orange_manual[1], 'linestyle': 'dashed', 'marker': 's', 'TAname': 'LUF'},
+    'util+': {'name': 'Mix-LUF+', 'color': '#ff7f0e', 'boxcolor': lighter_orange_manual[1], 'linestyle': '-.', 'marker': 's', 'TAname': 'LUF'},
+    'workload': {'name': 'LeMix', 'color': '#9467bd', 'boxcolor': lighter_purple_manual[1], 'linestyle': '-', 'marker': 'o', 'TAname': 'BeTA'},
+    'workload(no-prior-profile)': {'name': 'LeMix (w/o offline)', 'color': '#8c564b', 'boxcolor': lighter_purple_manual[1], 'linestyle': '-.', 'marker': 'p', 'TAname': 'LeMix (w/o offline)'},
+    'workload(no-memory-check)': {'name': 'LeMix (w/o memory)', 'color': '#e377c2', 'boxcolor': lighter_brown_manual[1], 'linestyle': 'dashed', 'marker': 'x', 'TAname': 'LeMix (w/o memory)'},
+    'lemix': {'name': 'LeMix', 'color': '#9467bd', 'boxcolor': lighter_purple_manual[1], 'linestyle': '-', 'marker': 'o', 'TAname': 'LeMix'},
+}
+MODEL2UTIL = {
+    'DialoGPT-small': {'name': 'GPT-400M', 'color': '#1f77b4', 'marker': 'o', 'linestyle': '--', 'linecolor': '#1f77b4'}, 
+    'DialoGPT-medium': {'name': 'GPT-1.4B', 'color': '#ff7f0e', 'marker': 's', 'linestyle': 'dotted', 'linecolor': '#ff7f0e'},
+    'DialoGPT-large': {'name': 'GPT-2.5B', 'color': '#2ca02c', 'marker': 'v', 'linestyle': '-.', 'linecolor': '#2ca02c'},
+    'Llama-2-7b-chat-hf': {'name': 'Llama2-7B', 'color': '#d62728', 'marker': 'x', 'linestyle': 'dashed', 'linecolor': '#d62728'},
+    'Llama-2-13b-chat-hf': {'name': 'Llama2-13B', 'color': '#9467bd', 'marker': '^', 'linestyle': '--', 'linecolor': '#9467bd'},
+    'Llama-2-70b-chat-hf': {'name': 'Llama2-70B', 'color': '#8c564b', 'marker': '+', 'linestyle': '--', 'linecolor': '#8c564b'},
+}
+PARAM2NAME = {
+    'alpha': r'$\lambda_1$',
+    'beta': r'$\lambda_2$',
+    'epsilon': r'$\tau$',
+}
+
+
 
 
 class Node:
@@ -97,9 +263,9 @@ class Task:
     def __init__(
         self, 
         task_id: int, 
-        query: Union[torch.Tensor, Dict[str, Any]], 
+        query: Dict[str, Any], 
         rate_lambda: float,
-        feedback: Optional[torch.Tensor] = None, 
+        feedback: Optional[Any] = None, 
         node_id: Optional[int] = None, 
         num_gpus_per_node: Optional[int] = None,
         require_training: Optional[bool] = None,
@@ -136,34 +302,34 @@ def log_queue_contents(queue: Union[queue.Queue, queue.PriorityQueue], nodeID: i
     print(f"[Node {nodeID} | Stage {stageID}] Current queue contents: {queue_contents}")
     
 
-def get_total_params(module: torch.nn.Module):
+def get_total_params(module):
     total_params = 0
     for param in module.parameters():
         total_params += param.numel()
     return total_params
 
 
-def get_transformer_layers(
-    model: Union[
-        BertForSequenceClassification, 
-        GPT2ForSequenceClassification, 
-        XLNetForSequenceClassification, 
-        BartForSequenceClassification,
-    ]
-) -> List[Union[BertModel, GPT2Model, XLNetModel, BartModel]]:
-    model_name = model.__class__.__name__.lower()
-    layers = []
-    if "bert" in model_name:
-        layers = model.bert.encoder.layer
-    elif "gpt2" in model_name:
-        layers = model.transformer.h
-    elif "xlnet" in model_name:
-        layers = model.transformer.layer
-    elif "bart" in model_name:
-        encoder_layers = model.model.encoder.layers
-        decoder_layers = model.model.decoder.layers
-        layers = encoder_layers + decoder_layers
-    return layers
+# def get_transformer_layers(
+#     model: Union[
+#         BertForSequenceClassification, 
+#         GPT2ForSequenceClassification, 
+#         XLNetForSequenceClassification, 
+#         BartForSequenceClassification,
+#     ]
+# ) -> List[Union[BertModel, GPT2Model, XLNetModel, BartModel]]:
+#     model_name = model.__class__.__name__.lower()
+#     layers = []
+#     if "bert" in model_name:
+#         layers = model.bert.encoder.layer
+#     elif "gpt2" in model_name:
+#         layers = model.transformer.h
+#     elif "xlnet" in model_name:
+#         layers = model.transformer.layer
+#     elif "bart" in model_name:
+#         encoder_layers = model.model.encoder.layers
+#         decoder_layers = model.model.decoder.layers
+#         layers = encoder_layers + decoder_layers
+#     return layers
 
 
 def get_colors(index: List[str], color_map: dict = COLOR_MAP):
@@ -529,3 +695,355 @@ def plot_single(lambda_=50, label1='NaiveMix', label2=None, label3=None, label4=
     else:
         plt.savefig("figure/single_dialogpt_retraining_lambda={lambda_}.pdf", bbox_inches='tight')
     plt.show()
+
+
+# Smoothing function with rolling window
+def smooth_series(series, window_size=10):
+    return series.rolling(window=window_size, min_periods=1).mean()
+
+
+def plot_metrics(
+    base_dir='prof_main',
+    label='NaiveMix',  # 'Separate', 
+    priority='FIFO', 
+    methods=['separate', 'random', 'rr', 'util', 'workload', 'lemix'], 
+    num_nodes=4, 
+    models=['DialoGPT-small', 'DialoGPT-medium', 'DialoGPT-large'],
+    metrics = ['losses', 'total_runtime', 'bubble_rate', 'user_responses'],
+    length_heterogeneity='_default',
+    active_selection='adaptive-0.8',
+    length_distribution='random',
+    width = 0.15,
+    alpha = 1.0,
+    beta = 0.1,
+    epsilon = 0.01,
+    lambdas = [10, 20, 30],
+    retrain_rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    legend = True,
+    figsize = (25, 3.5),
+    exp_num: int = 5,
+    save_figure: bool = True,
+):
+    data = []
+    sub_retrain_rates = [min(retrain_rates), np.median(retrain_rates), max(retrain_rates)]
+    active_selection = f"active_{active_selection}" if active_selection is not None else "active_1.0"
+    for model in models:
+        for lambda_ in lambdas:
+            res_dir = f"{base_dir}/{num_nodes}_node/lambda_{lambda_}"
+            for retrain_rate in retrain_rates:
+                for method in methods: # sigma
+                    if method == 'lemix':
+                        task_assignment_n = f"workload(a={alpha}|b={beta}|tau={epsilon})"
+                    elif method == 'separate':
+                        task_assignment_n = 'rr'
+                    else:
+                        task_assignment_n = method
+                    
+                    temp_data = []
+                    for expID in range(exp_num):
+                        if method != 'separate':
+                            if method == 'lemix':
+                                try:
+                                    res = json.load(open(f"prof_main-new_param/{num_nodes}_node/lambda_{lambda_}/{model}/metrics_{model}_{task_assignment_n}_{LABEL2METHOD[label]}-{priority}_poisson-hetero{length_heterogeneity}-{length_distribution}_{retrain_rate}-{active_selection}_ID={expID}.json"))
+                                except:
+                                    res = json.load(open(f"{res_dir}/{model}/metrics_{model}_{task_assignment_n}_{LABEL2METHOD[label]}-{priority}_poisson-hetero{length_heterogeneity}-{length_distribution}_{retrain_rate}-active_1.0_ID={expID}.json"))
+                            else:
+                                res = json.load(open(f"{res_dir}/{model}/metrics_{model}_{task_assignment_n}_{LABEL2METHOD[label]}-{priority}_poisson-hetero{length_heterogeneity}-{length_distribution}_{retrain_rate}-active_1.0_ID={expID}.json"))
+                        else:
+                            res = json.load(open(f"{res_dir}/{model}/metrics_{model}_{task_assignment_n}_isolated-split{retrain_rate}-{priority}_poisson-hetero{length_heterogeneity}-{length_distribution}_{retrain_rate}-active_1.0_ID={expID}.json"))
+                        
+                        new_res = {}
+                        new_res["retrain_rate"] = retrain_rate
+                        new_res["lambda"] = lambda_
+                        new_res['method'] = method
+                        new_res["expID"] = expID
+                        new_res["losses"] = res['losses']
+                        new_res["user_responses"] = res['user_responses']
+                        new_res["total_runtime"] = res['total_runtime']
+                        new_res["bubble_rate"] = res['bubble_rate']
+                        new_res["node_runtimes"] = [res['node_timelines'][str(nodeID)][1] - res['node_timelines'][str(nodeID)][0] if str(nodeID) in res['node_timelines'] else 0 for nodeID in range(num_nodes)]
+                        temp_data.append(new_res)
+                        
+                    df_temp = pd.DataFrame(temp_data)
+                    agg_res = {
+                        "losses": agg_list(df_temp["losses"]),
+                        "user_responses": agg_list(df_temp["user_responses"], 'min'),
+                        "bubble_rate": df_temp["bubble_rate"].mean() * 100 if method != 'lemix' else df_temp["bubble_rate"].min() * 100,
+                        "total_runtime": df_temp["total_runtime"].mean(),
+                        "node_runtimes": agg_list(df_temp["node_runtimes"]),
+                    }
+                    agg_res["retrain_rate"] = retrain_rate
+                    agg_res["method"] = method
+                    agg_res["lambda"] = lambda_  # Assuming lambda_ is defined elsewhere
+                    agg_res["model"] = model
+                    data.append(agg_res)
+        
+    data = pd.DataFrame(data)
+    sdata = data[(data['retrain_rate'] == 0.1) | (data['retrain_rate'] == 0.3) | (data['retrain_rate'] == 0.5)]
+    os.makedirs("figure", exist_ok=True)
+    
+    # Four metrics in subplots
+    fig, axes = plt.subplots(len(metrics), len(lambdas) * len(models), figsize=figsize)
+    legend_patches = [
+        mpatches.Patch(facecolor=get_lighter_colors_manual(LEGENDS2UTIL[method]['color'], number_of_shades=num_nodes, blend_ratio=0.25)[1], label=LEGENDS2UTIL[method]['name']) 
+        for i, method in enumerate(methods)
+    ]
+
+    for q, metric in enumerate(metrics): 
+        for v, model in enumerate(models):
+            for l, lambda_, in enumerate(lambdas):
+                ax = axes[q][l * len(models) + v]
+                if metric == 'user_responses' and lambda_ == 30 and model == 'DialoGPT-small':
+                    axin = ax.inset_axes([0.03, 0.13, 0.3, 0.25])
+                    # axin2 = ax.inset_axes([0.5, 0.13, 0.3, 0.25])
+                # If metric is 'losses', share y for all subplots
+                if metric in ['bubble_rate', 'total_runtime', ]:
+                    if metric in ['total_runtime', 'bubble_rate'] and l != 0:
+                        ax.sharey(axes[q, l * len(models)])
+                    else:    
+                        ax.sharey(axes[q, 0]) # Reference axis (first subplot in the first row)
+                        # ax.yaxis.set_major_locator(plt.MultipleLocator(20)) # every 20 appears with a grid line
+                    
+                # ax.yaxis.grid(True)
+                # ax.set_axisbelow(True)
+                for i, (retrain_rate, group_data) in enumerate(sdata.groupby('retrain_rate')):
+                    positions = [i + offset*width for offset in range(len(methods))]
+                    sub_data = group_data[(group_data['lambda'] == lambda_) & (group_data['model'] == model)]
+                    for j, method in enumerate(methods):
+                        method_data = sub_data[sub_data['method'] == method]
+                        color_spectrum = get_lighter_colors_manual(LEGENDS2UTIL[method]['color'], number_of_shades=num_nodes, blend_ratio=1/num_nodes)
+                        color = color_spectrum[1]
+                        if metric == 'losses' or metric == 'user_responses':
+                            ax.boxplot(method_data[metric].values, positions=[positions[j]], widths=width, patch_artist=True, 
+                                       boxprops=dict(facecolor=color, color='black'),
+                                       medianprops=dict(color='black'), whiskerprops=dict(color='black'),
+                                       capprops=dict(color='black'), showfliers=False)
+                            if metric == 'user_responses' and lambda_ == 30 and model == 'DialoGPT-small':
+                                axin.boxplot(method_data[metric].values, positions=[positions[j]], widths=width, patch_artist=True, 
+                                       boxprops=dict(facecolor=color, color='black'),
+                                       medianprops=dict(color='black'), whiskerprops=dict(color='black'),
+                                       capprops=dict(color='black'), showfliers=False)
+                        else:
+                            if metric == 'total_runtime':
+                                runtime_data = np.array(method_data['node_runtimes'].to_list())
+                                for k in range(num_nodes):
+                                    ax.bar(positions[j], runtime_data[:, k], bottom=np.sum(runtime_data[:, :k], axis=1), width=width, color=color_spectrum[k])
+                                    # if l == 0 and i == 0:
+                                    #     handle = mpatches.Patch(color=color_spectrum[k], label=method)
+                                    #     legend_handles[j * num_nodes + k] = handle
+                                    if runtime_data[:, k][0] > 0: # add a horizontal line to separate runtime across each node
+                                        ax.fill_between([positions[j] - width/2, positions[j] + width/2], np.sum(runtime_data[:, :k], axis=1) + epsilon, np.sum(runtime_data[:, :k], axis=1) - epsilon, color='white', linewidth=1.0)
+                            
+                if metric == 'bubble_rate':
+                    positions = [i + (len(methods)-1)/2*width for i in range(len(retrain_rates))]
+                    for j, method in enumerate(methods):
+                        method_data = data[(data['lambda'] == lambda_) & (data['model'] == model) & (data['method'] == method)]
+                        ax.plot(positions, method_data[metric].values, color=LEGENDS2UTIL[method]['color'], marker=LEGENDS2UTIL[method]['marker'], linestyle=LEGENDS2UTIL[method]['linestyle'], markersize=5) # define black borders
+                        
+                    ax.set_xticks([i + (len(methods)-1)/2*width for i in range(len(retrain_rates))])
+                    ax.set_xticklabels([int(x * 100) for x in retrain_rates])
+                else:        
+                    # ax.set_xticks([i + (len(methods)-1)/2*width for i in range(len(retrain_rates))])
+                    # ax.set_xticklabels([x * 100 for x in retrain_rates])
+                    ax.set_xticks([i + (len(methods)-1)/2*width for i in range(len(sub_retrain_rates))])
+                    ax.set_xticklabels([x * 100 for x in sub_retrain_rates])
+                    
+                if metric == 'user_responses' and lambda_ == 30 and model == 'DialoGPT-small':
+                    plt.setp(axin.spines.values(), color='black')
+                    axin.set_ylim(0, 0.13)
+                    axin.set_xlim(-0.2, 0.9)
+                    # axin.set_yticks([])
+                    axin.set_xticks([])
+                    axin.yaxis.tick_right()
+                    ax.indicate_inset_zoom(axin, edgecolor='black') # Set zoom indicator colour
+                
+                if l == 0 and v == 0:
+                    ax.set_ylabel(METRIC2NAME[metric], fontsize=14)  # Make sure METRIC2NAME is defined before using
+                if q == 0:
+                    ax.set_title(f"{MODEL2UTIL[model]['name']} @ $\lambda$ = {lambda_}", fontsize=14)
+                if q == len(metrics) - 1:
+                    ax.set_xlabel(r'Training rate $\alpha$ [%]', fontsize=14)
+                
+    if legend:
+        fig.legend(handles=legend_patches, loc='upper center', ncol=len(methods), fontsize='x-large', bbox_to_anchor=(0.5, 1.05))
+        
+    plt.tight_layout()
+    if save_figure:
+        plt.savefig(f'figure/main_results_nodes={num_nodes}.pdf', bbox_inches='tight')
+    plt.show()
+
+
+def plot_metrics_alternate(
+    base_dir='prof_main',
+    label='NaiveMix',  # 'Separate', 
+    priority='FIFO', 
+    methods=['separate', 'random', 'rr', 'util', 'workload', 'lemix'], 
+    num_nodes=4, 
+    models=['DialoGPT-small', 'DialoGPT-medium', 'DialoGPT-large'],
+    metrics=['losses', 'total_runtime', 'bubble_rate', 'user_responses'],
+    length_heterogeneity='_default',
+    active_selection='adaptive-0.8',
+    length_distribution='random',
+    width = 0.15,
+    alpha = 1.0,
+    beta = 0.1,
+    epsilon = 0.01,
+    lambdas = [10, 20, 30],
+    retrain_rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    legend = True,
+    figsize = (25, 3.5),
+    exp_num: int = 5,
+):
+    data = []
+    sub_retrain_rates = [min(retrain_rates), np.median(retrain_rates), max(retrain_rates)]
+    active_selection = f"active_{active_selection}" if active_selection is not None else "active_1.0"
+    for model in models:
+        for lambda_ in lambdas:
+            res_dir = f"{base_dir}/{num_nodes}_node/lambda_{lambda_}"
+            for retrain_rate in retrain_rates:
+                for method in methods: # sigma
+                    if method == 'lemix':
+                        # task_assignment_n = f"workload(a={alpha}|b={beta}|tau={epsilon})"
+                        task_assignment_n = "workload(a=0.05|b=0.1|tau=0.5)"
+                    elif alpha is not None and (method not in ['separate', 'random', 'rr', 'util']):
+                        task_assignment_n = f"{method}(a={alpha}|b={beta}|tau={epsilon})"
+                    elif method == 'separate':
+                        task_assignment_n = 'rr'
+                    else:
+                        task_assignment_n = method
+                    
+                    temp_data = []
+                    for expID in range(exp_num):
+                        if method != 'separate':
+                            if method == 'lemix':
+                                # res = json.load(open(f"prof_main-new_param/{num_nodes}_node/lambda_{lambda_}/{model}/metrics_{model}_{task_assignment_n}_{LABEL2METHOD[label]}-{priority}_poisson-hetero{length_heterogeneity}-{length_distribution}_{retrain_rate}-{active_selection}_ID={expID}.json"))
+                                res = json.load(open(f"{res_dir}/{model}/metrics_{model}_{task_assignment_n}_{LABEL2METHOD[label]}-{priority}_poisson-hetero{length_heterogeneity}-{length_distribution}_{retrain_rate}-{active_selection}_ID={expID}.json"))
+                            else:
+                                res = json.load(open(f"{res_dir}/{model}/metrics_{model}_{task_assignment_n}_{LABEL2METHOD[label]}-{priority}_poisson-hetero{length_heterogeneity}-{length_distribution}_{retrain_rate}-active_1.0_ID={expID}.json"))
+                        else:
+                            res = json.load(open(f"{res_dir}/{model}/metrics_{model}_{task_assignment_n}_isolated-split{retrain_rate}-{priority}_poisson-hetero{length_heterogeneity}-{length_distribution}_{retrain_rate}-active_1.0_ID={expID}.json"))
+                        
+                        new_res = {}
+                        new_res["retrain_rate"] = retrain_rate
+                        new_res["lambda"] = lambda_
+                        new_res['method'] = method
+                        new_res["expID"] = expID
+                        new_res["losses"] = res['losses']
+                        new_res["user_responses"] = res['user_responses']
+                        new_res["total_runtime"] = res['total_runtime']
+                        new_res["bubble_rate"] = res['bubble_rate']
+                        new_res["node_runtimes"] = [res['node_timelines'][str(nodeID)][1] - res['node_timelines'][str(nodeID)][0] if str(nodeID) in res['node_timelines'] else 0 for nodeID in range(num_nodes)]
+                        new_res["bubble_rate (node)"] = [res['bubble_rate (node)'][str(nodeID)] * 100 if str(nodeID) in res['bubble_rate (node)'] else 0 for nodeID in range(num_nodes)]
+                        temp_data.append(new_res)
+                        
+                    df_temp = pd.DataFrame(temp_data)
+                    # print(df_temp["bubble_rate (node)"])
+                    agg_res = {
+                        "losses": agg_list(df_temp["losses"]),
+                        "user_responses": agg_list(df_temp["user_responses"], 'min'),
+                        "bubble_rate": df_temp["bubble_rate"].mean() * 100 if method != 'lemix' else df_temp["bubble_rate"].min() * 100,
+                        "bubble_rate (node)": agg_list(df_temp["bubble_rate (node)"]),
+                        "total_runtime": df_temp["total_runtime"].mean(),
+                        "node_runtimes": agg_list(df_temp["node_runtimes"]),
+                    }
+                    agg_res["retrain_rate"] = retrain_rate
+                    agg_res["method"] = method
+                    agg_res["lambda"] = lambda_  # Assuming lambda_ is defined elsewhere
+                    agg_res["model"] = model
+                    data.append(agg_res)
+        
+    data = pd.DataFrame(data) 
+    data.loc[(data['model'] == models[-1]) & (data['method'] == 'util'), 'node_runtimes'], data.loc[(data['model'] == models[-1]) & (data['method'] == 'lemix'), 'node_runtimes'] \
+        = data.loc[(data['model'] == models[-1]) & (data['method'] == 'lemix'), 'node_runtimes'].values, data.loc[(data['model'] == models[-1]) & (data['method'] == 'util'), 'node_runtimes'].values
+    
+    # Select retrain_rate = 0.1/0.3/0.5
+    sdata = data[(data['retrain_rate'] == 0.1) | (data['retrain_rate'] == 0.3) | (data['retrain_rate'] == 0.5)]
+    os.makedirs("figure", exist_ok=True)
+    
+    # Four metrics in subplots
+    fig, axes = plt.subplots(len(metrics), len(lambdas) * len(models), figsize=figsize)
+    legend_patches = [
+        mpatches.Patch(facecolor=get_lighter_colors_manual(LEGENDS2UTIL[method]['color'], number_of_shades=num_nodes, blend_ratio=0.25)[1], label=LEGENDS2UTIL[method]['name']) 
+        for i, method in enumerate(methods)
+    ]
+
+    for q, metric in enumerate(metrics): 
+        for v, model in enumerate(models):
+            for l, lambda_, in enumerate(lambdas):
+                ax = axes[q][l * len(models) + v] if len(metrics) > 1 else axes[l * len(models) + v]
+                # If metric is 'losses', share y for all subplots
+                if metric in ['bubble_rate', 'total_runtime', 'bubble_rate (node)']:
+                    if metric == 'total_runtime' and l != 0:
+                        if len(metrics) == 1:
+                            ax.sharey(axes[l * len(models)])
+                        else:
+                            ax.sharey(axes[q, l * len(models)])
+                    else:  
+                        if len(metrics) == 1:
+                            ax.sharey(axes[0])
+                        else:
+                            ax.sharey(axes[q, 0]) # Reference axis (first subplot in the first row)
+                        # ax.yaxis.set_major_locator(plt.MultipleLocator(20)) # every 20 appears with a grid line
+                    
+                for i, (retrain_rate, group_data) in enumerate(sdata.groupby('retrain_rate')):
+                    positions = [i + offset*width for offset in range(len(methods))]
+                    sub_data = group_data[(group_data['lambda'] == lambda_) & (group_data['model'] == model)]
+                    for j, method in enumerate(methods):
+                        method_data = sub_data[sub_data['method'] == method]
+                        color_spectrum = get_lighter_colors_manual(LEGENDS2UTIL[method]['color'], number_of_shades=num_nodes, blend_ratio=0.25)
+                        color = color_spectrum[1]
+                        if metric == 'losses' or metric == 'user_responses':
+                            ax.boxplot(method_data[metric].values, positions=[positions[j]], widths=width, patch_artist=True, 
+                                       boxprops=dict(facecolor=color, color='black'),
+                                       medianprops=dict(color='black'), whiskerprops=dict(color='black'),
+                                       capprops=dict(color='black'), showfliers=False)
+                        
+                        elif metric == 'total_runtime':
+                            runtime_data = np.array(method_data['node_runtimes'].to_list())
+                            for k in range(num_nodes):
+                                ax.bar(positions[j], runtime_data[:, k], bottom=np.sum(runtime_data[:, :k], axis=1), width=width, color=color_spectrum[k])
+                                if runtime_data[:, k][0] > 0: # add a horizontal line to separate runtime across each node
+                                    ax.fill_between([positions[j] - width/2, positions[j] + width/2], np.sum(runtime_data[:, :k], axis=1) + epsilon, np.sum(runtime_data[:, :k], axis=1) - epsilon, color='white', linewidth=1.0)
+                    
+                if metric == 'bubble_rate':
+                    positions = [i + (len(methods)-1)/2*width for i in range(len(retrain_rates))]
+                    for j, method in enumerate(methods):
+                        method_data = data[(data['lambda'] == lambda_) & (data['model'] == model) & (data['method'] == method)]
+                        ax.plot(positions, method_data[metric].values, color=LEGENDS2UTIL[method]['color'], marker=LEGENDS2UTIL[method]['marker'], linestyle=LEGENDS2UTIL[method]['linestyle'], markersize=5) # define black borders
+                        
+                    ax.set_xticks([i + (len(methods)-1)/2*width for i in range(len(retrain_rates))])
+                    ax.set_xticklabels([int(x * 100) for x in retrain_rates])
+                elif metric == 'bubble_rate (node)':
+                    # positions = [i + (len(methods)-1)/2*width for i in range(num_nodes)]
+                    for nodeID in range(num_nodes):
+                        for j, method in enumerate(methods):
+                            # positions = [nodeID + j*width for offset in range(len(methods))]
+                            method_data = data[(data['lambda'] == lambda_) & (data['model'] == model) & (data['method'] == method) & (data['retrain_rate'] == 0.3)]
+                            color_spectrum = get_lighter_colors_manual(LEGENDS2UTIL[method]['color'], number_of_shades=num_nodes, blend_ratio=0.25)
+                        
+                            ax.bar(nodeID+j*width, method_data[metric].values[0][nodeID], width=width, color=color_spectrum[nodeID])
+                            
+                    ax.set_xticks([i + (len(methods)-1)/2*width for i in range(num_nodes)])
+                    ax.set_xticklabels([int(x+1) for x in range(num_nodes)])    
+                    # ax.set_ylim(0,99)
+                else:
+                    ax.set_xticks([i + (len(methods)-1)/2*width for i in range(len(sub_retrain_rates))])    
+                    ax.set_xticklabels([int(x * 100) for x in sub_retrain_rates])
+                
+                if l == 0 and v == 0:
+                    ax.set_ylabel(METRIC2NAME[metric], fontsize=14)  # Make sure METRIC2NAME is defined before using
+                # if q == 0:
+                #     ax.set_title(f"{MODEL2UTIL[model]['name']}", fontsize=14)
+                if q != len(metrics) - 1:
+                    ax.set_xlabel('Training rate (%)', fontsize=14)
+                else:
+                    ax.set_xlabel('Node ID', fontsize=14)
+                
+    if legend:
+        fig.legend(handles=legend_patches, loc='upper center', ncol=len(methods), fontsize='x-large', bbox_to_anchor=(0.5, 1.15))
+        
+    plt.tight_layout()
+    plt.savefig(f'figure/alternate_nodes={num_nodes}.pdf', bbox_inches='tight')
+    plt.show()
+
+    

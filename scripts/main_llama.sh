@@ -11,16 +11,22 @@ BETA=0.1
 EPSILON=0.5
 K=0.5
 EXPERIMENTS=3  # each experiment run 1 times
-NUM_NODES=4
 NUM_GPUS=8
 TOKEN="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"
-export CUDA_LAUNCH_BLOCKING=1
+# export CUDA_LAUNCH_BLOCKING=1
+MODEL_NAME="Llama-2-13b-chat-hf" # "Llama-2-7b-chat-hf" "Llama-2-13b-chat-hf" "Llama-2-70b-chat-hf"
+# Ensure the folder for profiling output exists
+PROFILING_DIR="nvidia-profiling"
+mkdir -p ${PROFILING_DIR}
+NUM_NODES=4
 
-for MODEL_NAME in "Llama-2-7b-chat-hf"; do
-    for RATE_LAMBDA in 10 30; do
+for MODEL_NAME in "Llama-2-13b-chat-hf"; do
+    for RATE_LAMBDA in 4 8 12 16 20 24 28 32 -1; do
         OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}
         for RETRAIN_RATE in 0.1 0.3 0.5 0.7 0.9; do
             for TASK_ASSIGNMENT in "rr" "random" "util" "workload"; do
+                nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,power.draw --format=csv,nounits -l 1 -f ${PROFILING_DIR}/${TASK_ASSIGNMENT}_${MODEL_NAME}_${NUM_NODES}-node_${RATE_LAMBDA}-rps_${RETRAIN_RATE}-rate.csv &
+                NVIDIA_SMI_PID=$!
                 python distributed_llama.py \
                     --model_name_or_path "meta-llama/${MODEL_NAME}" \
                     --access_token $TOKEN \
@@ -42,6 +48,8 @@ for MODEL_NAME in "Llama-2-7b-chat-hf"; do
                     --experiments $EXPERIMENTS \
                     --memory_threshold $MEMORY_THRESHOLD \
                     --run_mode 'online'
+                
+                kill $NVIDIA_SMI_PID
 
                 python plot.py \
                     --node $NUM_NODES \
@@ -57,8 +65,11 @@ for MODEL_NAME in "Llama-2-7b-chat-hf"; do
             done
 
             # ISOLATED
+            nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,power.draw --format=csv,nounits -l 1 -f ${PROFILING_DIR}/separate_${MODEL_NAME}_${NUM_NODES}-node_${RATE_LAMBDA}-rps_${RETRAIN_RATE}-rate.csv &
+            NVIDIA_SMI_PID=$!
             python distributed_llama.py \
                 --model_name_or_path "meta-llama/$MODEL_NAME" \
+                --access_token $TOKEN \
                 --model_name $MODEL_NAME \
                 --num_nodes $NUM_NODES \
                 --n_samples $NUM_SAMPLES \
@@ -71,6 +82,8 @@ for MODEL_NAME in "Llama-2-7b-chat-hf"; do
                 --batch_size $BATCH_SIZE \
                 --experiments $EXPERIMENTS \
                 --memory_threshold $MEMORY_THRESHOLD
+
+            kill $NVIDIA_SMI_PID
 
             python plot.py \
                 --node $NUM_NODES \

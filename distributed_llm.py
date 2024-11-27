@@ -31,6 +31,7 @@ from utils import Node, Task, record_time, log_queue_contents
 from models import (
     get_stages, 
     _prepare_inputs,
+    _prepare_decoding_inputs,
 )
 
 
@@ -92,8 +93,11 @@ class DistributedLLM:
         self.experimentID = experimentID
         self.run_mode = args.run_mode
         self.no_prior_profile = args.no_prior_profile
+        self.no_memory_check = args.no_memory_check
+        self.max_wait = args.max_wait
         
         os.makedirs(self.profile_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
         lh = 'default' if self.length_heterogeneity is None else self.length_heterogeneity
         self.profile_file = f"{self.profile_dir}/{self.model_n}_lambda={self.rate_lambda}_nodes={self.num_nodes}_retrain={self.retraining_rate}_LH={lh}.json"
         self.RECORD_MODE = False if self.run_mode == 'online' else True
@@ -369,6 +373,35 @@ class DistributedLLM:
                     del lengths_dict[closest_number]
             
         return selected_ids
+    
+
+    def offload_to_cpu(self, tensor: Any):
+        """
+        Offload tensor to CPU to free GPU memory.
+        """
+        if isinstance(tensor, torch.Tensor):
+            return tensor.to("cpu", non_blocking=True)
+        elif isinstance(tensor, dict):  # Handles customized outputs
+            return {k: self.offload_to_cpu(v) for k, v in tensor.items()}
+        elif isinstance(tensor, list):
+            return [self.offload_to_cpu(v) for v in tensor]
+        elif isinstance(tensor, tuple):
+            return tuple(self.offload_to_cpu(v) for v in tensor)
+        return tensor
+
+    def reload_to_gpu(self, tensor: Any, device: torch.device):
+        """
+        Reload tensor from CPU back to GPU.
+        """
+        if isinstance(tensor, torch.Tensor):
+            return tensor.to(device, non_blocking=True)
+        elif isinstance(tensor, dict):
+            return {k: self.reload_to_gpu(v, device) for k, v in tensor.items()}
+        elif isinstance(tensor, list):
+            return [self.reload_to_gpu(v, device) for v in tensor]
+        elif isinstance(tensor, tuple):
+            return tuple(self.reload_to_gpu(v, device) for v in tensor)
+        return tensor
 
         
     def get_preloaded_dataset(
@@ -467,7 +500,7 @@ class DistributedLLM:
                 # Update the start ID for the next lambda
                 current_start_id = current_end_id + 1
 
-            if self.isolated_split == 100:
+            if self.setting == 'isolated' and self.isolated_split == 100:
                 # Now lambda_ranges contains the ranges and test node requirements
                 lambda_ranges[-1]['end_id'] = len(selected_data) - 1
                 self.ID2test = {}
@@ -495,13 +528,15 @@ class DistributedLLM:
                 inference_taskIDs.append(i)
                 lamda = self.rate_lambda if self.rate_lambda != -1 else inference_lambdas[j]
                 j += 1
-                
+
+            # Prepare decode input
+            inputs = _prepare_decoding_inputs(batch)
             for nodeID, node in distributed_nodes.items():
                 task = Task(
                     task_id=i,
                     rate_lambda=lamda,
-                    query=_prepare_inputs(batch, device=node.init_device),
-                    feedback=_prepare_inputs(batch['labels'], device=node.last_device),
+                    query=_prepare_inputs(inputs, device=node.init_device),
+                    feedback=_prepare_inputs(inputs['labels'], device=node.last_device),
                     node_id=nodeID,
                     num_gpus_per_node=node.num_gpus_per_node,
                     require_training=require_training,
@@ -531,8 +566,6 @@ class DistributedLLM:
                 time.sleep(0)
             else:
                 time.sleep(random.expovariate(self.distributed_preloaded_tasks[0][taskID].rate_lambda))
-            # 10% of the time, produce a task with feedback
-            # print("Producing task {} with input length {}".format(taskID, task.query['input_ids'].shape[1]))
             # Essentially, we are using preloaded data (task ID)
             taskQueue.put(taskID)
             # We record and calculate the response time for each user task (no retraining)
@@ -596,8 +629,8 @@ class DistributedLLM:
         br, bi, init_id, finished_ids = 0, 0, 0, []
         previous_taskIDs = list(self.all_trace[nodeID].keys())
         previous_train_taskIDs = list(self.train_trace[nodeID].keys())
-        eta = self.eta if self.eta is not None else 2e-5
-        BT = self.BT if self.BT is not None else 0.07
+        eta = self.eta if self.eta is not None else 6.5e-6
+        BT = self.BT if self.BT is not None else 0.077
             
         # Get/Estimate previous forward execution traces
         if previous_taskIDs:
@@ -778,46 +811,46 @@ class DistributedLLM:
             # print("Global scheduler scheduled task {} (requre_training={}) to node {}".format(taskID, self.distributed_preloaded_tasks[0][taskID].require_training, nodeID))
     
     
-    def _check_device_availability(self, device: int, threshold: float = 0.8):
+    def check_device_availability(self, device: int):
         """
         Check if the device has enough available memory.
         Args:
         - device: The device to check.
-        - threshold: The maximum allowed memory utilization ratio.
         Returns:
         - is_available: Boolean indicating if the device is available.
         """
         # Get device memory status
         allocated_memory = torch.cuda.memory_allocated(device)
-        available_memory = self.device_total_memory - allocated_memory
-        # Calculate the available memory ratio
-        available_ratio = available_memory / self.device_total_memory
-        # Check if the available memory ratio is above the threshold
-        return available_ratio > (1 - threshold)
+        return allocated_memory / self.device_total_memory <= self.memory_threshold
+        # available_memory = self.device_total_memory - allocated_memory
+        # # Calculate the available memory ratio
+        # available_ratio = available_memory / self.device_total_memory
+        # # Check if the available memory ratio is above the threshold
+        # return available_ratio > (1 - threshold)
     
     
-    def _wait_for_device_availability(
+    def wait_for_device_availability(
         self, 
         device: int, 
         check_interval: float = 0.1, 
-        threshold: float = 0.8,
-        max_wait: float = 10.0,
+        force_check: bool = True,
     ):
         """
         Wait until the device is available based on memory usage.
         Args:
         - device: The device to wait for.
         - check_interval: How often to check the device status (in seconds).
-        - threshold: The maximum allowed memory utilization ratio.
-        - max_wait: Maximum wait time before exiting the wait state.
         """
+        if self.no_memory_check and not force_check:
+            return True
         start_time = time.time()
-        while not self._check_device_availability(device, threshold):
+        while not self.check_device_availability(device):
             # print(f"Waiting for device {device} to become available...")
             time.sleep(check_interval)
-            if time.time() - start_time > max_wait:
+            if time.time() - start_time > self.max_wait:
                 print(f"Exceeded max wait time for device {device}. Exit forward waiting loop.")
-                break
+                return False
+        return True
 
             
     def forward(
@@ -830,7 +863,7 @@ class DistributedLLM:
         timing_info: Dict[str, List[float]],
     ) -> Tuple[torch.Tensor, ...]:
         # Memory check and scale down if necessary
-        self._wait_for_device_availability(device, threshold=self.memory_threshold)
+        self.wait_for_device_availability(device)
         
         try:
             if task.require_training: # this is a training task
@@ -840,9 +873,8 @@ class DistributedLLM:
                     self.train_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
                     self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
 
-                with autocast():
-                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
-                # torch.cuda.synchronize() # synchronize the device
+                # with autocast():
+                tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 fe = record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
                 
                 self.task_trace[nodeID][stageID]['fe'] = fe
@@ -860,9 +892,8 @@ class DistributedLLM:
                     self.user_task_record[task.task_id]['start'] = fb
                     
                 with torch.no_grad():
-                    with autocast():
-                        tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
-                # torch.cuda.synchronize() # synchronize the device
+                    # with autocast():
+                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 fe = record_time(device, 'end', 'forward', task.task_id, timing_info)
                 
                 self.task_trace[nodeID][stageID]['fe'] = fe
@@ -880,7 +911,6 @@ class DistributedLLM:
                 # self.forward_end.record()
                 # torch.cuda.synchronize()
                 # Profile forward time (seconds) per stage
-                # self.eta = self.forward_start.elapsed_time(self.forward_end) / (task.query['input_ids'].shape[1] ** 2 * 1e3)
                 self.record_dict['etas'].append(((fe - fb) / (task.query['input_ids'].shape[1] ** 2), task.task_id))
                 self.record_dict['FTs'].append((fe - fb, task.task_id))
                 
@@ -964,6 +994,8 @@ class DistributedLLM:
         for nodeID, timing_info in self.timing_infos.items():
             if self.no_prior_profile:
                 stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-prior-profile_node{nodeID}.json'
+            elif self.no_memory_check:
+                stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-memory-check_node{nodeID}.json'
             else:
                 stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
@@ -1025,9 +1057,12 @@ class DistributedLLM:
                 total_runtime += node_max_time - node_min_time
                     
         bubble_rate = sum(total_idles) / sum(total_latencies) if sum(total_latencies) > 0 else 0
+        weight_sync_times = None
         for key, value in metrics.items():
             if key == 'loss':
                 losses = value
+            elif key == 'weight_sync':
+                weight_sync_times = value
             metrics[key] = sum(value) / len(value)
         
         # Calculate response times
@@ -1053,6 +1088,8 @@ class DistributedLLM:
         metrics['idles_sum (node)'] = {nodeID: sum(idles) for nodeID, idles in node_idles.items()}
         metrics['idles_avg'] = sum(total_idles) / len(total_idles) if total_idles else 0
         metrics['idles_avg (node)'] = {nodeID: sum(idles) / len(idles) if idles else 0 for nodeID, idles in node_idles.items()}
+        if weight_sync_times is not None:
+            metrics['weight_sync_times'] = weight_sync_times
         metrics['length_statistics'] = {
             'mean': self.mean_length,
             'std': self.std_length,
@@ -1115,6 +1152,8 @@ class DistributedLLM:
         task_assignment = f"{self.task_assignment}(a={self.alpha}|b={self.beta}|tau={self.epsilon})" if (self.task_assignment == 'workload' or '+' in self.task_assignment) else self.task_assignment
         if self.no_prior_profile:
             stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-prior-profile_ID={self.experimentID}.json'
+        elif self.no_memory_check:
+            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-memory-check_ID={self.experimentID}.json'
         else:
             stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_ID={self.experimentID}.json'
         with open(stats_f, 'w') as f:
@@ -1180,6 +1219,7 @@ class DistributedLLM:
             backward_dict = {taskID: bt for bt, taskID in self.record_dict['BTs']}
             self.record_dict['eta'] = np.mean(list(eta_dict.values()))
             self.record_dict['BT'] = np.mean(list(backward_dict.values()))
+            self.record_dict['FT'] = np.mean(list(forward_dict.values()))
             
             self.record_dict['task_dict'] = {
                 taskID: {
@@ -1222,6 +1262,8 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default='dummy', help='model name')
     parser.add_argument('--memory_threshold', type=float, default=0.5, 
                         help='threshold for maximum memory allocation in each GPU device')
+    parser.add_argument('--max_wait', type=float, default=10, 
+                        help='maximum time to wait from available memory')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--num_gpus', type=int, default=None)
@@ -1256,19 +1298,9 @@ if __name__ == '__main__':
     parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
     parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
+    parser.add_argument('--no_memory_check', action='store_true', help='Whether to use memory checker before each execution')
     args = parser.parse_args()
     
     for i in range(args.experiments):
         run_experiment(args, i)
     
-    # for i in range(args.experiments):
-    #     print(f"\n ** Experiment {i+1} **\n")
-    #     distributed_llm = DistributedLLM(args, experimentID=i)
-    #     distributed_llm.run()
-        
-    #     # If run_mode is online and RECORD_MODE is activated, we need to re-run the experiment
-    #     if distributed_llm.RECORD_MODE and args.run_mode == 'online':
-    #         del distributed_llm
-    #         torch.cuda.empty_cache()
-    #         new_run =  DistributedLLM(args, experimentID=i)
-    #         new_run.run()

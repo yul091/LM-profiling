@@ -6,15 +6,13 @@ import argparse
 import time
 from typing import List, Dict, Optional, Any, Union
 import logging
-from utils import record_time, Task, log_queue_contents
+from utils import record_time, Task
 from distributed_llm import DistributedLLM, set_seed, gc
 from models import (
     CustomizedLlamaOut,
     _prepare_inputs,
-    _prepare_decoding_inputs,
 )
 import torch
-from torch.nn.utils import clip_grad_norm_
 from torch.cuda.amp import GradScaler
 scaler = GradScaler()
 
@@ -89,7 +87,6 @@ class DistributedLlama(DistributedLLM):
                 continue    
                 
             if stageID == 0: # prepare inputs
-                inputs = _prepare_decoding_inputs(inputs)
                 task.feedback = inputs.pop('labels', None)
                 
             tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
@@ -117,7 +114,7 @@ class DistributedLlama(DistributedLLM):
                     self.record_dict['loss'].append((loss.item(), taskID))
                     self.record_dict['length'].append((input_length, taskID))
                 
-                if task.do_backward:
+                if task.do_backward and self.wait_for_device_availability(device, force_check=False):
                     # Backprop on the last stage
                     bb = time.time()
                     self.task_trace[nodeID][self.num_gpus_per_node-1]['bb'] = bb
@@ -192,6 +189,8 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default='Llama-2-7b-chat-hf', help='model name')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--memory_threshold', type=float, default=0.8, help='threshold for maximum memory allocation in each GPU device')
+    parser.add_argument('--max_wait', type=float, default=10, 
+                        help='maximum time to wait from available memory')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--num_gpus', type=int, default=None)
     parser.add_argument('--n_samples', type=int, default=-1)
@@ -225,6 +224,7 @@ if __name__ == '__main__':
     parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
     parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
+    parser.add_argument('--no_memory_check', action='store_true', help='Whether to use memory checker before each execution')
     args = parser.parse_args()
     
     for i in range(args.experiments):

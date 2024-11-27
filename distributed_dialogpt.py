@@ -10,10 +10,7 @@ import torch
 import logging
 from utils import record_time, Task
 from distributed_llm import DistributedLLM, set_seed, gc
-from models import (
-    CustomizedGPT2Out,
-    _prepare_decoding_inputs,
-)
+from models import CustomizedGPT2Out
 # from memory_profiler import memory_usage
 # torch.autograd.set_detect_anomaly(True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -84,10 +81,13 @@ class DistributedDialoGPT(DistributedLLM):
             
             if inputs is None:
                 print("Stage {} waiting for task {}".format(device, taskID))
-                continue    
+                continue   
+
+            # # Check memory usage and offload if necessary
+            # if not self.check_device_availability(device):
+            #     inputs = self.offload_to_cpu(inputs)
                 
             if stageID == 0: # prepare inputs
-                inputs = _prepare_decoding_inputs(inputs)
                 task.feedback = inputs.pop('labels', None)
                 
             tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
@@ -117,15 +117,13 @@ class DistributedDialoGPT(DistributedLLM):
                     self.record_dict['loss'].append((loss.item(), taskID))
                     self.record_dict['length'].append((input_length, taskID))
                 
-                if task.do_backward:
+                if task.do_backward and self.wait_for_device_availability(device, force_check=False):
                     bb = time.time()
                     self.task_trace[nodeID][self.num_gpus_per_node-1]['bb'] = bb
                     if taskID in self.train_trace[nodeID]:
                         self.train_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
                         self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
                     try:
-                        # if self.RECORD_MODE:
-                        #     self.backward_start.record()
                         loss.backward()
                         # if self.RECORD_MODE:
                         #     self.backward_end.record()
@@ -166,6 +164,7 @@ class DistributedDialoGPT(DistributedLLM):
                     if (self.setting == 'isolated') and (len(self._trained_task_lengths) % self.saving_steps == 0): 
                         # Save the parameters of stages in the last node and load them in other nodes
                         print(f" *** Save checkpoint {self.ckpt_path} *** ")
+                        sync_start = time.time()
                         for j in range(self.num_gpus_per_node):
                             torch.save(self.distributed_stages[nodeID][j].state_dict(), f"{self.ckpt_path}_stage{j}.pt")
                         # For other nodes, load the parameters from the last node
@@ -174,6 +173,8 @@ class DistributedDialoGPT(DistributedLLM):
                             print(f" *** Load checkpoint for Node {i} *** ")
                             for j in range(self.num_gpus_per_node):
                                 self.distributed_stages[i][j].load_state_dict(torch.load(f"{self.ckpt_path}_stage{j}.pt"))
+                        sync_end = time.time()
+                        self.metrics['weight_sync'].append(sync_end - sync_start)
                     
                     self._training_step += 1   
                 
@@ -197,6 +198,8 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default='dummy', help='model name')
     parser.add_argument('--memory_threshold', type=float, default=0.5, 
                         help='threshold for maximum memory allocation in each GPU device')
+    parser.add_argument('--max_wait', type=float, default=10, 
+                        help='maximum time to wait from available memory')
     parser.add_argument('--access_token', type=str, default=None, help='access token')
     parser.add_argument('--num_nodes', type=int, default=2)
     parser.add_argument('--num_gpus', type=int, default=None)
@@ -231,6 +234,7 @@ if __name__ == '__main__':
     parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
     parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
+    parser.add_argument('--no_memory_check', action='store_true', help='Whether to use memory checker before each execution')
     args = parser.parse_args()
     
     for i in range(args.experiments):

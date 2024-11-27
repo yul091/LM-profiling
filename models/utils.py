@@ -184,6 +184,7 @@ def stages_forward(
     labels = labels.to(stages[-1]._device) if labels is not None else None
     for i, stage in enumerate(stages):
         # print(f'current stage {i}: {stage}')
+        print_gpu_memory(i)
         if verbose:
             print(f"Forward pass for stage {i} on device {stage._device}")
         if i == 0:
@@ -246,6 +247,12 @@ def stages_decoding(
     # For CLM, we need to mask the sentence (-100) and add to the labels
     new_inputs = _prepare_decoding_inputs(inputs)
     return stages_forward(stages, new_inputs, verbose=verbose)
+
+
+# GPU memory tracking utility
+def print_gpu_memory(stage):
+    print(f"[{stage}] Allocated memory: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
+    print(f"[{stage}] Reserved memory: {torch.cuda.memory_reserved() / 1e6:.2f} MB")
 
 
 
@@ -346,12 +353,14 @@ if __name__ == '__main__':
     # loss = outputs.loss
     # end = time.time()
     # print(f'nll loss: {loss}, overhead: {end - start}')
-    
+
+    # Forward pass
     start = time.time()
     outputs = stages_decoding(stages, inputs)
     loss = outputs[0]
     end = time.time()
     print(f'nll loss: {loss}, overhead: {end - start}')
     loss.backward()
+    print_gpu_memory(num_stages-1)
     timing_info['0_end'].append((time.time(), 'backward'))
     print(timing_info)

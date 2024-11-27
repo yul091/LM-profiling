@@ -18,7 +18,7 @@ for NUM_NODES in 1; do
     # for RATE_LAMBDA in 50 30 20 10 5; do
     for RATE_LAMBDA in 5; do
         # for RETRAIN_RATE in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0; do
-        for RETRAIN_RATE in 1.0; do
+        for RETRAIN_RATE in 0; do
             if [ $NUM_NODES -eq 1 ]; then
                 CUDA_VISIBLE_DEVICES="0,1,2,3" # Use only cuda0-3 when NUM_NODES=1
             else

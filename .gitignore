@@ -2,7 +2,7 @@ prof*
 figure*
 # scripts
 # logging
-results
+res*
 wandb
 # data
 notebooks
