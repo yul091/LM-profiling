@@ -5,7 +5,7 @@ SETTING=active # "active" "isolated"
 WORKLOAD=poisson
 # TASK_ASSIGNMENT=workload # "workload" "random" "rr" "util" "random+" "rr+" "util+"
 # LENGTH_DIST=random # "ascending" "bursty" "random" "descending"
-BASE_DIR=prof_main
+BASE_DIR=prof_new
 # MODEL_NAME="DialoGPT-large" # "DialoGPT-medium" "DialoGPT-small"
 ALPHA=0.05
 BETA=0.1
@@ -94,10 +94,10 @@ mkdir -p ${PROFILING_DIR}
 
 
 
-for MODEL_NAME in "DialoGPT-large" "DialoGPT-medium" "DialoGPT-small"; do
+for MODEL_NAME in "DialoGPT-large"; do
     for RATE_LAMBDA in -1; do
         OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}
-        for RETRAIN_RATE in 0.0; do
+        for RETRAIN_RATE in 0.0 0.5 1.0; do
             for TASK_ASSIGNMENT in "workload"; do
                 # nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,power.draw --format=csv,nounits -l 1 -f ${PROFILING_DIR}/${TASK_ASSIGNMENT}_${MODEL_NAME}_${NUM_NODES}-node_${RATE_LAMBDA}-rps_${RETRAIN_RATE}-rate.csv &
                 # NVIDIA_SMI_PID=$!

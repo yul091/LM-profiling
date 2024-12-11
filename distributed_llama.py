@@ -52,7 +52,7 @@ class DistributedLlama(DistributedLLM):
     def __init__(self, args: argparse.Namespace, experimentID: int = 0):
         super().__init__(args, experimentID)
 
-    def device_inference(
+    def stage_inference(
         self, 
         stageID: int,
         nodeID: int,
@@ -78,7 +78,7 @@ class DistributedLlama(DistributedLLM):
                 break
             
             task: Task = preloaded_tasks[taskID]
-            input_length = task.query['input_ids'].shape[1]
+            batch_size, input_length = task.query['input_ids'].shape
             assert task.task_id == taskID
             inputs = task.hiddens[stageID]
             
@@ -91,6 +91,9 @@ class DistributedLlama(DistributedLLM):
                 
             tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
             task.hiddens[stageID] = None # clear the input that is no longer needed
+
+            if tuple_outputs is None:  # Error occurred
+                continue
                 
             if nextdeviceQueue is not None:  # Intermediate stage
                 # Need to send the output to the next stage, except for the last stage
@@ -107,7 +110,11 @@ class DistributedLlama(DistributedLLM):
                 
             else: # last stage
                 loss = tuple_outputs[0]
-                self.metrics["loss"].append(loss.item())
+                # self.metrics["loss"].append(loss.item())
+                if task.require_training:
+                    self.metrics["train_loss"].append(loss.item())
+                else:
+                    self.metrics["inference_loss"].append(loss.item())
                 # print(f"[Node {nodeID} | Stage {stageID}] Finished task {taskID} with loss {loss} (tuple outputs {tuple_outputs})")
 
                 if self.RECORD_MODE:
@@ -131,21 +138,23 @@ class DistributedLlama(DistributedLLM):
                             self.train_trace[nodeID][taskID][0]['be'] = be   
                             self.all_trace[nodeID][taskID][0]['be'] = be
                         
-                        if self.BT is None:
-                            self.BT = (be - bb) / self.num_gpus_per_node
+                        if self.backward_eta is None:
+                            self.backward_eta = (be - bb) / (self.num_gpus_per_node * batch_size * input_length ** 2)
                             
                         print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                     except Exception as e:
                         # logging.error(f"[node {nodeID} | stage {stageID} | task {taskID}] Backward error occurred: {e}")
                         pass
+                    
+                    self._trained_task_lengths.append(input_length)
 
-                    if self.RECORD_MODE:
+                    if self.RECORD_MODE:  # In RECORD_MODE, we do not update the model parameters
+                        self.record_dict['backward_etas'].append(
+                            ((be - bb) / (self.num_gpus_per_node * batch_size * input_length ** 2), taskID)
+                        )
                         self.record_dict['BTs'].append(((be - bb)/self.num_gpus_per_node, taskID))
                         
-                    self._trained_task_lengths.append(input_length)
-                    
-                    # Optimization
-                    if not self.RECORD_MODE: # In RECORD_MODE, we do not update the model parameters
+                    else:  # Optimization
                         try:
                             # self.distributed_optimizers[nodeID].step()
                             scaler.step(self.distributed_optimizers[nodeID])

@@ -50,7 +50,7 @@ class DistributedDialoGPT(DistributedLLM):
     def __init__(self, args: argparse.Namespace, experimentID: int = 0):
         super().__init__(args, experimentID)
 
-    def device_inference(
+    def stage_inference(
         self, 
         stageID: int,
         nodeID: int,
@@ -75,7 +75,7 @@ class DistributedDialoGPT(DistributedLLM):
                 break
             
             task: Task = preloaded_tasks[taskID]
-            input_length = task.query['input_ids'].shape[1]
+            batch_size, input_length = task.query['input_ids'].shape
             assert task.task_id == taskID
             inputs = task.hiddens[stageID]
             
@@ -92,6 +92,9 @@ class DistributedDialoGPT(DistributedLLM):
                 
             tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
             task.hiddens[stageID] = None # clear the input that is no longer needed
+             
+            if tuple_outputs is None:  # Error occurred
+                continue
                 
             if nextdeviceQueue is not None: # intermediate stage
                 # Need to send the output to the next stage, except for the last stage
@@ -111,7 +114,10 @@ class DistributedDialoGPT(DistributedLLM):
             else: # last stage
                 loss = tuple_outputs[0]
                 # print("[NLL loss={}] stage {} finished task {}".format(loss, device, taskID))
-                self.metrics["loss"].append(loss.item())
+                if task.require_training:
+                    self.metrics["train_loss"].append(loss.item())
+                else:
+                    self.metrics["inference_loss"].append(loss.item())
                 
                 if self.RECORD_MODE:
                     self.record_dict['loss'].append((loss.item(), taskID))
@@ -125,33 +131,29 @@ class DistributedDialoGPT(DistributedLLM):
                         self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
                     try:
                         loss.backward()
-                        # if self.RECORD_MODE:
-                        #     self.backward_end.record()
-                        #     torch.cuda.synchronize()
-                        #     BT = self.backward_start.elapsed_time(self.backward_end) / 1e3
-                            # self.record_dict['BTs'].append(BT, taskID)
                         be = record_time(init_device, 'end', 'backward', taskID, timing_info)
                         self.task_trace[nodeID][0]['be'] = be
                         if taskID in self.train_trace[nodeID]:
                             self.train_trace[nodeID][taskID][0]['be'] = be   
                             self.all_trace[nodeID][taskID][0]['be'] = be
                         
-                        if self.BT is None:
-                            self.BT = (be - bb) / self.num_gpus_per_node
-                            
-                        print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                        if self.backward_eta is None:
+                            self.backward_eta = (be - bb) / (self.num_gpus_per_node * batch_size * input_length ** 2)
+                        # print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                         
                     except Exception as e:
                         # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                         pass
                     
-                    if self.RECORD_MODE:
-                        self.record_dict['BTs'].append(((be - bb)/self.num_gpus_per_node, taskID))
-                        
                     self._trained_task_lengths.append(input_length)
-                    
-                    # Optimization
-                    if not self.RECORD_MODE: # In RECORD_MODE, we do not update the model parameters
+
+                    if self.RECORD_MODE:  # In RECORD_MODE, we do not update the model parameters
+                        self.record_dict['backward_etas'].append(
+                            ((be - bb) / (self.num_gpus_per_node * batch_size * input_length ** 2), taskID)
+                        )
+                        self.record_dict['BTs'].append(((be - bb)/ self.num_gpus_per_node, taskID))
+                        
+                    else: # Optimization
                         try:
                             self.distributed_optimizers[nodeID].step()
                             self.distributed_schedulers[nodeID].step()
