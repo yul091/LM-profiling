@@ -554,7 +554,6 @@ class DistributedLLM:
     def serving_producer(
         self,
         taskQueue: queue.Queue, 
-        max_wait_time: int = 5,
     ) -> None:
         """
         Simulate online serving requests with a Poisson arrival distribution.
@@ -566,26 +565,19 @@ class DistributedLLM:
                 taskQueue.put(None)  # Signal the end of the dataset
                 print(f"Producer finished producing inference tasks!")
                 break
-            try:
-                taskID = IDs.pop()  # Pop the last task ID
-            except IndexError as e:
-                print(f"Error popping from IDs: {e}")
-                break
+
+            taskID = IDs.pop()  # Pop the last task ID
 
             if self.workload == 'all':
                 time.sleep(0)
             else:
                 time.sleep(random.expovariate(self.distributed_preloaded_tasks[0][taskID].rate_lambda))
             
-            try:
-                taskQueue.put(taskID, timeout=max_wait_time)  # Add timeout to avoid indefinite blocking
-                release = time.time()
-                self.task_arrival[taskID]['release'] = release
-                self.user_task_record[taskID]['release'] = release
-                # print(f"Inference task {taskID} released at {release}")
-            except queue.Full:
-                # print(f"Task queue is full. Unable to enqueue taskID: {taskID}")
-                break
+            taskQueue.put(taskID) 
+            release = time.time()
+            self.task_arrival[taskID]['release'] = release
+            self.user_task_record[taskID]['release'] = release
+            # print(f"Inference task {taskID} released at {release}")
 
 
 
@@ -613,7 +605,7 @@ class DistributedLLM:
             
             start_time = time.time()  # Start timing for timeout
             while not self.training_status.get(taskID - 1, True):
-                time.sleep(0.001)  # Sleep briefly to avoid busy waiting
+                time.sleep(0.01)  # Sleep briefly to avoid busy waiting
                 if time.time() - start_time > max_wait_time:
                     print(f"Timeout waiting for preceding task {taskID - 1} to complete. Skipping task {taskID}.")
                     self.training_status[taskID - 1] = True  # Force status update to avoid indefinite blocking
@@ -678,12 +670,12 @@ class DistributedLLM:
         """
         batch_size, length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape
         # Initialize bubble rate and response time
-        fb = self.task_arrival[taskID]['release']
+        fb = self.task_arrival[taskID]['release']  # arrival time
         II, init_id, finished_ids = 0, 0, []
         previous_taskIDs = list(self.all_trace[nodeID].keys())
         previous_train_taskIDs = list(self.train_trace[nodeID].keys())
-        forward_eta = self.froward_eta if self.froward_eta is not None else 6.5e-6
-        backward_eta = self.backward_eta if self.backward_eta is not None else 0.077
+        forward_eta = self.froward_eta if self.froward_eta is not None else 2e-6
+        backward_eta = self.backward_eta if self.backward_eta is not None else 1e-6
         BL = backward_eta * batch_size * length ** 2  # backward latency
         FL = forward_eta * batch_size * length ** 2  # forward latency
             
@@ -701,19 +693,25 @@ class DistributedLLM:
             fe = fb + FL  # forward end
             i = init_id  # initialize the index of the previous training tasks
             
+            # Handling dependencies and inter-task interference
+            offset = 0
             for i in range(init_id, len(previous_train_taskIDs)):
-                ptID = previous_train_taskIDs[i]
+                ptID: int = previous_train_taskIDs[i]  # training task ID
                 if fe <= self.train_trace[nodeID][ptID][stageID]['bb']:  # no interference
                     break
                 fb = max(fb, self.train_trace[nodeID][ptID][stageID]['be'])  # far dependency
                 fe = fb + FL
+
+                if pfe <= self.train_trace[nodeID][ptID][stageID]['bb']:  # this training task operates in between the previous and current tasks
+                    offset += backward_eta * batch_size * self.distributed_preloaded_tasks[nodeID][ptID].query['input_ids'].shape[1] ** 2
+
                 if stageID == 0: # this training task has finished
                     finished_ids.append(ptID)
                     
             # Write the forward and backward execution traces
             self.task_trace[nodeID][stageID]['fb'] = fb
             self.task_trace[nodeID][stageID]['fe'] = fe
-            II += max(fb - pfe - (i - init_id) * BL, 0)  # update II
+            II += max(fb - pfe - offset, 0)  # update II (subtract all backward latencies in between)
             init_id = i  # avoid recomputation in subsequent stages
         
         if do_backward:
@@ -784,12 +782,13 @@ class DistributedLLM:
     def globalScheduler(
         self, 
         taskQueue: queue.Queue, 
+        max_wait_time: int = 5,
     ):
         finished_producers = 0  
         # Global scheduler
         while True:
             try:
-                taskID = taskQueue.get(timeout=1)  # Add a timeout to avoid indefinite blocking
+                taskID = taskQueue.get(timeout=max_wait_time)  # Add a timeout to avoid indefinite blocking
             except queue.Empty:
                 print("GlobalScheduler: No tasks in queue. Waiting...")
                 continue
@@ -941,8 +940,6 @@ class DistributedLLM:
                 fe = record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
 
                 if stageID == 0: # first stage: unlock the producer for the next task
-                    # self.CURRENT_TRAINING_FINISHED = True
-                    # self.training_producer_lock.release()
                     self.training_status[task.task_id] = True  # Mark first-stage forward as completed
                 
                 self.task_trace[nodeID][stageID]['fe'] = fe
@@ -1011,9 +1008,9 @@ class DistributedLLM:
     ):
         # We use num_gpus_per_node workers to simulateously get task from the queue and inference
         with ThreadPoolExecutor(max_workers=self.num_gpus_per_node) as executor:
-            futures = []
+            # futures = []
             for stageID in range(self.num_gpus_per_node):
-                future = executor.submit(
+                executor.submit(
                     self.stage_inference, 
                     stageID,
                     nodeID,
@@ -1023,31 +1020,118 @@ class DistributedLLM:
                     nextdeviceQueue=node.device_queues[stageID+1] if stageID != len(self.distributed_stages[nodeID]) - 1 else None,
                     init_device=node.init_device,
                 )
-                futures.append(future)
-            for future in futures:
-                try:
-                    # Set a timeout for each task. Adjust the timeout value as needed.
-                    future.result(timeout=60)  # Timeout set to 60 seconds
-                except TimeoutError:
-                    # Handle the timeout, for example, by logging an error, retrying the task, or skipping it.
-                    print(f"Task execution exceeded the timeout limit and was aborted for Node {nodeID}")
-                except Exception as e:
-                    print(f"Exception occurred in Node {nodeID}, Stage {stageID}: {e}")
+            #     futures.append(future)
+            # for future in futures:
+            #     try:
+            #         # Set a timeout for each task. Adjust the timeout value as needed.
+            #         future.result(timeout=60)  # Timeout set to 60 seconds
+            #     except TimeoutError:
+            #         # Handle the timeout, for example, by logging an error, retrying the task, or skipping it.
+            #         print(f"Task execution exceeded the timeout limit and was aborted for Node {nodeID}")
+            #     except Exception as e:
+            #         print(f"Exception occurred in Node {nodeID}, Stage {stageID}: {e}")
                 
         print("Node {} finished inference".format(node.node_id))
 
 
     def execute_concurrently(self):
         with ThreadPoolExecutor(max_workers=len(self.distributed_nodes)) as executor:
-            futures = []
+            # futures = []
             for nodeID, node in self.distributed_nodes.items():
-                future = executor.submit(self.node_inference, nodeID, node)
-                futures.append(future)
-            for future in futures:
-                try:
-                    future.result(timeout=60)  # Set timeout to avoid indefinite waits
-                except TimeoutError:
-                    print(f"Task execution exceeded the timeout limit for Node {nodeID}.")
+                executor.submit(self.node_inference, nodeID, node)
+            #     futures.append(future)
+            # for future in futures:
+            #     try:
+            #         future.result(timeout=60)  # Set timeout to avoid indefinite waits
+            #     except TimeoutError:
+            #         print(f"Task execution exceeded the timeout limit for Node {nodeID}.")
+
+
+    def run(self):
+        # Run the stages concurrently
+        if self.RECORD_MODE:
+            print("\n ** Running in RECORD mode **\n")
+        
+        task_queue = queue.Queue()
+        self.producer_workers = 0  # One for the global scheduler and one for the executor
+        if self.training_taskIDs:
+            self.producer_workers += 1
+        if self.inference_taskIDs:
+            self.producer_workers += 1
+
+        # with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.producer_workers) as producer_executor, \
+             ThreadPoolExecutor(max_workers=1) as scheduler_executor, \
+             ThreadPoolExecutor(max_workers=1) as execution_executor:
+
+            # Submit producers
+            if self.inference_taskIDs:
+                producer_executor.submit(self.serving_producer, task_queue)
+            if self.training_taskIDs:
+                producer_executor.submit(self.training_producer, task_queue)
+            
+            # Submit global scheduler
+            scheduler_executor.submit(
+                self.globalScheduler,
+                task_queue,
+            )
+            # Submit execution tasks
+            execution_executor.submit(self.execute_concurrently)
+        
+        if self.RECORD_MODE:        
+            # Save recorded dict
+            losses = [loss for loss, _ in self.record_dict['loss']]
+            # Quantile (25, 50, 75) for record_dict['loss]
+            self.record_dict['loss_stats'] = {'mean': np.mean(losses), 'std': np.std(losses)}
+            for quantile in [10, 20, 30, 40, 50, 60, 70, 80, 90]:
+                self.record_dict['loss_stats'][f'{quantile}%'] = np.percentile(losses, quantile)
+                
+            loss_dict = {taskID: loss for (loss, taskID) in self.record_dict['loss']}
+            length_dict = {taskID: length for (length, taskID) in self.record_dict['length']}
+            # First get the forward dict where each taskID corresponds to multiple forward times
+            tmp = defaultdict(list)
+            for (ft, taskID) in self.record_dict['FTs']:
+                tmp[taskID].append(ft)
+            # Then take the sum of the forward times for each taskID
+            forward_dict = {taskID: np.mean(fts) for taskID, fts in tmp.items()}
+            forward_eta_dict = {taskID: et for et, taskID in self.record_dict['forward_etas']}
+            backward_dict = {taskID: bt for bt, taskID in self.record_dict['BTs']}
+            backward_eta_dict = {taskID: et for et, taskID in self.record_dict['backward_etas']}
+            self.record_dict['forward_eta'] = np.mean(list(forward_eta_dict.values()))
+            self.record_dict['backward_eta'] = np.mean(list(backward_eta_dict.values()))
+            self.record_dict['FT'] = np.mean(list(forward_dict.values()))
+            self.record_dict['BT'] = np.mean(list(backward_dict.values()))
+            
+            self.record_dict['task_dict'] = {
+                taskID: {
+                    'loss': loss_dict.get(taskID, 'None'),
+                    'length': length_dict.get(taskID, 'None'),
+                    'forward': forward_dict.get(taskID, 'None'),
+                    'backward': backward_dict.get(taskID, 'None'),
+                    'forward_eta': forward_eta_dict.get(taskID, 'None'),
+                    'backward_eta': backward_eta_dict.get(taskID, 'None'),
+                } for taskID in loss_dict
+            }
+            # Remove forward_etas, backward_etas, FTs, BTs, loss, length
+            for key in ['forward_etas', 'backward_etas', 'FTs', 'BTs', 'loss', 'length']:
+                self.record_dict.pop(key)
+            
+            # os.makedirs(self.profile_file, exist_ok=True)
+            with open(self.profile_file, 'w') as f:
+                json.dump(self.record_dict, f, indent=4)
+            
+        else:
+            # Delete checkpoint file in the disk if self.ckpt_path is not None
+            if self.ckpt_path is not None:
+                for j in range(self.num_gpus_per_node):
+                    if os.path.exists(f"{self.ckpt_path}_stage{j}.pt"):
+                        os.remove(f"{self.ckpt_path}_stage{j}.pt")
+            
+            # Save timing info
+            self.save_timing_info()
+            
+            # Calculate metrics
+            self.calculate_metrics()
         
         
     def save_timing_info(self):
@@ -1234,93 +1318,6 @@ class DistributedLLM:
         with open(stats_f, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {stats_f}")
-        
-        
-    def run(self):
-        # Run the stages concurrently
-        if self.RECORD_MODE:
-            print("\n ** Running in RECORD mode **\n")
-        
-        task_queue = queue.Queue()
-        self.producer_workers = 0  # One for the global scheduler and one for the executor
-        if self.training_taskIDs:
-            self.producer_workers += 1
-        if self.inference_taskIDs:
-            self.producer_workers += 1
-
-        # with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        with ThreadPoolExecutor(max_workers=self.producer_workers) as producer_executor, \
-             ThreadPoolExecutor(max_workers=1) as scheduler_executor, \
-             ThreadPoolExecutor(max_workers=1) as execution_executor:
-
-            # Submit producers
-            if self.inference_taskIDs:
-                producer_executor.submit(self.serving_producer, task_queue)
-            if self.training_taskIDs:
-                producer_executor.submit(self.training_producer, task_queue)
-            
-            # Submit global scheduler
-            scheduler_executor.submit(
-                self.globalScheduler,
-                task_queue,
-            )
-            # Submit execution tasks
-            execution_executor.submit(self.execute_concurrently)
-        
-        if self.RECORD_MODE:        
-            # Save recorded dict
-            losses = [loss for loss, _ in self.record_dict['loss']]
-            # Quantile (25, 50, 75) for record_dict['loss]
-            self.record_dict['loss_stats'] = {'mean': np.mean(losses), 'std': np.std(losses)}
-            for quantile in [10, 20, 30, 40, 50, 60, 70, 80, 90]:
-                self.record_dict['loss_stats'][f'{quantile}%'] = np.percentile(losses, quantile)
-                
-            loss_dict = {taskID: loss for (loss, taskID) in self.record_dict['loss']}
-            length_dict = {taskID: length for (length, taskID) in self.record_dict['length']}
-            # First get the forward dict where each taskID corresponds to multiple forward times
-            tmp = defaultdict(list)
-            for (ft, taskID) in self.record_dict['FTs']:
-                tmp[taskID].append(ft)
-            # Then take the sum of the forward times for each taskID
-            forward_dict = {taskID: np.mean(fts) for taskID, fts in tmp.items()}
-            forward_eta_dict = {taskID: et for et, taskID in self.record_dict['forward_etas']}
-            backward_dict = {taskID: bt for bt, taskID in self.record_dict['BTs']}
-            backward_eta_dict = {taskID: et for et, taskID in self.record_dict['backward_etas']}
-            self.record_dict['forward_eta'] = np.mean(list(forward_eta_dict.values()))
-            self.record_dict['backward_eta'] = np.mean(list(backward_eta_dict.values()))
-            self.record_dict['FT'] = np.mean(list(forward_dict.values()))
-            self.record_dict['BT'] = np.mean(list(backward_dict.values()))
-            
-            self.record_dict['task_dict'] = {
-                taskID: {
-                    'loss': loss_dict.get(taskID, 'None'),
-                    'length': length_dict.get(taskID, 'None'),
-                    'forward': forward_dict.get(taskID, 'None'),
-                    'backward': backward_dict.get(taskID, 'None'),
-                    'forward_eta': forward_eta_dict.get(taskID, 'None'),
-                    'backward_eta': backward_eta_dict.get(taskID, 'None'),
-                } for taskID in loss_dict
-            }
-            # Remove forward_etas, backward_etas, FTs, BTs, loss, length
-            for key in ['forward_etas', 'backward_etas', 'FTs', 'BTs', 'loss', 'length']:
-                self.record_dict.pop(key)
-            
-            # os.makedirs(self.profile_file, exist_ok=True)
-            with open(self.profile_file, 'w') as f:
-                json.dump(self.record_dict, f, indent=4)
-            
-        else:
-            # Delete checkpoint file in the disk if self.ckpt_path is not None
-            if self.ckpt_path is not None:
-                for j in range(self.num_gpus_per_node):
-                    if os.path.exists(f"{self.ckpt_path}_stage{j}.pt"):
-                        os.remove(f"{self.ckpt_path}_stage{j}.pt")
-            
-            # Save timing info
-            self.save_timing_info()
-            
-            # Calculate metrics
-            self.calculate_metrics()
 
     
     
