@@ -139,7 +139,7 @@ class DistributedDialoGPT(DistributedLLM):
                         
                         if self.backward_eta is None:
                             self.backward_eta = (be - bb) / (self.num_gpus_per_node * batch_size * input_length ** 2)
-                        # print("Stage {} finish backward propagation for task {} !".format(device, taskID))
+                        print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                         
                     except Exception as e:
                         # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")

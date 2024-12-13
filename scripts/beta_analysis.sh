@@ -16,9 +16,9 @@ NUM_NODES=4
 
 
 # for RATE_LAMBDA in 35 40 45 50 55 60 65 70 75 80; do
-for RATE_LAMBDA in 10 20 30 40 50 60 70 80 90 99; do
+for RATE_LAMBDA in 10 20 30 40 50 60 70 80 90; do
     # for RETRAIN_RATE in 0.01 0.05 0.1 0.15 0.2 0.25 0.3; do
-    for RETRAIN_RATE in 0.01 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 0.99; do
+    for RETRAIN_RATE in 0.01 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9; do
         for MODEL_NAME in "DialoGPT-small" "DialoGPT-medium" "DialoGPT-large"; do
             OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/$MODEL_NAME
             python distributed_dialogpt.py \

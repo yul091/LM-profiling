@@ -6,7 +6,7 @@ import logging
 from typing import Dict, Union, Any, List, Tuple, Optional, Callable
 import numpy as np
 import pandas as pd
-# from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import seaborn as sns
@@ -307,6 +307,23 @@ def get_total_params(module):
     for param in module.parameters():
         total_params += param.numel()
     return total_params
+
+
+def save_metrics_with_order(metrics: dict, filepath: str):
+    # Extract keys with float or int values
+    prioritized_keys = [k for k, v in metrics.items() if isinstance(v, (float, int))]
+    # Create a reordered dictionary
+    reordered_metrics = OrderedDict()
+    for key in prioritized_keys:
+        reordered_metrics[key] = metrics[key]  # Add prioritized keys first
+    for key, value in metrics.items():
+        if key not in prioritized_keys:
+            reordered_metrics[key] = value  # Add remaining keys
+    
+    # Save the reordered dictionary as JSON
+    with open(filepath, 'w') as f:
+        json.dump(reordered_metrics, f, indent=4)
+    print(f"Metrics saved with reordered keys to {filepath}")
 
 
 # def get_transformer_layers(

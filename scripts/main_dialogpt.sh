@@ -93,10 +93,13 @@ mkdir -p ${PROFILING_DIR}
 
 
 
-for MODEL_NAME in "DialoGPT-large"; do
-    for RATE_LAMBDA in 99; do
-        OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}
-        for RETRAIN_RATE in 0.1; do
+# for RATE_LAMBDA in 32 28 24 20 16 12 8 4 -1; do
+    # for RETRAIN_RATE in 0.1 0.3 0.5 0.7 0.9; do 
+        # for MODEL_NAME in "DialoGPT-large" "DialoGPT-medium" "DialoGPT-small"; do
+for RATE_LAMBDA in 32; do
+    for RETRAIN_RATE in 0.5; do
+        for MODEL_NAME in "DialoGPT-large"; do
+            OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}
             for TASK_ASSIGNMENT in "workload"; do
                 # nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,power.draw --format=csv,nounits -l 1 -f ${PROFILING_DIR}/${TASK_ASSIGNMENT}_${MODEL_NAME}_${NUM_NODES}-node_${RATE_LAMBDA}-rps_${RETRAIN_RATE}-rate.csv &
                 # NVIDIA_SMI_PID=$!
