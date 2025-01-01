@@ -3,35 +3,33 @@ BATCH_SIZE=1
 MEMORY_THRESHOLD=0.9
 SETTING=active  # "active" "isolated"
 WORKLOAD=poisson
-# TASK_ASSIGNMENT=workload  # "workload" "random" "rr" "util" "random+" "rr+" "util+"
-# LENGTH_DIST=random  # "ascending" "bursty" "random" "descending"
+# TASK_ASSIGNMENT=workload  # "workload" "rr" "util" "random+" "rr+" "util+"
+# LENGTH_DIST=random  # "ascending" "bursty" "descending"
 BASE_DIR=prof_main
 ALPHA=0.15
 BETA=0.05
 EPSILON=0.2
 K=0.5
-EXPERIMENTS=3  # each experiment run 1 times
-NUM_GPUS=8
+EXPERIMENTS=1  # each experiment run 1 times
 TOKEN="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"
 # export CUDA_LAUNCH_BLOCKING=1
 MODEL_NAME="Llama-2-13b-chat-hf" # "Llama-2-7b-chat-hf" "Llama-2-13b-chat-hf" "Llama-2-70b-chat-hf"
 # Ensure the folder for profiling output exists
 PROFILING_DIR="nvidia-profiling"
 mkdir -p ${PROFILING_DIR}
-NUM_NODES=4
+NUM_NODES=2
 
-for MODEL_NAME in "Llama-2-13b-chat-hf"; do
+for MODEL_NAME in "Llama-2-7b-chat-hf" "Llama-2-13b-chat-hf" "Llama-2-70b-chat-hf"; do
     for RATE_LAMBDA in 32 28 24 20 16 12 8 4 -1; do
         OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}
         for RETRAIN_RATE in 0.1 0.3 0.5 0.7 0.9; do
-            for TASK_ASSIGNMENT in "rr" "random" "util" "workload"; do
+            for TASK_ASSIGNMENT in "rr" "util" "workload"; do
                 nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,power.draw --format=csv,nounits -l 1 -f ${PROFILING_DIR}/${TASK_ASSIGNMENT}_${MODEL_NAME}_${NUM_NODES}-node_${RATE_LAMBDA}-rps_${RETRAIN_RATE}-rate.csv &
                 NVIDIA_SMI_PID=$!
                 python distributed_llama.py \
                     --model_name_or_path "meta-llama/${MODEL_NAME}" \
                     --access_token $TOKEN \
                     --model_name $MODEL_NAME \
-                    --num_gpus $NUM_GPUS \
                     --num_nodes $NUM_NODES \
                     --n_samples $NUM_SAMPLES \
                     --rate_lambda $RATE_LAMBDA \

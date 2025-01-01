@@ -1033,8 +1033,8 @@ class DistributedLLM:
                     self.train_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
                     self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
 
-                # with autocast():
-                tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
+                with autocast():
+                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 fe = record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
 
                 if stageID == 0: # first stage: unlock the producer for the next task
@@ -1055,8 +1055,8 @@ class DistributedLLM:
                     self.user_task_record[task.task_id]['start'] = fb
                     
                 with torch.no_grad():
-                    # with autocast():
-                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
+                    with autocast():
+                        tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 fe = record_time(device, 'end', 'forward', task.task_id, timing_info)
                 
                 self.task_trace[nodeID][stageID]['fe'] = fe

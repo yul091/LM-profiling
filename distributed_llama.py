@@ -6,6 +6,7 @@ import argparse
 import time
 from typing import List, Dict, Optional, Any, Union
 import logging
+from torch.cuda.amp import autocast
 from utils import record_time, Task
 from distributed_llm import DistributedLLM, set_seed, gc
 from models import (
@@ -137,7 +138,6 @@ class DistributedLlama(DistributedLLM):
                     try:
                         # loss.backward()
                         scaler.scale(loss).backward()
-
                         be = record_time(init_device, 'end', 'backward', taskID, timing_info)
                         self.task_trace[nodeID][0]['be'] = be
                         if taskID in self.train_trace[nodeID]:
