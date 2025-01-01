@@ -35,6 +35,8 @@ def plot_mix(args, ax: plt.Axes, node: int = None, start_time: float = None):
             stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-prior-profile_node{node}.json'
         elif no_memory_check:
             stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-memory-check_node{node}.json'
+        elif no_prioritization:
+            stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-prioritization_node{node}.json'
         else:
             stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
 
@@ -134,6 +136,7 @@ if __name__ == '__main__':
     parser.add_argument('--active_selection', type=str, default=None, help='active selection ratio for training tasks')
     parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     parser.add_argument('--no_memory_check', action='store_true', help='Whether to use memory checker before each execution')
+    parser.add_argument('--no_prioritization', action='store_true', help='Whether to use task prioritization (for LeMix only)')
     parser.add_argument('--test_asyncio', action='store_true')
     args = parser.parse_args()
     
@@ -146,6 +149,7 @@ if __name__ == '__main__':
     retraining_rate = args.retraining_rate
     no_prior_profile = args.no_prior_profile
     no_memory_check = args.no_memory_check
+    no_prioritization = args.no_prioritization
     task_assignment = f"{args.task_assignment}(a={args.alpha}|b={args.beta}|tau={args.epsilon})" if (args.task_assignment == 'workload' or '+' in args.task_assignment) else args.task_assignment
     length_distribution = args.length_distribution
     length_heterogeneity = f"hetero{args.length_heterogeneity}" if args.length_heterogeneity is not None else "hetero_default"
@@ -160,6 +164,8 @@ if __name__ == '__main__':
             stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-prior-profile_node{node}.json'
         elif no_memory_check:
             stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-memory-check_node{node}.json'
+        elif no_prioritization:
+            stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-prioritization_node{node}.json'
         else:
             stats_f = f'{output_dir}/timing_info_{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_node{node}.json'
 
@@ -184,6 +190,8 @@ if __name__ == '__main__':
         save_fig = f"{output_dir}/{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-prior-profile.png"
     elif no_memory_check:
         save_fig = f"{output_dir}/{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-memory-check.png"
+    elif no_prioritization:
+        save_fig = f"{output_dir}/{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}_no-prioritization.png"
     else:
         save_fig = f"{output_dir}/{model_name}_{task_assignment}_{setting}-{priority}_{workload}-{length_heterogeneity}-{length_distribution}_{retraining_rate}-{active_selection}.png"
         

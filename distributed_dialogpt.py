@@ -89,7 +89,13 @@ class DistributedDialoGPT(DistributedLLM):
                 
             if stageID == 0: # prepare inputs
                 task.feedback = inputs.pop('labels', None)
-                
+            
+            # Memory check and scale down if necessary
+            # if self.wait_for_device_availability(device):
+            #     tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
+            # else:
+            #     tuple_outputs = None
+            #     print(f"Failed waiting for device {device} to be available, dropping task {taskID}")
             tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
             task.hiddens[stageID] = None # clear the input that is no longer needed
              
@@ -123,7 +129,7 @@ class DistributedDialoGPT(DistributedLLM):
                     self.record_dict['loss'].append((loss.item(), taskID))
                     self.record_dict['length'].append((input_length, taskID))
                 
-                if task.do_backward and self.wait_for_device_availability(device, force_check=False):
+                if task.do_backward and self.wait_for_device_availability(device):
                     bb = time.time()
                     self.task_trace[nodeID][self.num_gpus_per_node-1]['bb'] = bb
                     if taskID in self.train_trace[nodeID]:
@@ -236,6 +242,7 @@ if __name__ == '__main__':
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
     parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     parser.add_argument('--no_memory_check', action='store_true', help='Whether to use memory checker before each execution')
+    parser.add_argument('--no_prioritization', action='store_true', help='Whether to use task prioritization (for LeMix only)')
     args = parser.parse_args()
     
     for i in range(args.experiments):

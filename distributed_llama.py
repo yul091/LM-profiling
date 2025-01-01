@@ -233,6 +233,7 @@ if __name__ == '__main__':
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
     parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     parser.add_argument('--no_memory_check', action='store_true', help='Whether to use memory checker before each execution')
+    parser.add_argument('--no_prioritization', action='store_true', help='Whether to use task prioritization (for LeMix only)')
     args = parser.parse_args()
     
     for i in range(args.experiments):

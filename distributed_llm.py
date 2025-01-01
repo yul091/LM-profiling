@@ -94,6 +94,7 @@ class DistributedLLM:
         self.run_mode = args.run_mode
         self.no_prior_profile = args.no_prior_profile
         self.no_memory_check = args.no_memory_check
+        self.no_prioritization = args.no_prioritization
         self.max_wait = args.max_wait
         
         os.makedirs(self.profile_dir, exist_ok=True)
@@ -579,11 +580,6 @@ class DistributedLLM:
             release = time.time()
             self.task_arrival[taskID]['release'] = release
             self.user_task_record[taskID]['release'] = release
-
-            # # Enqueue deprioritized tasks if any
-            # if not self.deprioritized_tasks.empty():
-            #     train_taskID = self.deprioritized_tasks.get()
-
             # print(f"Inference task {taskID} released at {release}")
 
 
@@ -599,14 +595,21 @@ class DistributedLLM:
         # Produce using the dataset
         IDs = self.training_taskIDs[::-1]
         prev_ID = None
-        while True:
+        while IDs or not self.deprioritized_tasks.empty():
             # log_queue_contents(taskQueue, nodeID=None, stageID=None)
-            if not IDs:
-                taskQueue.put(None)  # Signal the end of the dataset
-                print(f"Producer finished producing training tasks!")
-                break
-            
-            taskID = IDs.pop()  # Pop the last task ID
+            # if not IDs:
+            #     taskQueue.put(None)  # Signal the end of the dataset
+            #     print(f"Producer finished producing training tasks!")
+            #     break
+            if IDs and not self.deprioritized_tasks.empty():
+                # Pick the task with the highest priority (smallest ID)
+                taskID = IDs.pop() if IDs[-1] < self.deprioritized_tasks.queue[0] else self.deprioritized_tasks.get()
+                # taskID = IDs.pop()  # Pop the last task ID
+            elif IDs:
+                taskID = IDs.pop()
+            else:
+                taskID = self.deprioritized_tasks.get()
+
             start_time = time.time()  # Start timing for timeout
             while prev_ID is not None and not self.training_status[prev_ID]:  # Wait for the preceding task to complete
                 time.sleep(0.01)  # Sleep briefly to avoid busy waiting
@@ -619,10 +622,22 @@ class DistributedLLM:
             self.training_status[taskID] = False
             taskQueue.put(taskID)
             self.task_arrival[taskID]['release'] = time.time()
-            print(f"Training task {taskID} released at {self.task_arrival[taskID]['release']}.")
+            # print(f"Training task {taskID} released at {self.task_arrival[taskID]['release']}.")
             prev_ID = taskID
 
-        
+        taskQueue.put(None)  # Signal the end of the dataset
+        print(f"Producer finished producing training tasks!")
+
+        # # Enqueue deprioritized tasks if any
+        # if not self.deprioritized_tasks.empty():
+        #     train_taskID = self.deprioritized_tasks.get()
+        #     # taskQueue.put(train_taskID)
+        #     # If the last element in the queue is None (mark the end), insert the train_taskID just before that
+        #     if taskQueue.queue[-1] is None:
+        #         taskQueue.queue.insert(-1, train_taskID)
+        #     else:
+        #         taskQueue.put(train_taskID)
+        #     self.task_arrival[train_taskID]['release'] = time.time()
         
     # def _compute_LC(
     #     self, 
@@ -728,13 +743,13 @@ class DistributedLLM:
             self.all_trace[nodeID].pop(ptID)
                     
         # Compute reward (idleness profit and response time)
-        response = fe - self.task_arrival[taskID]['release']  # response time (R)
+        RT = fe - self.task_arrival[taskID]['release']  # response time (R)
         IP = -max(II/self.num_gpus_per_node - arrival_gap, self.epsilon)  # idleness profit (IP)
-        lc = self.distributed_nodes[nodeID].length_consistency(length)  # length consistency (LC)
-        priority = (IP + self.beta * lc) / (self.alpha * response)
-        # priority = IP / (self.alpha * response + self.beta * lc + self.epsilon)
+        LC = self.distributed_nodes[nodeID].length_consistency(length)  # length consistency (LC)
+        priority = (IP + self.beta * LC) / (self.alpha * RT)
+        # priority = IP / (self.alpha * RT + self.beta * LC + self.epsilon)
         
-        return priority
+        return priority, RT
             
         
     # @profile
@@ -755,16 +770,15 @@ class DistributedLLM:
         elif self.task_assignment == 'workload':
             # # Choose the node with the least workload (number of tasks in the first device queue)
             # return min(node_list, key=lambda nodeID: self.distributed_nodes[nodeID].device_queues[0].qsize())
-            priority_list = []
+            priority_list, rt_list = [], []
             for nodeID in node_list:
                 try:
-                    priority = self._compute_priority(nodeID, taskID, do_backward=do_backward)
+                    priority, RT = self._compute_priority(nodeID, taskID, do_backward=do_backward)
                 except Exception as e:
                     priority = random.random()
                     logging.error(f"[node {nodeID} | task {taskID}] Bubble calculation error occurred: {e}")
                 priority_list.append(priority)
-                # br_list.append(br)
-                # bi_list.append(bi)
+                rt_list.append(RT)
             
             # Greedy: assign task to the node with the highest reward (lowest average utilization)
             best_index = np.argmax(priority_list) 
@@ -774,50 +788,51 @@ class DistributedLLM:
             # reward_list = F.softmax(torch.FloatTensor(reward_list), dim=0).numpy()  
             # best_index = np.random.choice(range(len(reward_list)), p=reward_list)
             nodeID = node_list[best_index]
+            # rt = rt_list[best_index]
             # self.node_accumulated_bubble[nodeID] += bi_list[best_index] - br_list[best_index]
-            return nodeID 
+            return nodeID, rt_list, best_index 
         else:
             raise ValueError(f"Invalid task assignment method: {self.task_assignment}")
         
 
-    def estimate_response(self, trainID: int, nodeID: int = None) -> float:
-        """
-        Estimate the shortest response time of a task based on the current system state across all nodes.
-        """
-        print(f"Estimating response time for current training task {trainID}...")
-        forward_eta = self.froward_eta if self.froward_eta is not None else 2e-6
-        # backward_eta = self.backward_eta if self.backward_eta is not None else 1e-6
-        # batch_size, length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape
-        tb, tl = self.distributed_preloaded_tasks[nodeID][trainID].query['input_ids'].shape
-        FL_train = forward_eta * tb * tl ** 2  # training forward latency
-        # BL_train = backward_eta * tb * tl ** 2  # training backward latency
-        arrival = self.task_arrival[trainID]['release']  # arrival time
-        fb_train = arrival + FL_train * (self.num_gpus_per_node - 1)  # training forward start
-        # FL_next = forward_eta * batch_size * length ** 2  # forward latency
-        # arrival = self.task_arrival[taskID]['release'] # arrival time
-        # fb_next = arrival + FL_next * (self.num_gpus_per_node - 1)  # forward start
+    # def estimate_response(self, trainID: int, nodeID: int = None) -> float:
+    #     """
+    #     Estimate the shortest response time of a task based on the current system state across all nodes.
+    #     """
+    #     # print(f"Estimating response time for current training task {trainID}...")
+    #     forward_eta = self.froward_eta if self.froward_eta is not None else 2e-6
+    #     # backward_eta = self.backward_eta if self.backward_eta is not None else 1e-6
+    #     # batch_size, length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape
+    #     tb, tl = self.distributed_preloaded_tasks[nodeID][trainID].query['input_ids'].shape
+    #     FL_train = forward_eta * tb * tl ** 2  # training forward latency
+    #     # BL_train = backward_eta * tb * tl ** 2  # training backward latency
+    #     arrival = self.task_arrival[trainID]['release']  # arrival time
+    #     fb_train = arrival + FL_train * (self.num_gpus_per_node - 1)  # training forward start
+    #     # FL_next = forward_eta * batch_size * length ** 2  # forward latency
+    #     # arrival = self.task_arrival[taskID]['release'] # arrival time
+    #     # fb_next = arrival + FL_next * (self.num_gpus_per_node - 1)  # forward start
 
-        earlist_fe = float('inf')
-        if nodeID is None:
-            for nodeID in range(self.num_nodes):
-                previous_taskIDs = list(self.all_trace[nodeID].keys())
-                last_taskID = previous_taskIDs[-1] if previous_taskIDs else None
-                if last_taskID is None:
-                    earlist_fe = min(earlist_fe, fb_train + FL_train)
-                    continue
-                pfe = self.all_trace[nodeID][last_taskID][self.num_gpus_per_node - 1]['fe'] # previous forward end
-                fe = max(pfe, fb_train) + FL_train  # forward end
-                earlist_fe = min(earlist_fe, fe)
-        else:
-            previous_taskIDs = list(self.all_trace[nodeID].keys())
-            last_taskID = previous_taskIDs[-1] if previous_taskIDs else None
-            if last_taskID is None:
-                return FL_train * self.num_gpus_per_node
-            pfe = self.all_trace[nodeID][last_taskID][self.num_gpus_per_node - 1]['fe'] # previous forward end
-            fe = max(pfe, fb_train) + FL_train  # forward end
-            earlist_fe = min(earlist_fe, fe)
+    #     earlist_fe = float('inf')
+    #     if nodeID is None:
+    #         for nodeID in range(self.num_nodes):
+    #             previous_taskIDs = list(self.all_trace[nodeID].keys())
+    #             last_taskID = previous_taskIDs[-1] if previous_taskIDs else None
+    #             if last_taskID is None:
+    #                 earlist_fe = min(earlist_fe, fb_train + FL_train)
+    #                 continue
+    #             pfe = self.all_trace[nodeID][last_taskID][self.num_gpus_per_node - 1]['fe'] # previous forward end
+    #             fe = max(pfe, fb_train) + FL_train  # forward end
+    #             earlist_fe = min(earlist_fe, fe)
+    #     else:
+    #         previous_taskIDs = list(self.all_trace[nodeID].keys())
+    #         last_taskID = previous_taskIDs[-1] if previous_taskIDs else None
+    #         if last_taskID is None:
+    #             return FL_train * self.num_gpus_per_node
+    #         pfe = self.all_trace[nodeID][last_taskID][self.num_gpus_per_node - 1]['fe'] # previous forward end
+    #         fe = max(pfe, fb_train) + FL_train  # forward end
+    #         earlist_fe = min(earlist_fe, fe)
 
-        return earlist_fe - arrival
+    #     return earlist_fe - arrival
 
 
         
@@ -889,7 +904,10 @@ class DistributedLLM:
             # Task assignment
             assign_start = time.time()
             if self.setting != 'isolated':
-                nodeID = self.assign_node(node_list=list(range(self.used_nodes)), taskID=taskID, do_backward=do_backward)
+                if self.task_assignment == 'workload':
+                    nodeID, RTs, best_index = self.assign_node(node_list=list(range(self.num_nodes)), taskID=taskID, do_backward=do_backward)
+                else:
+                    nodeID = self.assign_node(node_list=list(range(self.used_nodes)), taskID=taskID, do_backward=do_backward)
             else:
                 ########################## Dynamic separate ########################
                 test_nodes = self._test_nodes
@@ -908,11 +926,11 @@ class DistributedLLM:
 
             # Priotization based on the node states
             # If this task is a training task, do SLO check for the next inference task (only for LeMix)
-            if do_backward and self.task_assignment == 'workload':
-                estimated_response_time = self.estimate_response(taskID, nodeID=nodeID)
-                if estimated_response_time > 5 * self.slo_threshold:  # (5x SLO goal)
+            if self.task_assignment == 'workload' and (not self.no_prioritization) and do_backward and (finished_producers == 0):
+                # estimated_response_time = self.estimate_response(taskID, nodeID=nodeID)
+                if RTs[best_index] > 5 * self.slo_threshold:  # (5x SLO goal)
                     # SLO violation
-                    print(f"SLO violation detected for current training task {taskID}. Deprioritizing it in a temp queue {self.deprioritized_tasks.queue}.")
+                    # print(f"SLO violation detected for current training task {taskID}. Deprioritizing it in a temp queue {self.deprioritized_tasks.qsize()}.")
                     # Reorder the queue: place the current training task in a temporary queue
                     self.deprioritized_tasks.put(taskID)
                     self.training_status[taskID] = True  # Temporarily mark the task as completed to avoid indefinite blocking
@@ -1006,7 +1024,7 @@ class DistributedLLM:
     ) -> Tuple[torch.Tensor, ...]:
         # Memory check and scale down if necessary
         self.wait_for_device_availability(device)
-        
+
         try:
             if task.require_training: # this is a training task
                 fb = record_time(device, 'start', 'forward_grad', task.task_id, timing_info)
@@ -1230,6 +1248,8 @@ class DistributedLLM:
                 stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-prior-profile_node{nodeID}.json'
             elif self.no_memory_check:
                 stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-memory-check_node{nodeID}.json'
+            elif self.no_prioritization:
+                stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-prioritization_node{nodeID}.json'
             else:
                 stats_f = f'{self.output_dir}/timing_info_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_node{nodeID}.json'
             with open(stats_f, 'w') as f:
@@ -1304,13 +1324,14 @@ class DistributedLLM:
         # Calculate response times
         metrics['num_tasks'] = self.total_tasks
         metrics['retrain_tasks'] = self.retraining_tasks
-        # metrics['actual_retrained_tasks'] = len(self._trained_task_lengths)
+        metrics['actual_retrained_tasks'] = len(self._trained_task_lengths)
         metrics['user_tasks'] = len(self.user_task_record)
         metrics['SLO 1x'] = self.slo_threshold
         metrics['bubble_rate'] = bubble_rate 
         metrics['total_runtime'] = total_runtime
         metrics['end2end_latency'] = global_max_time - global_min_time
-        metrics['throughput'] = self.total_tasks / (global_max_time - global_min_time)
+        # metrics['throughput'] = self.total_tasks / (global_max_time - global_min_time)
+        metrics['throughput'] = self.total_tasks / total_runtime
         metrics['num_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].num_tasks for nodeID in self.distributed_nodes}
         metrics['retrain_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].train_tasks for nodeID in self.distributed_nodes}
         metrics['user_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].test_tasks for nodeID in self.distributed_nodes}
@@ -1376,6 +1397,7 @@ class DistributedLLM:
             metrics['SLO attainment (1x)'] = sum([1 for rt in response_times if rt <= self.slo_threshold]) / len(response_times) if response_times else 0
             metrics['SLO attainment (5x)'] = sum([1 for rt in response_times if rt <= 5 * self.slo_threshold]) / len(response_times) if response_times else 0
             metrics['SLO attainment (10x)'] = sum([1 for rt in response_times if rt <= 10 * self.slo_threshold]) / len(response_times) if response_times else 0
+            metrics['user_task_record'] = self.user_task_record
             
         metrics['idles'] = total_idles # list
         if self.training_taskIDs:
@@ -1397,6 +1419,8 @@ class DistributedLLM:
             stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-prior-profile_ID={self.experimentID}.json'
         elif self.no_memory_check:
             stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-memory-check_ID={self.experimentID}.json'
+        elif self.no_prioritization:
+            stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_no-prioritization_ID={self.experimentID}.json'
         else:
             stats_f = f'{self.output_dir}/metrics_{self.model_n}_{task_assignment}_{setting}-{self.priority}_{self.workload}-{length_heterogeneity}-{self.length_distribution}_{self.retraining_rate}-{active_selection}_ID={self.experimentID}.json'
         # with open(stats_f, 'w') as f:
@@ -1452,6 +1476,7 @@ if __name__ == '__main__':
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
     parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     parser.add_argument('--no_memory_check', action='store_true', help='Whether to use memory checker before each execution')
+    parser.add_argument('--no_prioritization', action='store_true', help='Whether to use task prioritization (for LeMix only)')
     args = parser.parse_args()
     
     for i in range(args.experiments):
