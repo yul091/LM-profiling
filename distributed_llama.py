@@ -88,8 +88,14 @@ class DistributedLlama(DistributedLLM):
                 
             if stageID == 0: # prepare inputs
                 task.feedback = inputs.pop('labels', None)
-                
-            tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
+
+            # Memory check and scale down if necessary
+            if self.wait_for_device_availability(device):
+                tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
+            else:
+                tuple_outputs = None
+                print(f"Failed waiting for device {device} to be available, dropping task {taskID}")
+            # tuple_outputs = self.forward(task, inputs, stageID, nodeID, device, timing_info)
             task.hiddens[stageID] = None # clear the input that is no longer needed
 
             if tuple_outputs is None:  # Error occurred

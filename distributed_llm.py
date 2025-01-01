@@ -1023,7 +1023,7 @@ class DistributedLLM:
         timing_info: Dict[str, List[float]],
     ) -> Tuple[torch.Tensor, ...]:
         # Memory check and scale down if necessary
-        self.wait_for_device_availability(device)
+        # self.wait_for_device_availability(device)
 
         try:
             if task.require_training: # this is a training task

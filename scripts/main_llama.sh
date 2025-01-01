@@ -1,14 +1,14 @@
 NUM_SAMPLES=334
 BATCH_SIZE=1
-MEMORY_THRESHOLD=0.5
+MEMORY_THRESHOLD=0.9
 SETTING=active  # "active" "isolated"
 WORKLOAD=poisson
 # TASK_ASSIGNMENT=workload  # "workload" "random" "rr" "util" "random+" "rr+" "util+"
 # LENGTH_DIST=random  # "ascending" "bursty" "random" "descending"
 BASE_DIR=prof_main
-ALPHA=0.05
-BETA=0.1
-EPSILON=0.5
+ALPHA=0.15
+BETA=0.05
+EPSILON=0.2
 K=0.5
 EXPERIMENTS=3  # each experiment run 1 times
 NUM_GPUS=8
@@ -21,7 +21,7 @@ mkdir -p ${PROFILING_DIR}
 NUM_NODES=4
 
 for MODEL_NAME in "Llama-2-13b-chat-hf"; do
-    for RATE_LAMBDA in 4 8 12 16 20 24 28 32 -1; do
+    for RATE_LAMBDA in 32 28 24 20 16 12 8 4 -1; do
         OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}
         for RETRAIN_RATE in 0.1 0.3 0.5 0.7 0.9; do
             for TASK_ASSIGNMENT in "rr" "random" "util" "workload"; do
