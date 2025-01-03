@@ -135,6 +135,8 @@ class DistributedDialoGPT(DistributedLLM):
                     if taskID in self.train_trace[nodeID]:
                         self.train_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
                         self.all_trace[nodeID][taskID][self.num_gpus_per_node-1]['bb'] = bb # update the recorded time
+
+                    # Do backward propagation
                     try:
                         loss.backward()
                         be = record_time(init_device, 'end', 'backward', taskID, timing_info)
@@ -150,6 +152,9 @@ class DistributedDialoGPT(DistributedLLM):
                     except Exception as e:
                         # logging.error(f"[node {nodeID} | stage {stageID}] Backward error occurred: {e}")
                         pass
+
+                    if self.PP == 'sync':  # If S-PP is used, we need to let the scheduler know that the task is done
+                        self.training_status[taskID] = True
                     
                     self._trained_task_lengths.append(input_length)
 
@@ -240,6 +245,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
+    parser.add_argument('--PP', type=str, default='async', choices=['sync', 'async'], help='Implement A-PP or S-PP for training tasks')
     parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     parser.add_argument('--no_memory_check', action='store_true', help='Whether to use memory checker before each execution')
     parser.add_argument('--no_prioritization', action='store_true', help='Whether to use task prioritization (for LeMix only)')

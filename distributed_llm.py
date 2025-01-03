@@ -83,6 +83,7 @@ class DistributedLLM:
         self.dataset_name_or_path = args.dataset_name_or_path
         self.lr = args.lr
         self.workload = args.workload
+        self.PP = args.PP
         self.retraining_rate = args.retraining_rate  
         self.model_n = args.model_name
         self.save_length = args.save_length
@@ -639,45 +640,6 @@ class DistributedLLM:
         #         taskQueue.put(train_taskID)
         #     self.task_arrival[train_taskID]['release'] = time.time()
         
-    # def _compute_LC(
-    #     self, 
-    #     task_length: int,
-    #     mean_length: int = None,
-    #     std_length: int = None,
-    # ): # Gaussian probability based on task length as length heterogeneity
-    #     mean_length = self.mean_length if mean_length is None else mean_length
-    #     std_length = self.std_length if std_length is None else std_length
-    #     return (1 / (std_length * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((task_length - mean_length) / std_length) ** 2)
-        
-    
-    # def check_do_backward(
-    #     self, 
-    #     taskID: int,
-    #     task_length: int,
-    #     training_step: int,
-    #     total_training_tasks: int,
-    #     # nodeID: int,
-    # ) -> bool:
-    #     # print("Selective algorithm will be implemented!")
-    #     # LC = self._compute_node_LC(nodeID, task_length)
-    #     if self.active_selection is None:
-    #         return True
-    #     # if '-' in self.active_selection: 
-    #     # check if the string is a float number
-    #     policy, _ = self.active_selection.split('-')
-    #     if policy != 'adaptive':
-    #         do_backward = taskID in self.backward_taskIDs
-    #     else:
-    #         if self.no_prior_profile:
-    #             P_l = self._compute_LC(task_length)
-    #             P_adjusted = self.k * P_l + (1 - self.k) * (1 - (training_step / total_training_tasks))
-    #             # P_adjusted = P_l
-    #         else:
-    #             P_adjusted = self.k * int(taskID in self.loss_taskIDs) + (1 - self.k) * int(taskID in self.length_taskIDs)
-    #         do_backward = P_adjusted > random.random()
-        
-    #     return do_backward
-        
         
     # @profile 
     def _compute_priority(self, nodeID: int, taskID: int, do_backward: bool = False) -> float:
@@ -1033,11 +995,11 @@ class DistributedLLM:
                     self.train_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
                     self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
 
-                with autocast():
-                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
+                # with autocast():
+                tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 fe = record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
 
-                if stageID == 0: # first stage: unlock the producer for the next task
+                if stageID == 0 and self.PP == 'async': # first stage: unlock the producer for the next task
                     self.training_status[task.task_id] = True  # Mark first-stage forward as completed
                 
                 self.task_trace[nodeID][stageID]['fe'] = fe
@@ -1055,8 +1017,8 @@ class DistributedLLM:
                     self.user_task_record[task.task_id]['start'] = fb
                     
                 with torch.no_grad():
-                    with autocast():
-                        tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
+                    # with autocast():
+                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
                 fe = record_time(device, 'end', 'forward', task.task_id, timing_info)
                 
                 self.task_trace[nodeID][stageID]['fe'] = fe
@@ -1079,7 +1041,7 @@ class DistributedLLM:
                 
         except Exception as e:
             logging.error(f"[Node {nodeID} - stage {stageID} - device {device}] Forward error occurred: {e}")
-            if stageID == 0:
+            if stageID == 0  and self.PP == 'async':
                 self.training_status[task.task_id] = True  # Mark first-stage forward as completed
             tuple_outputs = None
         
@@ -1474,6 +1436,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='prof')
     parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
+    parser.add_argument('--PP', type=str, default='async', choices=['sync', 'async'], help='Implement A-PP or S-PP for training tasks')
     parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     parser.add_argument('--no_memory_check', action='store_true', help='Whether to use memory checker before each execution')
     parser.add_argument('--no_prioritization', action='store_true', help='Whether to use task prioritization (for LeMix only)')

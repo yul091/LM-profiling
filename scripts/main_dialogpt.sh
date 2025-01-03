@@ -1,11 +1,11 @@
 NUM_SAMPLES=1000
 BATCH_SIZE=3
-MEMORY_THRESHOLD=0.5
+MEMORY_THRESHOLD=0.9
 SETTING=active # "active" "isolated"
 WORKLOAD=poisson
 # TASK_ASSIGNMENT=workload # "workload" "rr" "util" "random+" "rr+" "util+"
 # LENGTH_DIST=random # "ascending" "bursty" "descending"
-BASE_DIR=prof_new_new
+BASE_DIR=prof_SPP
 # MODEL_NAME="DialoGPT-large" # "DialoGPT-medium" "DialoGPT-small"
 ALPHA=0.15
 BETA=0.05
@@ -13,10 +13,10 @@ EPSILON=0.2
 K=0.5
 EXPERIMENTS=3 # each experiment run 3 times
 # NUM_NODES=4
-PROFILING_DIR="nvidia-profiling_new"
+PROFILING_DIR="nvidia-profiling_SPP"
 mkdir -p ${PROFILING_DIR}
 
-# "DialoGPT-small" "DialoGPT-medium" 
+# S-PP training
 for NUM_NODES in 4; do
     for MODEL_NAME in  "DialoGPT-large" "DialoGPT-medium" "DialoGPT-small"; do
         for RATE_LAMBDA in 4 8 12 16 20 24 28 32 -1; do
@@ -41,6 +41,7 @@ for NUM_NODES in 4; do
                         --beta $BETA \
                         --epsilon $EPSILON \
                         --k $K \
+                        --PP "sync" \
                         --experiments $EXPERIMENTS \
                         --memory_threshold $MEMORY_THRESHOLD
                     
@@ -73,6 +74,7 @@ for NUM_NODES in 4; do
                     --task_assignment 'rr' \
                     --output_dir $OUTPUT_DIR \
                     --batch_size $BATCH_SIZE \
+                    --PP "sync" \
                     --experiments $EXPERIMENTS \
                     --memory_threshold $MEMORY_THRESHOLD
 

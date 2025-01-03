@@ -151,6 +151,9 @@ class DistributedLlama(DistributedLLM):
                     except Exception as e:
                         # logging.error(f"[node {nodeID} | stage {stageID} | task {taskID}] Backward error occurred: {e}")
                         pass
+
+                    if self.PP == 'sync':  # If S-PP is used, we need to let the scheduler know that the task is done
+                        self.training_status[taskID] = True
                     
                     self._trained_task_lengths.append(input_length)
 
@@ -237,6 +240,7 @@ if __name__ == '__main__':
     parser.add_argument('--profile_dir', type=str, default='profile', help='directory to save profiling results')
     parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
     parser.add_argument('--run_mode', type=str, default='online', choices=['online', 'offline'], help='Whether to use RECORD MODEL for offline profiling')
+    parser.add_argument('--PP', type=str, default='async', choices=['sync', 'async'], help='Implement A-PP or S-PP for training tasks')
     parser.add_argument('--no_prior_profile', action='store_true', help='Whether to use offline profiling results as prior')
     parser.add_argument('--no_memory_check', action='store_true', help='Whether to use memory checker before each execution')
     parser.add_argument('--no_prioritization', action='store_true', help='Whether to use task prioritization (for LeMix only)')

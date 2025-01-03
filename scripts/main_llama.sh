@@ -1,6 +1,6 @@
 NUM_SAMPLES=334
 BATCH_SIZE=1
-MEMORY_THRESHOLD=0.9
+MEMORY_THRESHOLD=0.7
 SETTING=active  # "active" "isolated"
 WORKLOAD=poisson
 # TASK_ASSIGNMENT=workload  # "workload" "rr" "util" "random+" "rr+" "util+"
@@ -19,7 +19,7 @@ PROFILING_DIR="nvidia-profiling"
 mkdir -p ${PROFILING_DIR}
 NUM_NODES=2
 
-for MODEL_NAME in "Llama-2-7b-chat-hf" "Llama-2-13b-chat-hf" "Llama-2-70b-chat-hf"; do
+for MODEL_NAME in "Llama-2-70b-chat-hf"; do
     for RATE_LAMBDA in 32 28 24 20 16 12 8 4 -1; do
         OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}
         for RETRAIN_RATE in 0.1 0.3 0.5 0.7 0.9; do
