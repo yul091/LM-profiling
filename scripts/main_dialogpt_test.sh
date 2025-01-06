@@ -17,11 +17,11 @@ PROFILING_DIR="nvidia-profiling_test"
 mkdir -p ${PROFILING_DIR}
 
 # S-PP training
-for NUM_NODES in 4; do
+for NUM_NODES in 2; do
     for MODEL_NAME in  "DialoGPT-large"; do
-        for RATE_LAMBDA in 16; do
+        for RATE_LAMBDA in 32; do
             OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}
-            for RETRAIN_RATE in 0.3; do
+            for RETRAIN_RATE in 0.0; do
                 for TASK_ASSIGNMENT in "rr"; do
                     nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,power.draw --format=csv,nounits -l 1 -f ${PROFILING_DIR}/${TASK_ASSIGNMENT}_${MODEL_NAME}_${NUM_NODES}-node_${RATE_LAMBDA}-rps_${RETRAIN_RATE}-rate.csv &
                     NVIDIA_SMI_PID=$!

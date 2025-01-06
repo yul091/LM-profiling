@@ -78,13 +78,18 @@ class DistributedDialoGPT(DistributedLLM):
     
             # For inference tasks, handle batching dynamically at the first stage
             if stageID == 0 and not task.require_training:
+                while True:
+                    if not self.node_batch_executing[nodeID]:  # If the current batch is done, exit the loop
+                        break
+                    time.sleep(0.01)
+
                 if not self.node_batches[nodeID]:
                     task.start = time.time()
                 
                 self.node_batches[nodeID].append(task)
                 # Append the task to the current batch if it doesn't exceed batch size or max wait time
-                if (len(self.node_batches[nodeID]) < self.batch_size) and (time.time() - self.node_batches[nodeID][0].start < 0.3):
-                    time.sleep(0.1)  # Wait for more tasks to arrive
+                if (len(self.node_batches[nodeID]) < self.batch_size) and (time.time() - self.node_batches[nodeID][0].start < 0.1):
+                    time.sleep(0.01)  # Wait for more tasks to arrive
                     continue
 
                 # Use the data collator to pad and combine the batch
@@ -97,7 +102,7 @@ class DistributedDialoGPT(DistributedLLM):
                 task.query = _prepare_inputs(collated_batch, device=init_device)
                 task.feedback = _prepare_inputs(collated_batch['labels'], device=self.distributed_nodes[nodeID].last_device)
                 task.hiddens[stageID] = task.query
-                self.node_batches[nodeID].clear()  # Clear the batch
+                self.node_batch_executing[nodeID] = True
 
             inputs = task.hiddens[stageID]
 
@@ -150,6 +155,8 @@ class DistributedDialoGPT(DistributedLLM):
                     self.metrics["inference_loss"].append(loss.item())
                     print("[Inference loss={}] stage {} finished task {}".format(loss, device, taskID))
                     # self.node_batches[nodeID] = None  # clear the batch
+                    self.node_batches[nodeID].clear()  # Clear the batch
+                    self.node_batch_executing[nodeID] = False
                 
                 if self.RECORD_MODE:
                     self.record_dict['loss'].append((loss.item(), taskID))

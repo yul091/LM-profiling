@@ -295,6 +295,8 @@ class DistributedLLM:
                 collate_fn=self.data_collator,
             )
             self.training_taskIDs = self.get_preloaded_training_tasks(self.distributed_preloaded_tasks)
+        else:
+            self.training_taskIDs = []
         if self.num_inference_samples != 0:
             self.test_set = self.dataset.select(range(self.num_training_samples, len(self.dataset)))
             # self.test_dataloader = DataLoader(
@@ -303,6 +305,8 @@ class DistributedLLM:
             #     collate_fn=self.data_collator,
             # )
             self.inference_taskIDs = self.get_preloaded_inference_tasks(self.distributed_preloaded_tasks)
+        else:
+            self.inference_taskIDs = []
         
         self.total_tasks = len(self.training_taskIDs) + len(self.inference_taskIDs)
         self.retraining_tasks = len(self.training_taskIDs)
@@ -365,6 +369,7 @@ class DistributedLLM:
             ) for nodeID in range(self.num_nodes)
         }
         self.node_batches = {nodeID: [] for nodeID in range(self.num_nodes)}
+        self.node_batch_executing = {nodeID: False for nodeID in range(self.num_nodes)}
 
 
     def get_preloaded_training_tasks(self, distributed_preloaded_tasks: Dict[int, list]) -> List[int]:
@@ -719,47 +724,6 @@ class DistributedLLM:
             return nodeID, rt_list, best_index 
         else:
             raise ValueError(f"Invalid task assignment method: {self.task_assignment}")
-        
-
-    # def estimate_response(self, trainID: int, nodeID: int = None) -> float:
-    #     """
-    #     Estimate the shortest response time of a task based on the current system state across all nodes.
-    #     """
-    #     # print(f"Estimating response time for current training task {trainID}...")
-    #     forward_eta = self.froward_eta if self.froward_eta is not None else 2e-6
-    #     # backward_eta = self.backward_eta if self.backward_eta is not None else 1e-6
-    #     # batch_size, length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape
-    #     tb, tl = self.distributed_preloaded_tasks[nodeID][trainID].query['input_ids'].shape
-    #     FL_train = forward_eta * tb * tl ** 2  # training forward latency
-    #     # BL_train = backward_eta * tb * tl ** 2  # training backward latency
-    #     arrival = self.task_arrival[trainID]['release']  # arrival time
-    #     fb_train = arrival + FL_train * (self.num_gpus_per_node - 1)  # training forward start
-    #     # FL_next = forward_eta * batch_size * length ** 2  # forward latency
-    #     # arrival = self.task_arrival[taskID]['release'] # arrival time
-    #     # fb_next = arrival + FL_next * (self.num_gpus_per_node - 1)  # forward start
-
-    #     earlist_fe = float('inf')
-    #     if nodeID is None:
-    #         for nodeID in range(self.num_nodes):
-    #             previous_taskIDs = list(self.all_trace[nodeID].keys())
-    #             last_taskID = previous_taskIDs[-1] if previous_taskIDs else None
-    #             if last_taskID is None:
-    #                 earlist_fe = min(earlist_fe, fb_train + FL_train)
-    #                 continue
-    #             pfe = self.all_trace[nodeID][last_taskID][self.num_gpus_per_node - 1]['fe'] # previous forward end
-    #             fe = max(pfe, fb_train) + FL_train  # forward end
-    #             earlist_fe = min(earlist_fe, fe)
-    #     else:
-    #         previous_taskIDs = list(self.all_trace[nodeID].keys())
-    #         last_taskID = previous_taskIDs[-1] if previous_taskIDs else None
-    #         if last_taskID is None:
-    #             return FL_train * self.num_gpus_per_node
-    #         pfe = self.all_trace[nodeID][last_taskID][self.num_gpus_per_node - 1]['fe'] # previous forward end
-    #         fe = max(pfe, fb_train) + FL_train  # forward end
-    #         earlist_fe = min(earlist_fe, fe)
-
-    #     return earlist_fe - arrival
-
 
         
     # @profile
