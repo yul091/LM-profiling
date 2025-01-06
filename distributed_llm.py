@@ -913,17 +913,7 @@ class DistributedLLM:
             #     # print(f"Task {taskID} waiting due to queue limit on Node {nodeID}")
             #     time.sleep(0.01)  # Brief wait to avoid busy-waiting
 
-            if self.setting == 'interval':
-                seq_length = self.distributed_preloaded_tasks[0][taskID].query['input_ids'].shape[1]
-                if self.priority is None or self.priority == 'LLF':
-                    priority = seq_length
-                elif self.priority == 'MLF':
-                    priority = -seq_length
-                else:
-                    raise ValueError(f"Invalid priority type: {self.priority}")
-                self.distributed_nodes[nodeID].device_queues[0].put((priority, taskID))
-            else:
-                self.distributed_nodes[nodeID].device_queues[0].put((taskID, taskID))
+            self.distributed_nodes[nodeID].device_queues[0].put((taskID, taskID))
             
             # Record the node allocation 
             self.distributed_nodes[nodeID].update_length_stats(

@@ -83,9 +83,7 @@ class DistributedDialoGPT(DistributedLLM):
                 print("Stage {} waiting for task {}".format(device, taskID))
                 continue   
 
-            # # Check memory usage and offload if necessary
-            # if not self.check_device_availability(device):
-            #     inputs = self.offload_to_cpu(inputs)
+            # print(f"task query: {task.query.keys()}")
                 
             if stageID == 0: # prepare inputs
                 task.feedback = inputs.pop('labels', None)

@@ -1,6 +1,6 @@
 NUM_SAMPLES=1000
 BATCH_SIZE=3
-MEMORY_THRESHOLD=0.9
+MEMORY_THRESHOLD=0.8
 SETTING=active # "active" "isolated"
 WORKLOAD=poisson
 # TASK_ASSIGNMENT=workload # "workload" "rr" "util" "random+" "rr+" "util+"

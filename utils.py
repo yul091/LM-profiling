@@ -269,6 +269,7 @@ class Task:
         node_id: Optional[int] = None, 
         num_gpus_per_node: Optional[int] = None,
         require_training: Optional[bool] = None,
+        start: Optional[float] = None,
     ):
         self.task_id = task_id
         self.query = query
@@ -278,8 +279,10 @@ class Task:
         self.feedback = feedback
         self.node_id = node_id if node_id is not None else 0
         self.require_training = False if require_training is None else require_training
+        self.task_ids = [task_id]  # For inference tasks, we may have multiple task_ids in continous batching
         # Define do_backward for selective training: initially set to require_training
         self.do_backward = False if require_training is None else require_training
+        self.start = start
 
 
 def record_time(
