@@ -459,7 +459,8 @@ class DistributedLLM:
             lamda = self.rate_lambda if self.rate_lambda != -1 else inference_lambdas[index]
 
             # Prepare decode input
-            inputs = _prepare_decoding_inputs(batch)
+            # inputs = _prepare_decoding_inputs(batch)
+            inputs = batch
             for nodeID, node in self.distributed_nodes.items():
                 task = Task(
                     task_id=taskID,
@@ -612,14 +613,11 @@ class DistributedLLM:
         """
         Predict the execution traces for the incoming task and compute the reward (bubble rate & response time).
         """
-        if do_backward:
-            batch_size, length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape
-        else:  # For inference tasks, handle batching dynamically 
-            new_length = len(self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'])
-            if not self.node_batches[nodeID]:
-                batch_size, length = 1, new_length
-            else:
-                batch_size, length = len(self.node_batches[nodeID]) + 1, max([len(task.query['input_ids']) for task in self.node_batches[nodeID]] + [new_length])
+        batch_size, new_length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape
+        if not self.node_batches[nodeID]:
+            batch_size, length = 1, new_length
+        else:
+            batch_size, length = len(self.node_batches[nodeID]) + 1, max([t.query['input_ids'].shape[1] for t in self.node_batches[nodeID]] + [new_length])
 
         # Initialize bubble rate and response time
         fb = self.task_arrival[taskID]['release']  # arrival time
@@ -930,7 +928,7 @@ class DistributedLLM:
                         else:
                             self.user_task_record[task.task_id]['decode_end'] = fe
                             self.decodes[nodeID] += 1
-                            logging.info(f"[Node {nodeID}] Task {task.task_id} (with length {seq_length}) finished decode pass!")
+                            logging.info(f"[Node {nodeID}] Task {task.task_id} (with length {seq_length}) finished decode step {task.decode_step}!")
                         self.tokens_generated[nodeID] += 1
                         task.decode_step += 1
                     
@@ -1217,7 +1215,7 @@ class DistributedLLM:
         metrics['throughput (prefill)'] = sum(self.prefills.values()) / total_runtime
         metrics['throughput (decode)'] = sum(self.decodes.values()) / total_runtime
         metrics['generation_length'] = averge_decode_steps
-        metrics['generation_length (node)'] = {nodeID: np.mean(node_decode_steps[nodeID]) for nodeID in node_decode_steps} 
+        metrics['generation_length (node)'] = {nodeID: np.mean(node_decode_steps[nodeID]) if node_decode_steps[nodeID] else 0 for nodeID in node_decode_steps} 
         # metrics['generation_lengths'] = decode_steps
         metrics['num_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].num_tasks for nodeID in self.distributed_nodes}
         metrics['retrain_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].train_tasks for nodeID in self.distributed_nodes}

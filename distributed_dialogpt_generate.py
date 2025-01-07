@@ -183,10 +183,10 @@ class DistributedDialoGPT(DistributedLLM):
                 loss = tuple_outputs[0]
                 if task.require_training:
                     self.metrics["train_loss"].append(loss.item())
-                    print("[Train loss={}] stage {} finished task {}".format(loss, device, taskID))
+                    # print("[Train loss={}] stage {} finished task {}".format(loss, device, taskID))
                 else:
                     self.metrics["inference_loss"].append(loss.item())
-                    print("[Inference loss={}] stage {} finished task {}".format(loss, device, taskID))
+                    # print("[Inference loss={}] stage {} finished task {}".format(loss, device, taskID))
                     # Finished sentences should have their next token be a padding token
                     unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=init_device)
                     next_token_logits = tuple_outputs[1][:, -1, :].to(init_device)  # B X V
@@ -209,14 +209,14 @@ class DistributedDialoGPT(DistributedLLM):
                             t.query['attention_mask'] = torch.cat(
                                 [t.query['attention_mask'], torch.ones((1, 1), device=init_device)], dim=1
                             )
-                            print(f"[Current batch  {len(self.node_batches[nodeID])} | finished {finished_indices}] task {t.task_id} (index {i}) -> next token {next_tokens[i]}")
+                            # print(f"[Current batch  {len(self.node_batches[nodeID])} | finished {finished_indices}] task {t.task_id} (index {i}) -> next token {next_tokens[i]}")
                         # Remove finished sequences from the batch
                         if len(finished_indices) > 0:
-                            print(f"Removing finished sequences: {finished_indices}")
+                            # print(f"Removing finished sequences: {finished_indices}")
                             self.node_batches[nodeID] = [
                                 t for i, t in enumerate(self.node_batches[nodeID]) if i not in finished_indices
                             ]
-                        print(f"Remaining tasks: {len(self.node_batches[nodeID])}")
+                        # print(f"Remaining tasks: {len(self.node_batches[nodeID])}")
                     self.node_batch_executing[nodeID] = False
                     task.hiddens[0] = None  # Clear the input that is no longer needed
                 
