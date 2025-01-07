@@ -299,11 +299,11 @@ class DistributedLLM:
             self.training_taskIDs = []
         if self.num_inference_samples != 0:
             self.test_set = self.dataset.select(range(self.num_training_samples, len(self.dataset)))
-            # self.test_dataloader = DataLoader(
-            #     self.test_set,
-            #     batch_size=1,  # Online serving
-            #     collate_fn=self.data_collator,
-            # )
+            self.test_dataloader = DataLoader(
+                self.test_set,
+                batch_size=1,  # Online serving
+                collate_fn=self.data_collator,
+            )
             self.inference_taskIDs = self.get_preloaded_inference_tasks(self.distributed_preloaded_tasks)
         else:
             self.inference_taskIDs = []
@@ -370,6 +370,9 @@ class DistributedLLM:
         }
         self.node_batches = {nodeID: [] for nodeID in range(self.num_nodes)}
         self.node_batch_executing = {nodeID: False for nodeID in range(self.num_nodes)}
+        self.tokens_generated = {nodeID: 0 for nodeID in range(self.num_nodes)}
+        self.prefills = {nodeID: 0 for nodeID in range(self.num_nodes)}
+        self.decodes = {nodeID: 0 for nodeID in range(self.num_nodes)}
 
 
     def get_preloaded_training_tasks(self, distributed_preloaded_tasks: Dict[int, list]) -> List[int]:
@@ -395,7 +398,8 @@ class DistributedLLM:
 
     def get_preloaded_inference_tasks(self, distributed_preloaded_tasks: Dict[int, list]) -> List[int]:
         inference_taskIDs = []
-        inference_tasks = len(self.test_set)
+        # inference_tasks = len(self.test_set)
+        inference_tasks = len(self.test_dataloader)
             
         # If workload is 'alternate', we need to create a list of varying lambda values (e.g., 1, 1, ..., 5, 5, ..., 30, 30, ...), each for X consecutive tasks
         if self.rate_lambda == -1:
@@ -448,20 +452,21 @@ class DistributedLLM:
                 current_start_id = current_end_id + 1
 
         # print(f'inference lambdas {len(inference_lambdas)}, inference_ids {len(inference_ids)}')
-        for index, instance in enumerate(self.test_set):
+        # for index, instance in enumerate(self.test_set):
+        for index, batch in enumerate(self.test_dataloader):
             taskID = index + len(self.training_taskIDs)
             inference_taskIDs.append(taskID)
             lamda = self.rate_lambda if self.rate_lambda != -1 else inference_lambdas[index]
 
             # Prepare decode input
-            # inputs = _prepare_decoding_inputs(batch)
+            inputs = _prepare_decoding_inputs(batch)
             for nodeID, node in self.distributed_nodes.items():
                 task = Task(
                     task_id=taskID,
                     rate_lambda=lamda,
-                    query=instance,
-                    # query=_prepare_inputs(inputs, device=node.init_device),
-                    # feedback=_prepare_inputs(inputs['labels'], device=node.last_device),
+                    # query=instance,
+                    query=_prepare_inputs(inputs, device=node.init_device),
+                    feedback=_prepare_inputs(inputs['labels'], device=node.last_device),
                     node_id=nodeID,
                     num_gpus_per_node=node.num_gpus_per_node,
                     require_training=False,
@@ -808,8 +813,9 @@ class DistributedLLM:
             #     time.sleep(0.01)  # Brief wait to avoid busy-waiting
 
             self.distributed_nodes[nodeID].device_queues[0].put((taskID, taskID))
-            seq_length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1] if do_backward else len(self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'])
-            
+            # seq_length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1] if do_backward else len(self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'])
+            seq_length = self.distributed_preloaded_tasks[nodeID][taskID].query['input_ids'].shape[1]
+
             # Record the node allocation 
             self.distributed_nodes[nodeID].update_length_stats(
                 length=seq_length,
@@ -862,74 +868,86 @@ class DistributedLLM:
             
     def forward(
         self, 
-        task: Task,
+        taskID: int,
         inputs: Dict[str, Union[torch.Tensor, Any]],
+        input_length: int,
         stageID: int,
         nodeID: int,
         device: int, 
         timing_info: Dict[str, List[float]],
+        require_training: bool,
+        labels: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         # Memory check and scale down if necessary
         # self.wait_for_device_availability(device)
-
         try:
-            if task.require_training: # this is a training task
-                fb = record_time(device, 'start', 'forward_grad', task.task_id, timing_info)
+            if require_training: # this is a training task
+                fb = record_time(device, 'start', 'forward_grad', taskID, timing_info)
                 self.task_trace[nodeID][stageID]['fb'] = fb
-                if task.task_id in self.train_trace[nodeID]: # this training task has been completely recorded
-                    self.train_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
-                    self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
+                if taskID in self.train_trace[nodeID]: # this training task has been completely recorded
+                    self.train_trace[nodeID][taskID][stageID]['fb'] = fb # update the already recorded task
+                    self.all_trace[nodeID][taskID][stageID]['fb'] = fb # update the already recorded task
 
                 # with autocast():
-                tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
-                fe = record_time(device, 'end', 'forward_grad', task.task_id, timing_info)
+                tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=labels)
+                fe = record_time(device, 'end', 'forward_grad', taskID, timing_info)
 
                 if stageID == 0 and self.PP == 'async': # first stage: unlock the producer for the next task
-                    self.training_status[task.task_id] = True  # Mark first-stage forward as completed
+                    self.training_status[taskID] = True  # Mark first-stage forward as completed
                 
                 self.task_trace[nodeID][stageID]['fe'] = fe
-                if task.task_id in self.train_trace[nodeID]: # this training task has been completely recorded
-                    self.train_trace[nodeID][task.task_id][stageID]['fe'] = fe # update the already recorded task
-                    self.all_trace[nodeID][task.task_id][stageID]['fe'] = fe # update the already recorded task
+                if taskID in self.train_trace[nodeID]: # this training task has been completely recorded
+                    self.train_trace[nodeID][taskID][stageID]['fe'] = fe # update the already recorded task
+                    self.all_trace[nodeID][taskID][stageID]['fe'] = fe # update the already recorded task
            
             else: # this is a user (test) task
-                fb = record_time(device, 'start', 'forward', task.task_id, timing_info)
+                fb = record_time(device, 'start', 'forward', taskID, timing_info)
                 self.task_trace[nodeID][stageID]['fb'] = fb
-                if task.task_id in self.all_trace[nodeID]: # this task has been completely recorded
-                    self.all_trace[nodeID][task.task_id][stageID]['fb'] = fb # update the already recorded task
+                if taskID in self.all_trace[nodeID]: # this task has been completely recorded
+                    self.all_trace[nodeID][taskID][stageID]['fb'] = fb # update the already recorded task
                     
                 if stageID == 0: # first stage
-                    for id in task.task_ids:
-                        self.user_task_record[id]['start'] = fb
+                    for task in self.node_batches[nodeID]:
+                        if task.decode_step == 0:
+                            self.user_task_record[task.task_id]['start'] = fb
                     
                 with torch.no_grad():
                     # with autocast():
-                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=task.feedback)
-                fe = record_time(device, 'end', 'forward', task.task_id, timing_info)
+                    tuple_outputs = self.distributed_stages[nodeID][stageID](**inputs, labels=labels)
+                fe = record_time(device, 'end', 'forward', taskID, timing_info)
                 
                 self.task_trace[nodeID][stageID]['fe'] = fe
-                if task.task_id in self.all_trace[nodeID]: # this task has been completely recorded
-                    self.all_trace[nodeID][task.task_id][stageID]['fe'] = fe # update the already recorded task
+                if taskID in self.all_trace[nodeID]: # this task has been completely recorded
+                    self.all_trace[nodeID][taskID][stageID]['fe'] = fe # update the already recorded task
                 
                 if stageID == self.num_gpus_per_node - 1: # last stage
-                    for id in task.task_ids:
-                        self.user_task_record[id]['end'] = fe
-                    logging.info(f"[Node {nodeID}] Task(s) {task.task_ids} finished forward pass!")
+                    for task in self.node_batches[nodeID]:
+                        seq_length = task.query['input_ids'].shape[1]
+                        if task.decode_step == 0:
+                            self.user_task_record[task.task_id]['prefill_end'] = fe
+                            self.prefills[nodeID] += 1
+                            logging.info(f"[Node {nodeID}] Task {task.task_id} (with length {seq_length}) finished prefill pass!")
+                        else:
+                            self.user_task_record[task.task_id]['decode_end'] = fe
+                            self.decodes[nodeID] += 1
+                            logging.info(f"[Node {nodeID}] Task {task.task_id} (with length {seq_length}) finished decode pass!")
+                        self.tokens_generated[nodeID] += 1
+                        task.decode_step += 1
                     
             if self.froward_eta is None:
-                self.froward_eta = (fe - fb) / (task.query['input_ids'].shape[0] * task.query['input_ids'].shape[1] ** 2)
+                self.froward_eta = (fe - fb) / (len(self.node_batches[nodeID]) * input_length ** 2)
                     
             if self.RECORD_MODE:
                 # Profile forward time (seconds) per stage
                 self.record_dict['forward_etas'].append(
-                    ((fe - fb) / (task.query['input_ids'].shape[0] * task.query['input_ids'].shape[1] ** 2), task.task_id)
+                    ((fe - fb) / (len(self.node_batches[nodeID]) * input_length ** 2), taskID)
                 )
-                self.record_dict['FTs'].append((fe - fb, task.task_id))
+                self.record_dict['FTs'].append((fe - fb, taskID))
                 
         except Exception as e:
             logging.error(f"[Node {nodeID} - stage {stageID} - device {device}] Forward error occurred: {e}")
             if stageID == 0  and self.PP == 'async':
-                self.training_status[task.task_id] = True  # Mark first-stage forward as completed
+                self.training_status[taskID] = True  # Mark first-stage forward as completed
             tuple_outputs = None
         
         return tuple_outputs
@@ -1169,11 +1187,25 @@ class DistributedLLM:
             elif key == 'weight_sync':
                 weight_sync_times = value
             metrics[key] = sum(value) / len(value) if value else 0
+
+        node_decode_steps = {nodeID: [] for nodeID in self.distributed_nodes}
+        task2decode_steps = {}
+        decode_steps = []
+        for nodeID in self.distributed_nodes:
+            for task_dict in self.distributed_nodes[nodeID].task_allocation:
+                taskID: int = task_dict['taskID']
+                if task_dict['type'] == 'test':
+                    steps = self.distributed_preloaded_tasks[nodeID][taskID].decode_step
+                    node_decode_steps[nodeID].append(steps)
+                    decode_steps.append(steps)
+                    task2decode_steps[taskID] = steps
+        averge_decode_steps = np.mean(decode_steps)
         
         # Calculate response times
         metrics['num_tasks'] = self.total_tasks
         metrics['retrain_tasks'] = self.retraining_tasks
         metrics['actual_retrained_tasks'] = len(self._trained_task_lengths)
+        metrics['num_tokens_generated'] = sum(self.tokens_generated.values())
         metrics['user_tasks'] = len(self.user_task_record)
         metrics['SLO 1x'] = self.slo_threshold
         metrics['bubble_rate'] = bubble_rate 
@@ -1181,6 +1213,12 @@ class DistributedLLM:
         metrics['end2end_latency'] = global_max_time - global_min_time
         # metrics['throughput'] = self.total_tasks / (global_max_time - global_min_time)
         metrics['throughput'] = self.total_tasks / total_runtime
+        metrics['throughput (tokens)'] = metrics['num_tokens_generated'] / total_runtime
+        metrics['throughput (prefill)'] = sum(self.prefills.values()) / total_runtime
+        metrics['throughput (decode)'] = sum(self.decodes.values()) / total_runtime
+        metrics['generation_length'] = averge_decode_steps
+        metrics['generation_length (node)'] = {nodeID: np.mean(node_decode_steps[nodeID]) for nodeID in node_decode_steps} 
+        # metrics['generation_lengths'] = decode_steps
         metrics['num_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].num_tasks for nodeID in self.distributed_nodes}
         metrics['retrain_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].train_tasks for nodeID in self.distributed_nodes}
         metrics['user_tasks (node)'] = {nodeID: self.distributed_nodes[nodeID].test_tasks for nodeID in self.distributed_nodes}
@@ -1190,6 +1228,7 @@ class DistributedLLM:
         }
         metrics['end2end_latency (node)'] = {nodeID: node_timelines[nodeID][1] - node_timelines[nodeID][0] for nodeID in node_timelines}
         metrics['throughput (node)'] = {nodeID: self.distributed_nodes[nodeID].num_tasks / (node_timelines[nodeID][1] - node_timelines[nodeID][0]) for nodeID in node_timelines}
+        metrics['decode_throughput (node)'] = {nodeID: self.tokens_generated[nodeID] / (node_timelines[nodeID][1] - node_timelines[nodeID][0]) for nodeID in node_timelines}
         metrics['node_timelines'] = node_timelines
         metrics['idles_sum'] = sum(total_idles)
         metrics['idles_sum (node)'] = {nodeID: sum(idles) for nodeID, idles in node_idles.items()}
@@ -1222,24 +1261,37 @@ class DistributedLLM:
         
         if self.user_task_record:
             # total_response_time, total_wait_time, total_inference_time = 0, 0, 0
-            response_times, wait_times, latencies = [], [], []
+            response_times, wait_times, latencies, E2E_decoding_times, token_decoding_times = [], [], [], [], []
             user_global_min_time, user_global_max_time = float('inf'), float('-inf')
             for taskID, record_dict in self.user_task_record.items():
-                # total_response_time += record_dict['end'] - record_dict['release']
+                # total_response_time += record_dict['prefill_end'] - record_dict['release']
                 # total_wait_time += record_dict['start'] - record_dict['release']
-                # total_inference_time += record_dict['end'] - record_dict['start']
-                if 'start' not in record_dict or 'end' not in record_dict:
-                    print(f"Unrecorded user request (ID={taskID})!")
+                # total_inference_time += record_dict['prefill_end'] - record_dict['start']
+                if 'start' not in record_dict or 'prefill_end' not in record_dict:
+                    # print(f"Unrecorded user request (ID={taskID})! \tOnly have keys: {record_dict.keys()}")
                     continue
                 user_global_min_time = min(user_global_min_time, record_dict['start'])
-                user_global_max_time = max(user_global_max_time, record_dict['end'])
-                response_times.append(record_dict['end'] - record_dict['release'])
-                wait_times.append(record_dict['start'] - record_dict['release'])
-                latencies.append(record_dict['end'] - record_dict['start'])
+                user_global_max_time = max(user_global_max_time, record_dict['prefill_end'])
+                response_times.append(record_dict['prefill_end'] - record_dict['release'])
+                # if 'decode_end' not in record_dict:
+                #     print(f"No 'decode_end' for task {taskID} in record dict")
+                # else:
+                if 'decode_end' in record_dict:
+                    E2E_decoding_time = record_dict['decode_end'] - record_dict['prefill_end']
+                    E2E_decoding_times.append(E2E_decoding_time)
+                    try:
+                        decode_step = task2decode_steps[taskID]
+                        token_decoding_times.append(E2E_decoding_time / decode_step if decode_step > 0 else 0)
+                    except KeyError:
+                        print(f"Decode step not found for task {taskID}")
                 
-            metrics['user_wait_avg'] = sum(wait_times) / len(self.user_task_record)
-            metrics['user_inference_avg'] = sum(latencies) / len(self.user_task_record)
-            metrics['user_response_avg'] = sum(response_times) / len(self.user_task_record)
+                wait_times.append(record_dict['start'] - record_dict['release'])
+                latencies.append(record_dict['prefill_end'] - record_dict['start'])
+                
+            metrics['wait_avg'] = sum(wait_times) / len(wait_times) if wait_times else 0
+            metrics['TTFT_avg'] = sum(latencies) / len(latencies) if latencies else 0
+            metrics['TBT_avg'] = sum(token_decoding_times) / len(token_decoding_times) if token_decoding_times else 0
+            metrics['response_avg'] = sum(response_times) / len(self.user_task_record)
             metrics['user_end2end_latency'] = user_global_max_time - user_global_min_time
             metrics['user_throughput'] = len(self.user_task_record) / (user_global_max_time - user_global_min_time)
             metrics['user_responses'] = response_times # list
