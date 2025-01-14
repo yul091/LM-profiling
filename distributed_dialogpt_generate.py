@@ -8,7 +8,6 @@ import argparse
 import time
 from typing import List, Dict, Optional, Any, Union
 import torch
-from torch.nn.utils.rnn import pad_sequence
 import logging
 from utils import record_time, Task
 from distributed_llm_generate import DistributedLLM, set_seed, gc
@@ -17,14 +16,6 @@ from transformers import LogitsProcessorList, StoppingCriteriaList, MaxLengthCri
 # from memory_profiler import memory_usage
 # torch.autograd.set_detect_anomaly(True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-
-# Custom padding function
-def pad_batch(tensor_list, pad_value=0):
-    """
-    Pads a list of tensors to the same length along dimension 1.
-    """
-    return pad_sequence(tensor_list, batch_first=True, padding_value=pad_value)
 
 
 
@@ -60,6 +51,7 @@ class DistributedDialoGPT(DistributedLLM):
     def __init__(self, args: argparse.Namespace, experimentID: int = 0):
         super().__init__(args, experimentID)
 
+
     def stage_inference(
         self, 
         stageID: int,
@@ -94,48 +86,9 @@ class DistributedDialoGPT(DistributedLLM):
     
             # For inference tasks, handle batching dynamically at the first stage
             if stageID == 0 and not task.require_training:
-                while True:
-                    if not self.node_batch_executing[nodeID]:  # If the current batch is done, exit the loop
-                        break
-                    time.sleep(0.01)
-
-                if not self.node_batches[nodeID]:
-                    task.start = time.time()
-                
-                if len(self.node_batches[nodeID]) < self.batch_size: 
-                    self.node_batches[nodeID].append(task)
-                else:  # if the batch is full, put the new task back and execute the batch
-                    deviceQueue.put((priority, taskID))
-
-                # Append the remaining tasks (in the queue) to the current batch if it doesn't exceed batch size or max wait time
-                while len(self.node_batches[nodeID]) < self.batch_size:
-                    # print(f"Current batch size: {len(self.node_batches[nodeID])}, remaining tasks: {deviceQueue.queue}")
-                    try:
-                        tp, td = deviceQueue.get(timeout=max_wait_time)
-                        if td == float('inf'):
-                            deviceQueue.put((tp, td))
-                            break
-                        tt: Task = preloaded_tasks[td]
-                        if tt.require_training:
-                            deviceQueue.put((tp, td))
-                            break
-                        self.node_batches[nodeID].append(tt)
-                    except queue.Empty:
-                        break
-
-                # Use the data collator to pad and combine the batch
-                input_ids_list = [t.query['input_ids'].squeeze(0) for t in self.node_batches[nodeID]]
-                attention_mask_list = [t.query['attention_mask'].squeeze(0) for t in self.node_batches[nodeID]]
-                input_ids = pad_batch(input_ids_list, pad_value=self.tokenizer.pad_token_id)
-                attention_mask = pad_batch(attention_mask_list, pad_value=0)  
-
-                # Update the current task to use the collated batch
-                task.hiddens[stageID] = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "labels": input_ids.clone(),
-                }
-                self.node_batch_executing[nodeID] = True
+                self.continuous_batching(
+                    taskID, priority, task, stageID, nodeID, deviceQueue, preloaded_tasks, max_wait_time
+                )
 
             inputs = task.hiddens[stageID]
 
@@ -187,38 +140,10 @@ class DistributedDialoGPT(DistributedLLM):
                 else:
                     self.metrics["inference_loss"].append(loss.item())
                     # print("[Inference loss={}] stage {} finished task {}".format(loss, device, taskID))
-                    # Finished sentences should have their next token be a padding token
-                    unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=init_device)
-                    next_token_logits = tuple_outputs[1][:, -1, :].to(init_device)  # B X V
-                    # pre-process distribution
-                    next_tokens_scores = logits_processor(task.hiddens[0]["input_ids"], next_token_logits)
-                    next_tokens = torch.argmax(next_tokens_scores, dim=-1)  # Greedy decoding (B)
-                    # next_tokens = next_tokens * unfinished_sequences + self.tokenizer.pad_token_id * (1 - unfinished_sequences)
-                    # Update unfinished sequences
-                    unfinished_sequences = unfinished_sequences.mul(next_tokens.ne(self.tokenizer.eos_token_id).long())
-                    # print(f"Unfinished sequences: {unfinished_sequences}")
-                    # Stop when each sentence is finished or if we exceed the maximum length
-                    if unfinished_sequences.max() == 0 or stopping_criteria(task.hiddens[0]["input_ids"], next_tokens_scores):
-                        self.node_batches[nodeID].clear()  # Clear the batch
-                    else:
-                        finished_indices = (unfinished_sequences == 0).nonzero(as_tuple=True)[0]
-                        # Append generated tokens to the sequence for all tasks in the batch
-                        for i, t in enumerate(self.node_batches[nodeID]):
-                            t.query['input_ids'] = torch.cat([t.query['input_ids'], next_tokens[i].view(1, 1)], dim=1)
-                            # print(f"\tUpdated input_ids: {t.query['input_ids'].shape}")
-                            t.query['attention_mask'] = torch.cat(
-                                [t.query['attention_mask'], torch.ones((1, 1), device=init_device)], dim=1
-                            )
-                            # print(f"[Current batch  {len(self.node_batches[nodeID])} | finished {finished_indices}] task {t.task_id} (index {i}) -> next token {next_tokens[i]}")
-                        # Remove finished sequences from the batch
-                        if len(finished_indices) > 0:
-                            # print(f"Removing finished sequences: {finished_indices}")
-                            self.node_batches[nodeID] = [
-                                t for i, t in enumerate(self.node_batches[nodeID]) if i not in finished_indices
-                            ]
-                        # print(f"Remaining tasks: {len(self.node_batches[nodeID])}")
-                    self.node_batch_executing[nodeID] = False
-                    task.hiddens[0] = None  # Clear the input that is no longer needed
+                    self.autoregressive_decoding(
+                        task, nodeID, logits_processor, stopping_criteria, init_device, batch_size, 
+                        lm_logits=tuple_outputs[1],
+                    )
                 
                 if self.RECORD_MODE:
                     self.record_dict['loss'].append((loss.item(), taskID))

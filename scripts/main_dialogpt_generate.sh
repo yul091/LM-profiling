@@ -1,5 +1,5 @@
 NUM_SAMPLES=1000
-BATCH_SIZE=3
+# BATCH_SIZE=3
 MEMORY_THRESHOLD=0.7
 SETTING=active # "active" "isolated"
 WORKLOAD=poisson
@@ -14,10 +14,13 @@ PROFILING_DIR="nvidia-profiling_generate"
 mkdir -p ${PROFILING_DIR}
 
 # S-PP training
-for RATE_LAMBDA in 4 8 12 16 20 24 28 32; do
-    for MODEL_NAME in "DialoGPT-small" "DialoGPT-medium" "DialoGPT-large"; do
-        OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}
-        for RETRAIN_RATE in 0.1 0.3 0.5 0.7 0.9; do
+RETRAIN_RATE=0.5
+for RATE_LAMBDA in 8 12 16 20 24 28 32; do
+    # for MODEL_NAME in "DialoGPT-small" "DialoGPT-medium" "DialoGPT-large"; do
+    for MODEL_NAME in "DialoGPT-large"; do
+        # for RETRAIN_RATE in 0.1 0.3 0.5 0.7 0.9; do
+        for BATCH_SIZE in 1 3 5; do
+            OUTPUT_DIR=${BASE_DIR}/${NUM_NODES}_node/lambda_${RATE_LAMBDA}/${MODEL_NAME}/batch_${BATCH_SIZE}
             for TASK_ASSIGNMENT in "rr" "util" "workload"; do
                 nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,power.draw --format=csv,nounits -l 1 -f ${PROFILING_DIR}/${TASK_ASSIGNMENT}_${MODEL_NAME}_${NUM_NODES}-node_${RATE_LAMBDA}-rps_${RETRAIN_RATE}-rate.csv &
                 NVIDIA_SMI_PID=$!

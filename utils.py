@@ -6,22 +6,11 @@ import logging
 from typing import Dict, Union, Any, List, Tuple, Optional, Callable
 import numpy as np
 import pandas as pd
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import seaborn as sns
-# from transformers import (
-#     BertModel,
-#     BertForSequenceClassification,
-#     GPT2Model,
-#     GPT2ForSequenceClassification,
-#     XLNetModel,
-#     XLNetForSequenceClassification,
-#     BartModel,
-#     BartForSequenceClassification,
-# )
-# from transformers.models.bert.modeling_bert import BertModel
-
+from torch.nn.utils.rnn import pad_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +29,14 @@ OPTIMIZER_NAME = "optimizer.pt"
 OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
+
+
+# Custom padding function
+def pad_batch(tensor_list, pad_value=0):
+    """
+    Pads a list of tensors to the same length along dimension 1.
+    """
+    return pad_sequence(tensor_list, batch_first=True, padding_value=pad_value)
 
 
 def avg_util_overtime(data: pd.DataFrame, num_nodes: int, active_node_list: List[int] = None, active_memory_threshold: int = 0):
